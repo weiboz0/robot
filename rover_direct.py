@@ -70,17 +70,24 @@ def _clamp(v, lo, hi):
 
 
 class Rover:
-    def __init__(self, port: str = None, baud: int = BAUD, enable_gimbal: bool = True):
+    def __init__(self, port: str = None, baud: int = BAUD, init: bool = True):
         self.port = port or detect_port()
         self.ser = serial.Serial(self.port, baud, timeout=1)
         time.sleep(0.2)
-        if enable_gimbal:
-            self.select_module(2)  # 2 = Gimbal (pan/tilt). Needed for camera to move.
+        if init:
+            self.init_base()
 
     # -- low level ----------------------------------------------------------
     def send(self, cmd: dict) -> None:
         """Send one JSON command (newline-terminated) to the ESP32."""
         self.ser.write((json.dumps(cmd, separators=(",", ":")) + "\n").encode("utf-8"))
+
+    def init_base(self) -> None:
+        """Boot config for a write-only controller (like app.py, minus the
+        feedback stream, which we don't read)."""
+        self.send({"T": 143, "cmd": 0})   # serial echo off
+        self.send({"T": 131, "cmd": 0})   # feedback stream off (we don't read it)
+        self.select_module(2)             # 2 = Gimbal (enables pan/tilt)
 
     def select_module(self, module: int) -> None:
         """0:None 1:RoArm-M2-S 2:Gimbal. The pan/tilt camera needs module 2."""
@@ -132,10 +139,28 @@ class Rover:
     def gimbal_stop(self) -> None:
         self.send({"T": 0})
 
+    def estop(self) -> None:
+        """Stop wheels AND gimbal immediately."""
+        self.send({"T": 1, "L": 0, "R": 0})
+        self.send({"T": 0})
+
     # -- misc ---------------------------------------------------------------
     def lights(self, front: int = 0, base: int = 0) -> None:
         """LED PWM 0..255. front=IO5 (head), base=IO4 (chassis)."""
         self.send({"T": 132, "IO4": base, "IO5": front})
+
+    def oled(self, line: int, text: str) -> None:
+        """Write text to an OLED line (0-3)."""
+        self.send({"T": 3, "lineNum": line, "Text": text})
+
+    def oled_default(self) -> None:
+        """Restore the OLED's default status screen."""
+        self.send({"T": -3})
+
+    def servo_torque(self, lock: bool, servo_id: int = 255) -> None:
+        """Lock (True) or release (False) bus servos; 255 = all. Releasing lets
+        you hand-position the gimbal; lock to hold it."""
+        self.send({"T": 210, "id": servo_id, "cmd": 1 if lock else 0})
 
     def close(self) -> None:
         try:
@@ -158,17 +183,24 @@ def demo(r: Rover) -> None:
 
 # ---------------------------------------------------------------- interactive
 HELP = """commands:
-  cam PAN TILT      aim camera to absolute angles (tilt + = up)
-  up / down         tilt camera +/-15 from current
-  left / right      pan camera -/+15 from current
-  center            level the camera
-  drive L R [SECS]  wheel speeds (e.g. drive 0.2 0.2 1)
-  fwd / back [SECS] drive straight
-  spinl / spinr [SECS]
-  stop              stop wheels
-  light F B         LED PWM 0..255 (front, base)
-  demo              run the self-test sweep
-  help / quit
+  camera:
+    up/down/left/right [DEG]   nudge camera (DEG degrees, default 15)
+    cam PAN TILT               aim to absolute angles (tilt + = up)
+    center                     level the camera
+  motors:
+    drive L R [SECS]           wheel speeds, auto-stop after SECS (default 1)
+    move L R                   wheel speeds, continuous (no auto-stop)
+    fwd/back [SECS]            drive straight
+    spinl/spinr [SECS]         turn in place (default 0.6s)
+    stop                       stop wheels
+  other:
+    estop                      stop wheels AND gimbal now
+    relax / lock               release / lock the gimbal servos (hand-position)
+    light F B                  LED PWM 0..255 (front, base)
+    oled LINE TEXT...          write text to OLED line 0-3
+    oledclear                  restore default OLED screen
+    demo                       motor+camera self-test
+    help / quit
 """
 
 
@@ -192,19 +224,24 @@ def repl(r: Rover) -> None:
                 print(HELP)
             elif c == "cam":
                 pan, tilt = float(args[0]), float(args[1]); r.set_camera(pan, tilt)
-            elif c == "up":
-                tilt += 15; r.set_camera(pan, tilt)
-            elif c == "down":
-                tilt -= 15; r.set_camera(pan, tilt)
-            elif c == "left":
-                pan -= 15; r.set_camera(pan, tilt)
-            elif c == "right":
-                pan += 15; r.set_camera(pan, tilt)
+            elif c in ("up", "down", "left", "right"):
+                step = float(args[0]) if args else 15.0   # optional degrees
+                if c == "up":
+                    tilt += step
+                elif c == "down":
+                    tilt -= step
+                elif c == "left":
+                    pan -= step
+                else:
+                    pan += step
+                r.set_camera(pan, tilt)
             elif c == "center":
                 pan = tilt = 0; r.center_camera()
             elif c == "drive":
                 r.drive_for(float(args[0]), float(args[1]),
                             float(args[2]) if len(args) > 2 else 1.0)
+            elif c == "move":
+                r.drive(float(args[0]), float(args[1]))   # continuous, no auto-stop
             elif c == "fwd":
                 r.forward(0.2, float(args[0]) if args else 1.0)
             elif c == "back":
@@ -215,8 +252,18 @@ def repl(r: Rover) -> None:
                 r.spin_right(0.2, float(args[0]) if args else 0.6)
             elif c == "stop":
                 r.stop()
+            elif c == "estop":
+                r.estop()
+            elif c == "relax":
+                r.servo_torque(False)
+            elif c == "lock":
+                r.servo_torque(True)
             elif c == "light":
                 r.lights(int(args[0]), int(args[1]))
+            elif c == "oled":
+                r.oled(int(args[0]), " ".join(args[1:]))
+            elif c == "oledclear":
+                r.oled_default()
             elif c == "demo":
                 demo(r)
             else:
@@ -225,9 +272,20 @@ def repl(r: Rover) -> None:
             print("bad args — type 'help'")
 
 
+def camtest(r: "Rover") -> None:
+    """Slow, visible camera-only sweep (no driving)."""
+    print("camera UP 45 ..."); r.set_camera(0, 45); time.sleep(2.5)
+    print("camera DOWN -30 ..."); r.set_camera(0, -30); time.sleep(2.5)
+    print("camera PAN LEFT -45 ..."); r.set_camera(-45, 0); time.sleep(2.5)
+    print("camera PAN RIGHT 45 ..."); r.set_camera(45, 0); time.sleep(2.5)
+    print("camera CENTER ..."); r.center_camera(); time.sleep(1)
+    print("camtest done")
+
+
 def main() -> None:
     keep_app = "--keep-app" in sys.argv
     run_demo = "demo" in sys.argv
+    run_camtest = "camtest" in sys.argv
 
     if not keep_app:
         if stop_http_service():
@@ -244,6 +302,8 @@ def main() -> None:
     try:
         if run_demo:
             demo(r)
+        elif run_camtest:
+            camtest(r)
         else:
             repl(r)
     finally:
