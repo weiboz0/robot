@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Direct serial control of the Waveshare UGV rover — no HTTP service needed.
+
+Runs ON the rover (ssh ws@192.168.1.131). Talks straight to the ESP32 sub-
+controller over the UART, sending the same line-delimited JSON commands that
+ugv_rpi/base_ctrl.py uses:
+
+    motors :  {"T":1,  "L":<left>, "R":<right>}        # wheel speeds
+    gimbal :  {"T":133,"X":<pan>, "Y":<tilt>, "SPD":0, "ACC":0}   # absolute aim
+    gimbal :  {"T":141,"X":<pan>, "Y":<tilt>, "SPD":<spd>}        # continuous
+    e-stop :  {"T":0}
+    lights :  {"T":132,"IO4":<a>,"IO5":<b>}
+    module :  {"T":4,  "cmd":2}   # 0:None 1:RoArm 2:Gimbal — selects pan/tilt
+
+The serial port can only be held by one process. app.py (the web service) grabs
+it at boot, so by default this script stops app.py first. Restore the web
+service with a reboot, or:  ~/ugv_rpi/ugv-env/bin/python ~/ugv_rpi/app.py
+
+Run with the env that has pyserial:
+    ~/ugv_rpi/ugv-env/bin/python ~/rover_direct.py            # interactive
+    ~/ugv_rpi/ugv-env/bin/python ~/rover_direct.py demo       # quick self-test
+    ~/ugv_rpi/ugv-env/bin/python ~/rover_direct.py --keep-app # don't stop app.py
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+import serial
+
+BAUD = 115200
+# Pan/tilt and wheel limits (match base_ctrl conventions; clamped for safety).
+PAN_LIMIT = (-180.0, 180.0)
+TILT_LIMIT = (-45.0, 90.0)   # + is up
+SPEED_LIMIT = 0.5            # max |wheel speed| we allow by default
+
+
+def detect_port() -> str:
+    """Pi 5 uses /dev/ttyAMA0; earlier Pis use /dev/serial0 (same as app.py)."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            if "Raspberry Pi 5" in f.read():
+                return "/dev/ttyAMA0"
+    except OSError:
+        pass
+    return "/dev/serial0"
+
+
+def stop_http_service() -> bool:
+    """Kill the ugv_rpi web app so we can own the serial port. Returns True if
+    something was stopped. It won't auto-restart until reboot (it's an @reboot
+    cron job)."""
+    try:
+        out = subprocess.run(["pgrep", "-f", "ugv_rpi/app.py"],
+                             capture_output=True, text=True)
+        pids = [p for p in out.stdout.split() if p]
+        if not pids:
+            return False
+        subprocess.run(["pkill", "-f", "ugv_rpi/app.py"])
+        time.sleep(1.5)  # let it release the port
+        return True
+    except Exception as e:
+        print(f"[stop_http_service] {e}")
+        return False
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class Rover:
+    def __init__(self, port: str = None, baud: int = BAUD, enable_gimbal: bool = True):
+        self.port = port or detect_port()
+        self.ser = serial.Serial(self.port, baud, timeout=1)
+        time.sleep(0.2)
+        if enable_gimbal:
+            self.select_module(2)  # 2 = Gimbal (pan/tilt). Needed for camera to move.
+
+    # -- low level ----------------------------------------------------------
+    def send(self, cmd: dict) -> None:
+        """Send one JSON command (newline-terminated) to the ESP32."""
+        self.ser.write((json.dumps(cmd, separators=(",", ":")) + "\n").encode("utf-8"))
+
+    def select_module(self, module: int) -> None:
+        """0:None 1:RoArm-M2-S 2:Gimbal. The pan/tilt camera needs module 2."""
+        self.send({"T": 4, "cmd": module})
+
+    # -- motors -------------------------------------------------------------
+    def drive(self, left: float, right: float) -> None:
+        """Set wheel speeds. left/right roughly -0.5..0.5 (negative reverses)."""
+        self.send({"T": 1,
+                   "L": _clamp(left, -SPEED_LIMIT, SPEED_LIMIT),
+                   "R": _clamp(right, -SPEED_LIMIT, SPEED_LIMIT)})
+
+    def stop(self) -> None:
+        self.send({"T": 1, "L": 0, "R": 0})
+
+    def drive_for(self, left: float, right: float, seconds: float) -> None:
+        """Drive at the given speeds for `seconds`, then stop."""
+        self.drive(left, right)
+        time.sleep(max(0.0, min(10.0, seconds)))
+        self.stop()
+
+    def forward(self, speed: float = 0.2, seconds: float = 1.0) -> None:
+        self.drive_for(abs(speed), abs(speed), seconds)
+
+    def backward(self, speed: float = 0.2, seconds: float = 1.0) -> None:
+        self.drive_for(-abs(speed), -abs(speed), seconds)
+
+    def spin_left(self, speed: float = 0.2, seconds: float = 0.6) -> None:
+        self.drive_for(-abs(speed), abs(speed), seconds)
+
+    def spin_right(self, speed: float = 0.2, seconds: float = 0.6) -> None:
+        self.drive_for(abs(speed), -abs(speed), seconds)
+
+    # -- camera gimbal ------------------------------------------------------
+    def set_camera(self, pan: float, tilt: float, speed: int = 0, acc: int = 0) -> None:
+        """Aim the camera to absolute angles. pan=left/right, tilt=up/down (+up)."""
+        self.send({"T": 133,
+                   "X": _clamp(pan, *PAN_LIMIT),
+                   "Y": _clamp(tilt, *TILT_LIMIT),
+                   "SPD": speed, "ACC": acc})
+
+    def gimbal_continuous(self, pan: float, tilt: float, speed: int = 200) -> None:
+        """Move the gimbal at a velocity (T:141) rather than to an angle."""
+        self.send({"T": 141, "X": pan, "Y": tilt, "SPD": speed})
+
+    def center_camera(self) -> None:
+        self.set_camera(0, 0)
+
+    def gimbal_stop(self) -> None:
+        self.send({"T": 0})
+
+    # -- misc ---------------------------------------------------------------
+    def lights(self, front: int = 0, base: int = 0) -> None:
+        """LED PWM 0..255. front=IO5 (head), base=IO4 (chassis)."""
+        self.send({"T": 132, "IO4": base, "IO5": front})
+
+    def close(self) -> None:
+        try:
+            self.stop()
+            self.ser.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------- demo
+def demo(r: Rover) -> None:
+    print("camera: up 45"); r.set_camera(0, 45); time.sleep(2)
+    print("camera: down -30"); r.set_camera(0, -30); time.sleep(2)
+    print("camera: pan left -45"); r.set_camera(-45, 0); time.sleep(2)
+    print("camera: center"); r.center_camera(); time.sleep(1)
+    print("motors: nudge forward 0.6s @0.15"); r.forward(0.15, 0.6)
+    print("motors: spin right 0.5s"); r.spin_right(0.2, 0.5)
+    print("demo done")
+
+
+# ---------------------------------------------------------------- interactive
+HELP = """commands:
+  cam PAN TILT      aim camera to absolute angles (tilt + = up)
+  up / down         tilt camera +/-15 from current
+  left / right      pan camera -/+15 from current
+  center            level the camera
+  drive L R [SECS]  wheel speeds (e.g. drive 0.2 0.2 1)
+  fwd / back [SECS] drive straight
+  spinl / spinr [SECS]
+  stop              stop wheels
+  light F B         LED PWM 0..255 (front, base)
+  demo              run the self-test sweep
+  help / quit
+"""
+
+
+def repl(r: Rover) -> None:
+    pan, tilt = 0.0, 0.0
+    print(HELP)
+    while True:
+        try:
+            line = input("rover> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); break
+        if not line:
+            continue
+        parts = line.split()
+        c = parts[0].lower()
+        args = parts[1:]
+        try:
+            if c in ("quit", "exit"):
+                break
+            elif c == "help":
+                print(HELP)
+            elif c == "cam":
+                pan, tilt = float(args[0]), float(args[1]); r.set_camera(pan, tilt)
+            elif c == "up":
+                tilt += 15; r.set_camera(pan, tilt)
+            elif c == "down":
+                tilt -= 15; r.set_camera(pan, tilt)
+            elif c == "left":
+                pan -= 15; r.set_camera(pan, tilt)
+            elif c == "right":
+                pan += 15; r.set_camera(pan, tilt)
+            elif c == "center":
+                pan = tilt = 0; r.center_camera()
+            elif c == "drive":
+                r.drive_for(float(args[0]), float(args[1]),
+                            float(args[2]) if len(args) > 2 else 1.0)
+            elif c == "fwd":
+                r.forward(0.2, float(args[0]) if args else 1.0)
+            elif c == "back":
+                r.backward(0.2, float(args[0]) if args else 1.0)
+            elif c == "spinl":
+                r.spin_left(0.2, float(args[0]) if args else 0.6)
+            elif c == "spinr":
+                r.spin_right(0.2, float(args[0]) if args else 0.6)
+            elif c == "stop":
+                r.stop()
+            elif c == "light":
+                r.lights(int(args[0]), int(args[1]))
+            elif c == "demo":
+                demo(r)
+            else:
+                print("?? type 'help'")
+        except (IndexError, ValueError):
+            print("bad args — type 'help'")
+
+
+def main() -> None:
+    keep_app = "--keep-app" in sys.argv
+    run_demo = "demo" in sys.argv
+
+    if not keep_app:
+        if stop_http_service():
+            print("stopped ugv_rpi/app.py to free the serial port "
+                  "(reboot or rerun app.py to restore the web service).")
+
+    port = detect_port()
+    try:
+        r = Rover(port)
+    except serial.SerialException as e:
+        sys.exit(f"Could not open {port}: {e}\n"
+                 "If the web service still holds it, run without --keep-app.")
+    print(f"connected on {port} @ {BAUD}")
+    try:
+        if run_demo:
+            demo(r)
+        else:
+            repl(r)
+    finally:
+        r.close()
+
+
+if __name__ == "__main__":
+    main()
