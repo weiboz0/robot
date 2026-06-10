@@ -135,15 +135,18 @@ def run_tool(rover, name: str, args: dict) -> str:
 def main() -> None:
     load_dotenv()
     api_key = os.environ.get("OPENCODE_API_KEY", "").strip()
+
+    # Set up the LLM if possible; if not, direct ($) commands still work.
+    client = None
     if not api_key:
-        sys.exit("OPENCODE_API_KEY not set. Add it to ~/.env on the rover.")
-
-    try:
-        from openai import OpenAI
-    except ImportError:
-        sys.exit("openai SDK missing. Run: ~/ugv_rpi/ugv-env/bin/pip install openai")
-
-    client = OpenAI(api_key=api_key, base_url=BASE_URL)
+        chat_status = "chat OFF (set OPENCODE_API_KEY in ~/.env)"
+    else:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key, base_url=BASE_URL)
+            chat_status = f"chat ON ({MODEL})"
+        except ImportError:
+            chat_status = "chat OFF (run: pip install openai)"
     tools = [{"type": "function", "function": t} for t in TOOL_DEFS]
 
     # Take the serial port (stops the web app) and connect.
@@ -154,9 +157,10 @@ def main() -> None:
         rover = rover_direct.Rover()
     except Exception as e:
         sys.exit(f"Could not open serial: {e}")
-    print(f"[rover chat | {MODEL}] connected on {rover.port}.")
-    print("Type normally to chat. Prefix a line with $ for a direct command "
-          "(e.g. '$up 45', '$drive 0.2 0.2 1', '$help'). 'quit' to exit.\n")
+    print(f"[rover] connected on {rover.port}  |  {chat_status}")
+    print("Type a request to chat & command in plain English; prefix a line "
+          "with $ to run a direct command ($up 45, $drive 0.2 0.2 1, $help). "
+          "'quit' to exit.\n")
 
     messages = [{"role": "system", "content": SYSTEM}]
     try:
@@ -175,6 +179,9 @@ def main() -> None:
                     break
                 if out:
                     print(out)
+                continue
+            if client is None:                        # chat unavailable
+                print("  chat is off — use $ for direct commands (try $help)")
                 continue
             messages.append({"role": "user", "content": user})
             while True:
