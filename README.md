@@ -29,8 +29,28 @@ gimbal module so pan/tilt works.
 
 ```bash
 # on the rover:
-~/ugv_rpi/ugv-env/bin/python ~/rover_direct.py          # interactive
-~/ugv_rpi/ugv-env/bin/python ~/rover_direct.py demo     # self-test
+rover            # interactive  (launcher -> ~/robot/rover_direct.py)
+rover demo       # self-test
+```
+
+## Direct-control chatbot (`rover_chat.py`)
+Also runs **on the rover**. An LLM (OpenCode / minimax-m3 by default) drives the
+rover over direct serial, so fuzzy commands work — "look up a bit", "spin
+around". Prefix a line with `$` to run a direct command instead of chatting
+(`$up 45`, `$drive 0.2 0.2 1`, `$help`). Needs `OPENCODE_API_KEY` in `~/.env`
+and `openai` installed in the rover's venv.
+
+```bash
+roverchat        # launcher -> ~/robot/rover_chat.py
+```
+
+## Running on the rover via git
+The rover programs live in this repo; on the rover they're cloned at `~/robot`
+and run via the `rover` / `roverchat` launchers. To update:
+
+```bash
+ssh rover
+cd ~/robot && git pull      # launchers always run the latest
 ```
 
 ESP32 command reference: motors `{"T":1,"L":..,"R":..}`, gimbal
