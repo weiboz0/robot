@@ -73,6 +73,8 @@ class Rover:
     def __init__(self, port: str = None, baud: int = BAUD, init: bool = True):
         self.port = port or detect_port()
         self.ser = serial.Serial(self.port, baud, timeout=1)
+        self.pan = 0.0    # tracked camera angles (for relative nudges)
+        self.tilt = 0.0
         time.sleep(0.2)
         if init:
             self.init_base()
@@ -124,10 +126,9 @@ class Rover:
     # -- camera gimbal ------------------------------------------------------
     def set_camera(self, pan: float, tilt: float, speed: int = 0, acc: int = 0) -> None:
         """Aim the camera to absolute angles. pan=left/right, tilt=up/down (+up)."""
-        self.send({"T": 133,
-                   "X": _clamp(pan, *PAN_LIMIT),
-                   "Y": _clamp(tilt, *TILT_LIMIT),
-                   "SPD": speed, "ACC": acc})
+        self.pan = _clamp(pan, *PAN_LIMIT)
+        self.tilt = _clamp(tilt, *TILT_LIMIT)
+        self.send({"T": 133, "X": self.pan, "Y": self.tilt, "SPD": speed, "ACC": acc})
 
     def gimbal_continuous(self, pan: float, tilt: float, speed: int = 200) -> None:
         """Move the gimbal at a velocity (T:141) rather than to an angle."""
@@ -204,8 +205,91 @@ HELP = """commands:
 """
 
 
+QUIT = "__QUIT__"
+
+
+def exec_command(r: Rover, line: str) -> str:
+    """Run one direct command line. Returns a status string, "" for no output,
+    or the QUIT sentinel. Never raises — returns an error string instead.
+    Shared by the standalone REPL and the chatbot's `$` direct-command path."""
+    parts = line.split()
+    if not parts:
+        return ""
+    c = parts[0].lower()
+    args = parts[1:]
+    try:
+        if c in ("quit", "exit"):
+            return QUIT
+        if c == "help":
+            return HELP
+        if c == "cam":
+            r.set_camera(float(args[0]), float(args[1]))
+            return f"camera -> pan={r.pan}, tilt={r.tilt}"
+        if c in ("up", "down", "left", "right"):
+            step = float(args[0]) if args else 15.0   # optional degrees
+            pan, tilt = r.pan, r.tilt
+            if c == "up":
+                tilt += step
+            elif c == "down":
+                tilt -= step
+            elif c == "left":
+                pan -= step
+            else:
+                pan += step
+            r.set_camera(pan, tilt)
+            return f"camera -> pan={r.pan}, tilt={r.tilt}"
+        if c == "center":
+            r.center_camera()
+            return "camera centered"
+        if c == "drive":
+            r.drive_for(float(args[0]), float(args[1]),
+                        float(args[2]) if len(args) > 2 else 1.0)
+            return f"drove L={args[0]} R={args[1]}, stopped"
+        if c == "move":
+            r.drive(float(args[0]), float(args[1]))
+            return f"moving L={args[0]} R={args[1]} (continuous)"
+        if c == "fwd":
+            r.forward(0.2, float(args[0]) if args else 1.0)
+            return "forward"
+        if c == "back":
+            r.backward(0.2, float(args[0]) if args else 1.0)
+            return "back"
+        if c == "spinl":
+            r.spin_left(0.2, float(args[0]) if args else 0.6)
+            return "spin left"
+        if c == "spinr":
+            r.spin_right(0.2, float(args[0]) if args else 0.6)
+            return "spin right"
+        if c == "stop":
+            r.stop()
+            return "stopped"
+        if c == "estop":
+            r.estop()
+            return "emergency stopped"
+        if c == "relax":
+            r.servo_torque(False)
+            return "gimbal relaxed"
+        if c == "lock":
+            r.servo_torque(True)
+            return "gimbal locked"
+        if c == "light":
+            r.lights(int(args[0]), int(args[1]))
+            return f"lights front={args[0]} base={args[1]}"
+        if c == "oled":
+            r.oled(int(args[0]), " ".join(args[1:]))
+            return "oled written"
+        if c == "oledclear":
+            r.oled_default()
+            return "oled reset"
+        if c == "demo":
+            demo(r)
+            return "demo done"
+        return f"?? unknown command '{c}' — type 'help'"
+    except (IndexError, ValueError):
+        return "bad args — type 'help'"
+
+
 def repl(r: Rover) -> None:
-    pan, tilt = 0.0, 0.0
     print(HELP)
     while True:
         try:
@@ -214,62 +298,11 @@ def repl(r: Rover) -> None:
             print(); break
         if not line:
             continue
-        parts = line.split()
-        c = parts[0].lower()
-        args = parts[1:]
-        try:
-            if c in ("quit", "exit"):
-                break
-            elif c == "help":
-                print(HELP)
-            elif c == "cam":
-                pan, tilt = float(args[0]), float(args[1]); r.set_camera(pan, tilt)
-            elif c in ("up", "down", "left", "right"):
-                step = float(args[0]) if args else 15.0   # optional degrees
-                if c == "up":
-                    tilt += step
-                elif c == "down":
-                    tilt -= step
-                elif c == "left":
-                    pan -= step
-                else:
-                    pan += step
-                r.set_camera(pan, tilt)
-            elif c == "center":
-                pan = tilt = 0; r.center_camera()
-            elif c == "drive":
-                r.drive_for(float(args[0]), float(args[1]),
-                            float(args[2]) if len(args) > 2 else 1.0)
-            elif c == "move":
-                r.drive(float(args[0]), float(args[1]))   # continuous, no auto-stop
-            elif c == "fwd":
-                r.forward(0.2, float(args[0]) if args else 1.0)
-            elif c == "back":
-                r.backward(0.2, float(args[0]) if args else 1.0)
-            elif c == "spinl":
-                r.spin_left(0.2, float(args[0]) if args else 0.6)
-            elif c == "spinr":
-                r.spin_right(0.2, float(args[0]) if args else 0.6)
-            elif c == "stop":
-                r.stop()
-            elif c == "estop":
-                r.estop()
-            elif c == "relax":
-                r.servo_torque(False)
-            elif c == "lock":
-                r.servo_torque(True)
-            elif c == "light":
-                r.lights(int(args[0]), int(args[1]))
-            elif c == "oled":
-                r.oled(int(args[0]), " ".join(args[1:]))
-            elif c == "oledclear":
-                r.oled_default()
-            elif c == "demo":
-                demo(r)
-            else:
-                print("?? type 'help'")
-        except (IndexError, ValueError):
-            print("bad args — type 'help'")
+        out = exec_command(r, line)
+        if out == QUIT:
+            break
+        if out:
+            print(out)
 
 
 def camtest(r: "Rover") -> None:
