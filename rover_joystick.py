@@ -32,8 +32,11 @@ BTN_A, BTN_X, BTN_Y = 0, 2, 3
 BTN_RB, BTN_START = 5, 7
 # --- tunables --------------------------------------------------------------
 DEADZONE = 0.15
-MAX_SPEED = 0.30        # normal wheel-speed cap
-TURBO_SPEED = 0.50      # while RB held
+MAX_SPEED = 0.25        # normal wheel-speed cap (lowered to ease current draw)
+TURBO_SPEED = 0.40      # while RB held
+RAMP = 1.2              # max wheel-speed change per second (slew-rate limit):
+                        # ramps speed gradually to avoid motor current spikes
+                        # that can brown out / reset the Pi
 PAN_RATE = 90.0         # deg/sec at full stick
 TILT_RATE = 70.0
 RATE_HZ = 25.0
@@ -87,6 +90,7 @@ def main():
           "Start button or Ctrl-C to quit.\n")
 
     pan, tilt = 0.0, 0.0
+    left, right = 0.0, 0.0   # current wheel speeds (ramped toward target)
     light_on = False
     prev = {}
     dt = 1.0 / RATE_HZ
@@ -118,8 +122,12 @@ def main():
             top = TURBO_SPEED if js.get_button(BTN_RB) else MAX_SPEED
             throttle = -dz(js.get_axis(AX_LY))   # stick up = forward
             steer = dz(js.get_axis(AX_LX))
-            left = clamp(throttle + steer, -1.0, 1.0) * top
-            right = clamp(throttle - steer, -1.0, 1.0) * top
+            tgt_left = clamp(throttle + steer, -1.0, 1.0) * top
+            tgt_right = clamp(throttle - steer, -1.0, 1.0) * top
+            # slew-rate limit: ramp toward target to avoid current spikes
+            step = RAMP * dt
+            left += clamp(tgt_left - left, -step, step)
+            right += clamp(tgt_right - right, -step, step)
             rover.drive(left, right)
 
             # camera from right stick (integrate into absolute angles)
