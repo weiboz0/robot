@@ -66,7 +66,7 @@ def debug_loop(js):
     print("DEBUG: move sticks/press buttons; Ctrl-C to quit.")
     dt = 1.0 / 10
     while True:
-        pygame.event.pump()
+        pygame.event.get()   # drain the event queue (don't just pump)
         axes = [round(js.get_axis(i), 2) for i in range(js.get_numaxes())]
         btns = [i for i in range(js.get_numbuttons()) if js.get_button(i)]
         print(f"axes {axes}  buttons {btns}        ", end="\r", flush=True)
@@ -93,7 +93,8 @@ def main():
     last_cam = None
     try:
         while True:
-            pygame.event.pump()
+            pygame.event.get()   # drain the event queue each frame, or the
+                                 # joystick state freezes once the queue fills
 
             def pressed(b):  # rising edge
                 now = js.get_button(b)
