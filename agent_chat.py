@@ -31,7 +31,6 @@ import dobot
 BASE_URL = os.environ.get("OPENCODE_BASE_URL", "").strip() or "https://opencode.ai/zen/go/v1"
 MODEL = os.environ.get("OPENCODE_MODEL", "").strip() or "minimax-m3"
 
-SERIAL_DEVICES = ("/dev/ttyAMA0", "/dev/serial0")
 ROVER_HTTP_HOST, ROVER_HTTP_PORT = "192.168.1.131", 5000
 
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -70,7 +69,7 @@ def _clamp(v, lo, hi):
 class RoverCtl:
     """Common rover interface over either the serial or HTTP backend."""
 
-    def __init__(self, backend: str):
+    def __init__(self, backend: str, port: str = None):
         self.backend = backend          # "serial" | "http"
         self.pan = 0.0
         self.tilt = 0.0
@@ -79,7 +78,7 @@ class RoverCtl:
             self._rd = rover_direct
             if rover_direct.stop_http_service():
                 print("stopped ugv_rpi/app.py to free the serial port.")
-            self._r = rover_direct.Rover()
+            self._r = rover_direct.Rover(port=port)   # open the detected path, don't re-detect
             self.where = self._r.port
         else:
             self.where = f"http://{ROVER_HTTP_HOST}:{ROVER_HTTP_PORT}"
@@ -117,11 +116,19 @@ class RoverCtl:
 
 
 def detect_rover():
-    if any(os.path.exists(p) for p in SERIAL_DEVICES):
+    # Single source of truth for the serial device: rover_direct.detect_port()
+    # is board-aware (Pi 5 -> /dev/ttyAMA0; older Pis -> /dev/serial0). Use serial
+    # only if that exact device exists, and open *that* path (no re-detect mismatch).
+    try:
+        import rover_direct
+        port = rover_direct.detect_port()
+    except Exception:
+        port = None
+    if port and os.path.exists(port):
         try:
-            return RoverCtl("serial")
+            return RoverCtl("serial", port=port)
         except Exception as e:
-            print(f"rover serial detected but failed to open: {e}")
+            print(f"rover serial detected ({port}) but failed to open: {e}")
     if _reachable(ROVER_HTTP_HOST, ROVER_HTTP_PORT):
         return RoverCtl("http")
     return None
