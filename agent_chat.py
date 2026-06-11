@@ -24,6 +24,7 @@ import os
 import re
 import socket
 import sys
+import time
 
 import rover_client          # stdlib-only (urllib); safe to import anywhere
 import dobot
@@ -152,6 +153,15 @@ class RoverCtl:
     def center(self):
         self.set_camera(0, 0)
 
+    def demo(self):
+        # motor + camera self-test (backend-agnostic, mirrors rover_direct.demo)
+        self.set_camera(0, 45); time.sleep(2)
+        self.set_camera(0, -30); time.sleep(2)
+        self.set_camera(-45, 0); time.sleep(2)
+        self.center(); time.sleep(1)
+        self.drive(0.15, 0.15, 0.6)   # nudge forward
+        self.drive(0.2, -0.2, 0.5)    # spin right
+
     def close(self):
         if self.backend == "serial":
             self._r.close()
@@ -221,6 +231,8 @@ def rover_command(r: RoverCtl, line: str) -> str:
             r.oled(args[0], " ".join(args[1:])); return f"oled line {args[0]} set"
         if c == "oledclear":
             r.oled_default(); return "oled restored"
+        if c == "demo":
+            r.demo(); return "demo done"
         return f"?? unknown rover command '{c}'"
     except (IndexError, ValueError):
         return "bad args"
@@ -364,7 +376,7 @@ def main():
                 if cmd in ("help", ""):
                     print("rover camera: up/down/left/right [deg], cam P T, center, relax, lock\n"
                           "rover motors: drive L R [s], move L R, fwd/back/spinl/spinr [s], stop, estop\n"
-                          "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear\n"
+                          "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear, demo\n"
                           "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
                 elif cmd.lower().startswith("dobot"):
                     raw = cmd[5:].strip()

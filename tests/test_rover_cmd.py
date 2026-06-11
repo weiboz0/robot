@@ -21,8 +21,32 @@ class FakeRover:
     def drive(self, l, r, s):
         self.calls.append(("drive", float(l), float(r), float(s)))
 
+    def move(self, l, r):
+        self.calls.append(("move", float(l), float(r)))
+
     def stop(self):
         self.calls.append(("stop",))
+
+    def estop(self):
+        self.calls.append(("estop",))
+
+    def lights(self, front=0, base=0):
+        f = int(max(0, min(255, float(front))))
+        b = int(max(0, min(255, float(base))))
+        self.calls.append(("lights", f, b))
+        return f, b
+
+    def set_torque(self, lock):
+        self.calls.append(("torque", lock))
+
+    def oled(self, line, text):
+        self.calls.append(("oled", int(line), text))
+
+    def oled_default(self):
+        self.calls.append(("oled_default",))
+
+    def demo(self):
+        self.calls.append(("demo",))
 
     def center(self):
         self.set_camera(0, 0)
@@ -59,6 +83,41 @@ class RoverCmdTest(unittest.TestCase):
         r = FakeRover()
         agent_chat.rover_command(r, "spinr 0.5")
         self.assertIn(("drive", 0.2, -0.2, 0.5), r.calls)
+
+    def test_lights_parse_and_clamp(self):
+        r = FakeRover()
+        out = agent_chat.rover_command(r, "light 300 -5")   # out of range
+        self.assertIn(("lights", 255, 0), r.calls)
+        self.assertIn("front=255", out)
+
+    def test_move_continuous(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "move 0.2 -0.2")
+        self.assertIn(("move", 0.2, -0.2), r.calls)
+
+    def test_estop(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "estop")
+        self.assertIn(("estop",), r.calls)
+
+    def test_relax_and_lock(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "relax")
+        agent_chat.rover_command(r, "lock")
+        self.assertIn(("torque", False), r.calls)
+        self.assertIn(("torque", True), r.calls)
+
+    def test_oled_write_and_clear(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "oled 1 hello world")   # text keeps spaces
+        self.assertIn(("oled", 1, "hello world"), r.calls)
+        agent_chat.rover_command(r, "oledclear")
+        self.assertIn(("oled_default",), r.calls)
+
+    def test_demo(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "demo")
+        self.assertIn(("demo",), r.calls)
 
     def test_unknown_command(self):
         r = FakeRover()
