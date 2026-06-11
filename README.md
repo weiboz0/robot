@@ -19,6 +19,20 @@ echo 'OPENCODE_API_KEY=sk-...' >> .env     # or ~/.env  (LLM = OpenCode/minimax-
 python agent_chat.py
 ```
 
+### Pull from GitHub and run `chatbot` anywhere
+After cloning/pulling, run the installer once — then just type `chatbot` from any directory:
+
+```bash
+git clone git@github.com:weiboz0/robot.git && cd robot   # or: git pull
+pip install -r requirements.txt
+echo 'OPENCODE_API_KEY=sk-...' >> .env                   # or ~/.env
+./install.sh        # symlinks `chatbot` into ~/.local/bin (one time)
+chatbot             # run from anywhere
+```
+
+`install.sh` adds `~/.local/bin` to your PATH if it isn't already (open a new terminal
+afterward). You can also run it without installing: `./chatbot`.
+
 Chat in plain English, or prefix a line with `$` for a direct command:
 `$up 45`, `$cam 0 30`, `$drive 0.2 0.2 1`, `$stop` (rover); `$dobot GetPose()`,
 `$dobot EnableRobot()` (raw Dobot); `$help`. Without an API key it still runs —

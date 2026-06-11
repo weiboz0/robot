@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Launcher for the unified rover + Dobot MG400 chatbot.
+# Resolves its own location (even via symlink) so it runs from anywhere.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+# Prefer python3, fall back to python.
+PY="$(command -v python3 || command -v python)"
+if [ -z "$PY" ]; then
+  echo "chatbot: no python3/python found on PATH" >&2
+  exit 1
+fi
+exec "$PY" "$DIR/agent_chat.py" "$@"
