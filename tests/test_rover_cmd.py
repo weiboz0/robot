@@ -65,5 +65,21 @@ class RoverCmdTest(unittest.TestCase):
         self.assertIn("unknown", agent_chat.rover_command(r, "bogus").lower())
 
 
+class RoverCtlClampTest(unittest.TestCase):
+    """RoverCtl.drive must clamp speed/duration even on out-of-range input."""
+
+    def test_http_backend_clamps_drive(self):
+        import rover_client
+        calls = []
+        orig = rover_client.drive
+        rover_client.drive = lambda l, r, s: calls.append((l, r, s))
+        try:
+            rc = agent_chat.RoverCtl("http")     # http backend: no serial / no I/O on init
+            rc.drive(3, -3, 60)                  # wildly out of range
+        finally:
+            rover_client.drive = orig
+        self.assertEqual(calls, [(0.5, -0.5, 5.0)])
+
+
 if __name__ == "__main__":
     unittest.main()

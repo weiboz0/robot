@@ -93,10 +93,14 @@ class RoverCtl:
             rover_client.set_camera(self.pan, self.tilt)
 
     def drive(self, left, right, seconds):
+        # clamp here too (defense-in-depth; backends also clamp)
+        left = _clamp(float(left), -0.5, 0.5)
+        right = _clamp(float(right), -0.5, 0.5)
+        seconds = _clamp(float(seconds), 0.0, 5.0)
         if self.backend == "serial":
-            self._r.drive_for(float(left), float(right), float(seconds))
+            self._r.drive_for(left, right, seconds)
         else:
-            rover_client.drive(float(left), float(right), float(seconds))
+            rover_client.drive(left, right, seconds)
 
     def stop(self):
         if self.backend == "serial":
@@ -234,7 +238,12 @@ def main():
     load_dotenv()
     print("detecting robots...")
     rover = detect_rover()
-    arm = dobot.Dobot() if dobot.reachable() else None
+    arm = None
+    if dobot.reachable():
+        try:
+            arm = dobot.Dobot()
+        except OSError as e:
+            print(f"  dobot reachable but connect failed ({e}); disabling Dobot")
     print(f"  rover: {'%s (%s)' % (rover.where, rover.backend) if rover else 'not found'}")
     print(f"  dobot: {'192.168.1.6' if arm else 'not found'}")
     if rover is None and arm is None:
