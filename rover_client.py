@@ -44,3 +44,39 @@ def drive(left: float, right: float, seconds: float = 1.0) -> None:
 def stop() -> None:
     """Stop the wheels immediately."""
     _send_json({"T": 1, "L": 0, "R": 0})
+
+
+def move(left: float, right: float) -> None:
+    """Set wheel speeds continuously (no auto-stop). Use stop() to halt."""
+    left = max(-0.5, min(0.5, left))
+    right = max(-0.5, min(0.5, right))
+    _send_json({"T": 1, "L": left, "R": right})
+
+
+def lights(front: int = 0, base: int = 0) -> None:
+    """LED PWM 0..255. front=IO5 (head), base=IO4 (chassis)."""
+    front = max(0, min(255, int(front)))
+    base = max(0, min(255, int(base)))
+    _send_json({"T": 132, "IO4": base, "IO5": front})
+
+
+def estop() -> None:
+    """Stop wheels and gimbal immediately."""
+    _send_json({"T": 1, "L": 0, "R": 0})
+    _send_json({"T": 0})
+
+
+def servo_torque(lock: bool, servo_id: int = 255) -> None:
+    """Lock (True) or release (False) bus servos; 255 = all."""
+    _send_json({"T": 210, "id": int(servo_id), "cmd": 1 if lock else 0})
+
+
+def oled(line: int, text: str) -> None:
+    """Write text to an OLED line (0-3). NOTE: the rover's `base -c` HTTP path
+    splits on spaces, so multi-word text won't survive over HTTP (use serial)."""
+    _send_json({"T": 3, "lineNum": int(line), "Text": text})
+
+
+def oled_default() -> None:
+    """Restore the OLED's default status screen."""
+    _send_json({"T": -3})

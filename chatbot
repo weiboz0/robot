@@ -9,10 +9,19 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 
-# Prefer python3, fall back to python.
-PY="$(command -v python3 || command -v python)"
+# Pick a python that has the deps (openai, pyserial). On the rover these live in
+# the ugv_rpi venv, NOT system python — prefer a venv if one is present, so
+# `chatbot` gets chat ON without installing anything system-wide. Override with
+# the CHATBOT_PYTHON env var.
+PY="$CHATBOT_PYTHON"
 if [ -z "$PY" ]; then
-  echo "chatbot: no python3/python found on PATH" >&2
+  for cand in "$HOME/ugv_rpi/ugv-env/bin/python" "$DIR/.venv/bin/python" "$DIR/venv/bin/python"; do
+    if [ -x "$cand" ]; then PY="$cand"; break; fi
+  done
+fi
+PY="${PY:-$(command -v python3 || command -v python)}"
+if [ -z "$PY" ]; then
+  echo "chatbot: no python found (set CHATBOT_PYTHON to a python with openai+pyserial)" >&2
   exit 1
 fi
 exec "$PY" "$DIR/agent_chat.py" "$@"
