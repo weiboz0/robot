@@ -101,11 +101,53 @@ class RoverCtl:
         else:
             rover_client.drive(left, right, seconds)
 
+    def move(self, left, right):
+        # continuous, no auto-stop
+        left = _clamp(float(left), -0.5, 0.5)
+        right = _clamp(float(right), -0.5, 0.5)
+        if self.backend == "serial":
+            self._r.drive(left, right)
+        else:
+            rover_client.move(left, right)
+
     def stop(self):
         if self.backend == "serial":
             self._r.stop()
         else:
             rover_client.stop()
+
+    def estop(self):
+        if self.backend == "serial":
+            self._r.estop()
+        else:
+            rover_client.estop()
+
+    def lights(self, front=0, base=0):
+        front = int(_clamp(float(front), 0, 255))
+        base = int(_clamp(float(base), 0, 255))
+        if self.backend == "serial":
+            self._r.lights(front, base)
+        else:
+            rover_client.lights(front, base)
+        return front, base
+
+    def set_torque(self, lock):
+        if self.backend == "serial":
+            self._r.servo_torque(lock)
+        else:
+            rover_client.servo_torque(lock)
+
+    def oled(self, line, text):
+        if self.backend == "serial":
+            self._r.oled(int(line), text)
+        else:
+            rover_client.oled(int(line), text)
+
+    def oled_default(self):
+        if self.backend == "serial":
+            self._r.oled_default()
+        else:
+            rover_client.oled_default()
 
     def center(self):
         self.set_camera(0, 0)
@@ -163,8 +205,22 @@ def rover_command(r: RoverCtl, line: str) -> str:
             r.drive(-0.2, 0.2, args[0] if args else 0.6); return "spin left"
         if c == "spinr":
             r.drive(0.2, -0.2, args[0] if args else 0.6); return "spin right"
+        if c == "move":
+            r.move(args[0], args[1]); return "moving (use stop)"
         if c == "stop":
             r.stop(); return "stopped"
+        if c == "estop":
+            r.estop(); return "emergency stop (wheels + gimbal)"
+        if c == "light":
+            front = float(args[0]) if args else 0
+            base = float(args[1]) if len(args) > 1 else 0
+            f, b = r.lights(front, base); return f"lights -> front={f}, base={b}"
+        if c in ("relax", "lock"):
+            r.set_torque(c == "lock"); return "gimbal locked" if c == "lock" else "gimbal relaxed"
+        if c == "oled":
+            r.oled(args[0], " ".join(args[1:])); return f"oled line {args[0]} set"
+        if c == "oledclear":
+            r.oled_default(); return "oled restored"
         return f"?? unknown rover command '{c}'"
     except (IndexError, ValueError):
         return "bad args"
@@ -186,6 +242,16 @@ def build_tools(rover, arm):
                  "required": ["left", "right", "seconds"]}},
             {"name": "rover_stop", "description": "Stop the rover wheels.",
              "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_estop", "description": "Emergency stop: halt rover wheels AND gimbal immediately.",
+             "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_lights",
+             "description": "Set rover LED brightness (PWM 0..255). front=head light, base=chassis light. 0 = off.",
+             "parameters": {"type": "object", "properties": {
+                 "front": {"type": "number"}, "base": {"type": "number"}}, "required": ["front", "base"]}},
+            {"name": "rover_oled",
+             "description": "Write text to the rover's OLED screen line (0-3). Omit/empty to restore default screen.",
+             "parameters": {"type": "object", "properties": {
+                 "line": {"type": "number"}, "text": {"type": "string"}}, "required": ["line", "text"]}},
         ]
     if arm is not None:
         tools += [
@@ -215,6 +281,15 @@ def run_tool(rover, arm, name, a):
             rover.drive(a["left"], a["right"], a.get("seconds", 1.0)); return "drove, stopped"
         if name == "rover_stop":
             rover.stop(); return "stopped"
+        if name == "rover_estop":
+            rover.estop(); return "emergency stopped"
+        if name == "rover_lights":
+            f, b = rover.lights(a.get("front", 0), a.get("base", 0)); return f"lights front={f} base={b}"
+        if name == "rover_oled":
+            txt = a.get("text", "")
+            if txt == "":
+                rover.oled_default(); return "oled restored"
+            rover.oled(a.get("line", 0), txt); return "oled updated"
         if name == "dobot_get_pose":
             return arm.pose()
         if name == "dobot_get_mode":
@@ -235,7 +310,8 @@ SYSTEM = (
     "have a Waveshare UGV rover (tank wheels + pan/tilt camera) and/or a Dobot MG400 "
     "robotic arm, depending on which tools are provided — only use tools that exist. "
     "Keep actions small and safe unless told otherwise. Rover: tilt + is up; wheel "
-    "speeds small (<=0.3). Dobot: coordinates are mm (x,y,z) and degrees (r); move "
+    "speeds small (<=0.3); lights are PWM 0..255 (front=head, base=chassis, 0=off). "
+    "Dobot: coordinates are mm (x,y,z) and degrees (r); move "
     "conservatively and enable the arm before moving. After acting, briefly say what "
     "you did. Be concise."
 )
@@ -286,8 +362,9 @@ def main():
             if user.startswith("$"):
                 cmd = user[1:].strip()
                 if cmd in ("help", ""):
-                    print("rover: up/down/left/right [deg], cam P T, center, drive L R [s], "
-                          "fwd/back/spinl/spinr [s], stop\n"
+                    print("rover camera: up/down/left/right [deg], cam P T, center, relax, lock\n"
+                          "rover motors: drive L R [s], move L R, fwd/back/spinl/spinr [s], stop, estop\n"
+                          "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear\n"
                           "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
                 elif cmd.lower().startswith("dobot"):
                     raw = cmd[5:].strip()
