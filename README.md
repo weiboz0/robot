@@ -1,6 +1,31 @@
 # rover
 
-Tools for a Waveshare UGV Rover (Raspberry Pi + ESP32 sub-controller).
+Tools for a Waveshare UGV Rover (Raspberry Pi + ESP32 sub-controller) and a Dobot
+MG400 robotic arm.
+
+## Multi-robot chatbot (`agent_chat.py`) — recommended
+One chatbot that controls **both the rover and the Dobot MG400** in natural language.
+Same file, no per-machine edits — it **auto-detects** what it can reach:
+
+- **Rover**: direct serial if a serial port exists (on the Pi), else the rover's HTTP
+  API if reachable (on a computer), else disabled.
+- **Dobot** (`192.168.1.6`): TCP-IP if reachable, else disabled.
+
+Runs on the rover's Raspberry Pi or any computer (the Dobot can't run it itself).
+
+```bash
+pip install -r requirements.txt
+echo 'OPENCODE_API_KEY=sk-...' >> .env     # or ~/.env  (LLM = OpenCode/minimax-m3)
+python agent_chat.py
+```
+
+Chat in plain English, or prefix a line with `$` for a direct command:
+`$up 45`, `$cam 0 30`, `$drive 0.2 0.2 1`, `$stop` (rover); `$dobot GetPose()`,
+`$dobot EnableRobot()` (raw Dobot); `$help`. Without an API key it still runs —
+chat is off but `$` commands work.
+
+> The Dobot must be in **Remote/TCP control mode** (unlock in DobotStudio Pro) or it
+> replies `-1`. Run the tests with `python -m unittest discover -s tests -t .`.
 
 ## Chatbot (`chatbot.py`)
 A terminal chatbot that chats and drives the rover via natural language. Works
