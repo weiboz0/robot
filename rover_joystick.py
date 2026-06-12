@@ -7,9 +7,15 @@ Left stick drives the wheels, right stick aims the camera.
   Left stick    : throttle (up/down) + steering (left/right)
   Right stick   : camera pan / tilt
   RB (hold)     : turbo (higher top speed)
+  D-pad up/down : raise / lower the speed cap
   A button      : stop wheels
-  Y button      : center camera
+  B button      : take a photo (saved to ./photos)
   X button      : toggle head light
+  Y button      : center camera
+  LB button     : toggle base (chassis) light
+  Back button   : emergency stop (wheels + gimbal)
+  L3 (click L)  : relax gimbal (release servos to hand-position the camera)
+  R3 (click R)  : lock gimbal
   Start button  : quit
 
 Run:
@@ -24,15 +30,19 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 import pygame
 
 import rover_direct
+import rover_camera
 
 # --- gamepad mapping (Xbox 360 pad on Linux/SDL2) --------------------------
 AX_LX, AX_LY = 0, 1     # left stick: steer, throttle
 AX_RX, AX_RY = 3, 4     # right stick: camera pan, tilt
-BTN_A, BTN_X, BTN_Y = 0, 2, 3
-BTN_RB, BTN_START = 5, 7
+BTN_A, BTN_B, BTN_X, BTN_Y = 0, 1, 2, 3
+BTN_LB, BTN_RB = 4, 5
+BTN_BACK, BTN_START = 6, 7
+BTN_L3, BTN_R3 = 9, 10
 # --- tunables --------------------------------------------------------------
 DEADZONE = 0.15
-MAX_SPEED = 0.25        # normal wheel-speed cap (lowered to ease current draw)
+SPEED_STEPS = [0.15, 0.20, 0.25, 0.30, 0.40]   # selectable normal speed caps
+SPEED_START = 2          # index into SPEED_STEPS (-> 0.25)
 TURBO_SPEED = 0.40      # while RB held
 RAMP = 1.2              # max wheel-speed change per second (slew-rate limit):
                         # ramps speed gradually to avoid motor current spikes
@@ -41,6 +51,14 @@ PAN_RATE = 90.0         # deg/sec at full stick
 TILT_RATE = 70.0
 RATE_HZ = 25.0
 # ---------------------------------------------------------------------------
+
+CONTROLS = """controls:
+  left stick    drive (throttle + steer)      RB (hold)  turbo
+  right stick   camera pan / tilt             D-pad U/D  speed cap +/-
+  A  stop wheels        B  take photo         X  head light    Y  center camera
+  LB base light         Back  E-STOP          L3 relax gimbal  R3 lock gimbal
+  Start / Ctrl-C  quit
+"""
 
 DEBUG = "--debug" in sys.argv
 
@@ -86,13 +104,15 @@ def main():
     if not keep_app and rover_direct.stop_http_service():
         print("stopped ugv_rpi/app.py to free the serial port.")
     rover = rover_direct.Rover()
-    print(f"connected on {rover.port}. Left stick = drive, right stick = camera. "
-          "Start button or Ctrl-C to quit.\n")
+    print(f"connected on {rover.port}.\n" + CONTROLS)
 
     pan, tilt = 0.0, 0.0
     left, right = 0.0, 0.0   # current wheel speeds (ramped toward target)
-    light_on = False
+    head_on = False          # X -> head light
+    base_on = False          # LB -> base/chassis light
+    speed_idx = SPEED_START
     prev = {}
+    prev_hat = (0, 0)
     dt = 1.0 / RATE_HZ
     last_cam = None
     try:
@@ -115,11 +135,38 @@ def main():
             if pressed(BTN_A):
                 rover.stop()
             if pressed(BTN_X):
-                light_on = not light_on
-                rover.lights(255 if light_on else 0, 0)
+                head_on = not head_on
+                rover.lights(255 if head_on else 0, 255 if base_on else 0)
+                print(f"head light {'on' if head_on else 'off'}        ")
+            if pressed(BTN_LB):
+                base_on = not base_on
+                rover.lights(255 if head_on else 0, 255 if base_on else 0)
+                print(f"base light {'on' if base_on else 'off'}        ")
+            if pressed(BTN_B):
+                path = rover_camera.take_photo()
+                print(f"photo -> {path}        " if path
+                      else "no camera tool (rpicam-still) found        ")
+            if pressed(BTN_BACK):
+                left = right = 0.0
+                rover.estop()
+                print("EMERGENCY STOP        ")
+            if pressed(BTN_L3):
+                rover.servo_torque(False)
+                print("gimbal relaxed (hand-position it)        ")
+            if pressed(BTN_R3):
+                rover.servo_torque(True)
+                print("gimbal locked        ")
+
+            # D-pad (hat): up/down change the speed cap (rising-edge per nudge)
+            hat = js.get_hat(0) if js.get_numhats() else (0, 0)
+            if hat[1] != 0 and prev_hat[1] == 0:
+                speed_idx = clamp(speed_idx + (1 if hat[1] > 0 else -1),
+                                  0, len(SPEED_STEPS) - 1)
+                print(f"speed cap -> {SPEED_STEPS[speed_idx]:.2f}        ")
+            prev_hat = hat
 
             # driving from left stick (throttle + steer -> differential)
-            top = TURBO_SPEED if js.get_button(BTN_RB) else MAX_SPEED
+            top = TURBO_SPEED if js.get_button(BTN_RB) else SPEED_STEPS[speed_idx]
             throttle = -dz(js.get_axis(AX_LY))   # stick up = forward
             steer = dz(js.get_axis(AX_LX))
             tgt_left = clamp(throttle + steer, -1.0, 1.0) * top
