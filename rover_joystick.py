@@ -111,6 +111,7 @@ def main():
     head_on = False          # X -> head light
     base_on = False          # LB -> base/chassis light
     speed_idx = SPEED_START
+    estopped = False         # Back latches a hard stop until sticks recenter
     prev = {}
     prev_hat = (0, 0)
     dt = 1.0 / RATE_HZ
@@ -148,8 +149,9 @@ def main():
                       else "no camera tool (rpicam-still) found        ")
             if pressed(BTN_BACK):
                 left = right = 0.0
+                estopped = True
                 rover.estop()
-                print("EMERGENCY STOP        ")
+                print("EMERGENCY STOP (recenter sticks to resume)        ")
             if pressed(BTN_L3):
                 rover.servo_torque(False)
                 print("gimbal relaxed (hand-position it)        ")
@@ -169,6 +171,11 @@ def main():
             top = TURBO_SPEED if js.get_button(BTN_RB) else SPEED_STEPS[speed_idx]
             throttle = -dz(js.get_axis(AX_LY))   # stick up = forward
             steer = dz(js.get_axis(AX_LX))
+            if estopped:
+                if throttle == 0.0 and steer == 0.0:
+                    estopped = False             # sticks centered -> release
+                else:
+                    throttle = steer = 0.0       # hold stop until recentered
             tgt_left = clamp(throttle + steer, -1.0, 1.0) * top
             tgt_right = clamp(throttle - steer, -1.0, 1.0) * top
             # slew-rate limit: ramp toward target to avoid current spikes
