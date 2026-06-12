@@ -27,6 +27,7 @@ import sys
 import time
 
 import rover_client          # stdlib-only (urllib); safe to import anywhere
+import rover_camera          # stdlib-only; safe to import anywhere
 import dobot
 
 BASE_URL = os.environ.get("OPENCODE_BASE_URL", "").strip() or "https://opencode.ai/zen/go/v1"
@@ -153,6 +154,12 @@ class RoverCtl:
     def center(self):
         self.set_camera(0, 0)
 
+    def photo(self):
+        # On HTTP (a computer) grab from the rover's stream -> saves locally here.
+        # On serial (the Pi) the web app is down, so rover_camera uses rpicam-still.
+        host = ROVER_HTTP_HOST if self.backend == "http" else "127.0.0.1"
+        return rover_camera.take_photo(wait=True, host=host)
+
     def demo(self):
         # motor + camera self-test (backend-agnostic, mirrors rover_direct.demo)
         self.set_camera(0, 45); time.sleep(2)
@@ -233,6 +240,8 @@ def rover_command(r: RoverCtl, line: str) -> str:
             r.oled_default(); return "oled restored"
         if c == "demo":
             r.demo(); return "demo done"
+        if c == "photo":
+            p = r.photo(); return f"photo saved -> {p}" if p else "photo failed (camera busy?)"
         return f"?? unknown rover command '{c}'"
     except (IndexError, ValueError):
         return "bad args"
@@ -264,6 +273,9 @@ def build_tools(rover, arm):
              "description": "Write text to the rover's OLED screen line (0-3). Omit/empty to restore default screen.",
              "parameters": {"type": "object", "properties": {
                  "line": {"type": "number"}, "text": {"type": "string"}}, "required": ["line", "text"]}},
+            {"name": "rover_photo",
+             "description": "Take a photo with the rover's camera. Returns the saved image file path.",
+             "parameters": {"type": "object", "properties": {}}},
         ]
     if arm is not None:
         tools += [
@@ -302,6 +314,8 @@ def run_tool(rover, arm, name, a):
             if txt == "":
                 rover.oled_default(); return "oled restored"
             rover.oled(a.get("line", 0), txt); return "oled updated"
+        if name == "rover_photo":
+            p = rover.photo(); return f"photo saved to {p}" if p else "photo failed (camera busy?)"
         if name == "dobot_get_pose":
             return arm.pose()
         if name == "dobot_get_mode":
@@ -322,7 +336,8 @@ SYSTEM = (
     "have a Waveshare UGV rover (tank wheels + pan/tilt camera) and/or a Dobot MG400 "
     "robotic arm, depending on which tools are provided — only use tools that exist. "
     "Keep actions small and safe unless told otherwise. Rover: tilt + is up; wheel "
-    "speeds small (<=0.3); lights are PWM 0..255 (front=head, base=chassis, 0=off). "
+    "speeds small (<=0.3); lights are PWM 0..255 (front=head, base=chassis, 0=off); "
+    "you can take a photo with the camera. "
     "Dobot: coordinates are mm (x,y,z) and degrees (r); move "
     "conservatively and enable the arm before moving. After acting, briefly say what "
     "you did. Be concise."
@@ -376,7 +391,7 @@ def main():
                 if cmd in ("help", ""):
                     print("rover camera: up/down/left/right [deg], cam P T, center, relax, lock\n"
                           "rover motors: drive L R [s], move L R, fwd/back/spinl/spinr [s], stop, estop\n"
-                          "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear, demo\n"
+                          "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear, demo, photo\n"
                           "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
                 elif cmd.lower().startswith("dobot"):
                     raw = cmd[5:].strip()

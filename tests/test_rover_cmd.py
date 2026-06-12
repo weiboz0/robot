@@ -48,6 +48,10 @@ class FakeRover:
     def demo(self):
         self.calls.append(("demo",))
 
+    def photo(self):
+        self.calls.append(("photo",))
+        return "photos/rover_test.jpg"
+
     def center(self):
         self.set_camera(0, 0)
 
@@ -118,6 +122,12 @@ class RoverCmdTest(unittest.TestCase):
         r = FakeRover()
         agent_chat.rover_command(r, "demo")
         self.assertIn(("demo",), r.calls)
+
+    def test_photo(self):
+        r = FakeRover()
+        out = agent_chat.rover_command(r, "photo")
+        self.assertIn(("photo",), r.calls)
+        self.assertIn(".jpg", out)
 
     def test_unknown_command(self):
         r = FakeRover()
