@@ -4,10 +4,12 @@
 set -e
 DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
-chmod +x "$DIR/chatbot"
 mkdir -p "$HOME/.local/bin"
-ln -sf "$DIR/chatbot" "$HOME/.local/bin/chatbot"
-echo "Linked: chatbot -> $DIR/chatbot"
+for cmd in chatbot roverweb; do
+  chmod +x "$DIR/$cmd"
+  ln -sf "$DIR/$cmd" "$HOME/.local/bin/$cmd"
+  echo "Linked: $cmd -> $DIR/$cmd"
+done
 
 # Ensure ~/.local/bin is on PATH (covers bash and zsh).
 case ":$PATH:" in
@@ -22,4 +24,4 @@ case ":$PATH:" in
     ;;
 esac
 
-echo "Done. Run:  chatbot"
+echo "Done. Run:  chatbot   (or:  roverweb  for the photo gallery + live view)"

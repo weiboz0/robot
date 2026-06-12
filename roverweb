@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Launcher for the rover photo gallery + live-view web server (rover_web.py).
+# Resolves its own location (even via symlink) and prefers a venv python that
+# has Flask (on the rover that's ~/ugv_rpi/ugv-env). Override with CHATBOT_PYTHON.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+PY="$CHATBOT_PYTHON"
+if [ -z "$PY" ]; then
+  for cand in "$HOME/ugv_rpi/ugv-env/bin/python" "$DIR/.venv/bin/python" "$DIR/venv/bin/python"; do
+    if [ -x "$cand" ]; then PY="$cand"; break; fi
+  done
+fi
+PY="${PY:-$(command -v python3 || command -v python)}"
+if [ -z "$PY" ]; then
+  echo "roverweb: no python found (set CHATBOT_PYTHON to a python with Flask)" >&2
+  exit 1
+fi
+exec "$PY" "$DIR/rover_web.py" "$@"
