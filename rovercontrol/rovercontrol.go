@@ -1543,6 +1543,7 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
 <header><h1>🤖 Rover controller</h1>
  <button class="warn" onclick="cmd('estop')">⛔ E-STOP</button>
  <button onclick="snap()">📸 Snapshot</button>
+ <span id="gp" style="font-size:12px;color:#999">🎮 none (press a button)</span>
  <span id="health"><small>…</small></span>
 </header>
 <img class="live" src="/video_feed" alt="live view">
@@ -1599,8 +1600,53 @@ async function load(){
 async function del(n){await fetch('/delete_photo/'+n,{method:'POST'});seen='';load();}
 async function health(){try{const h=await(await fetch('/healthz')).json();
  document.getElementById('health').innerHTML='<small>serial '+(h.serial.up?'✓':'✗')+
- ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad?'✓':'–')+'</small>';}catch(e){}}
+ ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad.up?'✓':'–')+'</small>';}catch(e){}}
 setInterval(()=>{load();health();},2000);load();health();
+
+// ── Mac-side gamepad: Gamepad API → existing HTTP endpoints (no server change).
+// Drive is in-flight-guarded and refreshed continuously while deflected (feeds
+// the 500ms server watchdog); centered → /stop once. Camera integrates the
+// right stick into an absolute angle for /camera_aim. getGamepads() is re-read
+// every tick (never cached).
+let padIndex=null,padPrev=[],driveBusy=false,aimBusy=false,wasMoving=false;
+let panAngle=0,tiltAngle=0,lastDrive=0,lastAim=0;
+const DZ=0.15,PANR=90,TILTR=70,SENDMS=120;
+const gpEl=document.getElementById('gp');
+function gpStop(){fetch('/stop',{method:'POST'});}
+addEventListener('gamepadconnected',e=>{padIndex=e.gamepad.index;padPrev=[];
+ if(gpEl)gpEl.textContent='🎮 '+e.gamepad.id.slice(0,20);});
+addEventListener('gamepaddisconnected',e=>{if(e.gamepad.index===padIndex){
+ padIndex=null;gpStop();if(gpEl)gpEl.textContent='🎮 none';}});
+document.addEventListener('visibilitychange',()=>{if(document.hidden){wasMoving=false;gpStop();}});
+addEventListener('pagehide',()=>{try{fetch('/stop',{method:'POST',keepalive:true});}catch(e){}});
+function dzf(v){return Math.abs(v)<DZ?0:v;}
+function gpEdge(b,i){const n=!!(b&&b.pressed);const f=n&&!padPrev[i];padPrev[i]=n;return f;}
+function gpPoll(){
+ if(padIndex===null||document.hidden)return; // never drive while backgrounded
+ const gp=navigator.getGamepads&&navigator.getGamepads()[padIndex];
+ if(!gp)return;
+ const ax=gp.axes,bt=gp.buttons,now=Date.now();
+ if(gpEdge(bt[0],0))cmd('stop');
+ if(gpEdge(bt[1],1))snap();
+ if(gpEdge(bt[2],2))cmd('light_head');
+ if(gpEdge(bt[3],3)){panAngle=0;tiltAngle=0;cmd('camera_center');}
+ if(gpEdge(bt[4],4))cmd('light_base');
+ if(gpEdge(bt[8],8))cmd('estop');
+ const thr=-dzf(ax[1]||0),str=dzf(ax[0]||0);
+ const l=Math.max(-1,Math.min(1,thr+str)),r=Math.max(-1,Math.min(1,thr-str));
+ if(l!==0||r!==0){wasMoving=true;
+  if(!driveBusy&&now-lastDrive>=SENDMS){driveBusy=true;lastDrive=now;
+   fetch('/drive?l='+l.toFixed(3)+'&r='+r.toFixed(3),{method:'POST'}).finally(()=>{driveBusy=false;});}
+ }else if(wasMoving){wasMoving=false;gpStop();}
+ const dp=dzf(ax[2]||0)*PANR/20,dt=-dzf(ax[3]||0)*TILTR/20;
+ if(dp!==0||dt!==0){
+  panAngle=Math.max(-180,Math.min(180,panAngle+dp));
+  tiltAngle=Math.max(-45,Math.min(90,tiltAngle+dt));
+  if(!aimBusy&&now-lastAim>=SENDMS){aimBusy=true;lastAim=now;
+   fetch('/camera_aim?pan='+panAngle.toFixed(1)+'&tilt='+tiltAngle.toFixed(1),{method:'POST'}).finally(()=>{aimBusy=false;});}
+ }
+}
+setInterval(gpPoll,50);
 </script>
 </body></html>`
 

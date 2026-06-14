@@ -154,6 +154,30 @@ func TestHTTPPhotosListAndDelete(t *testing.T) {
 	}
 }
 
+// TestIndexGamepadJS pins the browser-gamepad front-end (plan 005) so it can't
+// silently regress: the poller, in-flight guard, watchdog-fed drive refresh,
+// camera-aim integrator, and stop-on-disconnect/center must all be present.
+func TestIndexGamepadJS(t *testing.T) {
+	app, _ := testApp(t)
+	body := do(t, app, "GET", "/").Body.String()
+	for _, want := range []string{
+		"navigator.getGamepads", // re-read live each tick
+		"gamepadconnected",      // connect handler
+		"gamepaddisconnected",   // disconnect → stop
+		"driveBusy",             // in-flight guard (no fetch pile-up)
+		"/drive?l=",             // drive via existing endpoint
+		"/camera_aim?pan=",      // absolute-aim integrator
+		"panAngle",              // client-side angle integration
+		"wasMoving",             // deadzone → /stop once
+		"visibilitychange",      // background → stop failsafe
+		"keepalive:true",        // pagehide stop
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("gamepad JS missing %q", want)
+		}
+	}
+}
+
 func TestHTTPMethodAndCORS(t *testing.T) {
 	app, _ := testApp(t)
 	// GET on a POST-only command → 405 (method pattern mismatch) or 404
