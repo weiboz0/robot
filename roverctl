@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Launcher for rovercontrol, the single-file Go rover controller.
+# Resolves its own location (even via symlink) and execs the arm64 binary, a
+# built artifact (gitignored) copied to the repo root on deploy.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+BIN="$DIR/rovercontrol-arm64"
+if [ ! -x "$BIN" ]; then
+  echo "roverctl: $BIN missing — build it on a machine with Go:" >&2
+  echo "  cd rovercontrol && GOOS=linux GOARCH=arm64 go build -o ../rovercontrol-arm64 ." >&2
+  echo "then copy it here (e.g. scp rovercontrol-arm64 rover:robot/)" >&2
+  exit 1
+fi
+exec "$BIN" -photos "$DIR/photos" "$@"
