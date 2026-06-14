@@ -13,10 +13,20 @@ RUN_INTEGRATION=0
 fail=0
 step() { echo; echo "=== $* ==="; }
 
-# ── unit: Go controller ─────────────────────────────────────────────────────
+# ── unit: Go controller (with coverage) ─────────────────────────────────────
+# COVERAGE_MIN: fail if statement coverage drops below this percent (default 70).
+COVERAGE_MIN="${COVERAGE_MIN:-70}"
 if [ -d rovercontrol ] && command -v go >/dev/null 2>&1; then
-  step "go vet + test (rovercontrol)"
-  ( cd rovercontrol && go vet ./... && go test -race ./... ) || fail=1
+  step "go vet + test + coverage (rovercontrol)"
+  if ( cd rovercontrol && go vet ./... && \
+       go test -race -covermode=atomic -coverprofile=/tmp/rc-cov.out ./... ); then
+    pct=$( (cd rovercontrol && go tool cover -func=/tmp/rc-cov.out) | awk '/^total:/{print $3}')
+    echo "coverage: $pct (floor ${COVERAGE_MIN}%)  [unit only; hardware paths covered by --all integration]"
+    num=${pct%\%}
+    awk "BEGIN{exit !($num < $COVERAGE_MIN)}" && { echo "coverage below floor"; fail=1; }
+  else
+    fail=1
+  fi
   step "go cross-compile (linux/arm64)"
   ( cd rovercontrol && GOOS=linux GOARCH=arm64 go build -o /tmp/rovercontrol-ci-arm64 . ) || fail=1
 else
@@ -33,16 +43,13 @@ else
   echo "skip: python/tests not available"
 fi
 
-# ── integration (opt-in; needs the rover reachable) ─────────────────────────
-if [ "$RUN_INTEGRATION" = 1 ]; then
-  step "integration: rover reachable + controller health"
-  if ssh -o ConnectTimeout=6 rover true 2>/dev/null; then
-    # rovercontrol must be answering on :8080 with serial+camera up
-    curl -fsS --max-time 5 "http://192.168.1.131:8080/healthz" \
-      | grep -q '"up":true' || { echo "controller /healthz not healthy"; fail=1; }
-  else
-    echo "rover unreachable — integration skipped (not a failure)"
-  fi
+# ── integration (opt-in; runs the Go integration suite vs the live rover) ────
+# The -tags integration tests hit the deployed controller's HTTP API and
+# self-skip if it's unreachable, so they never fail CI when offline.
+if [ "$RUN_INTEGRATION" = 1 ] && [ -d rovercontrol ] && command -v go >/dev/null 2>&1; then
+  step "go integration tests (live rover, ROVER_URL=${ROVER_URL:-http://192.168.1.131:8080})"
+  ( cd rovercontrol && ROVER_URL="${ROVER_URL:-http://192.168.1.131:8080}" \
+      go test -tags integration -run Integration ./... ) || fail=1
 fi
 
 echo
