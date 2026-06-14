@@ -235,12 +235,12 @@ func TestParseJSEvent(t *testing.T) {
 
 func TestGamepadReader(t *testing.T) {
 	g := newGamepad()
-	stream := append(jsEventBytes(16383, jsEventAxis, axLX), jsEventBytes(1, jsEventButton, btnA)...)
+	stream := append(jsEventBytes(16383, jsEventAxis, 0), jsEventBytes(1, jsEventButton, 0)...)
 	g.reader(context.Background(), bytes.NewReader(stream)) // returns at EOF
-	if v := g.axis(axLX); v < 0.49 || v > 0.51 {
+	if v := g.axis(0); v < 0.49 || v > 0.51 {
 		t.Fatalf("axis normalize: %v", v)
 	}
-	if !g.button(btnA) {
+	if !g.button(0) {
 		t.Fatal("button not set")
 	}
 }
@@ -251,7 +251,7 @@ func TestGamepadDisconnectStops(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pw.Write(jsEventBytes(32767, jsEventAxis, axLY)) // stick deflected when it drops
+	pw.Write(jsEventBytes(32767, jsEventAxis, 1)) // left-Y deflected when it drops
 	done := make(chan struct{})
 	go func() { app.runGamepad(context.Background(), pr); close(done) }()
 	time.Sleep(80 * time.Millisecond) // let it connect + drive
@@ -294,6 +294,8 @@ func testApp(t *testing.T) (*App, *recLink) {
 	app := &App{rover: r, hub: newHub(), cam: &Camera{}, photoDir: t.TempDir()}
 	app.move = newMovement(r)
 	app.aim = &CameraAim{r: r}
+	m := defaultMapping()
+	app.mapping, app.mapSource = &m, "default"
 	app.cam.setStatus(true, "")
 	return app, rl
 }
@@ -421,11 +423,14 @@ func TestHTTPHealthz(t *testing.T) {
 	var h struct {
 		Serial  map[string]any `json:"serial"`
 		Camera  map[string]any `json:"camera"`
-		Gamepad bool           `json:"gamepad"`
+		Gamepad map[string]any `json:"gamepad"`
 	}
 	json.Unmarshal(w.Body.Bytes(), &h)
 	if h.Serial["up"] != true || h.Camera["up"] != false || h.Camera["err"] != "busy" {
 		t.Fatalf("healthz: %s", w.Body.String())
+	}
+	if h.Gamepad["mapping"] != "default" {
+		t.Fatalf("healthz gamepad mapping: %v", h.Gamepad)
 	}
 }
 
