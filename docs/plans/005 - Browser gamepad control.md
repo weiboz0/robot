@@ -157,4 +157,30 @@ only on press (not watchdog-relevant).
 
 ## Post-execution report
 
-_(filled in at the end)_
+**Shipped (PR #10, merged):** browser Gamepad API support in the embedded web UI
+— a 20 Hz poller (re-reading `getGamepads()` each tick) driving the rover via the
+existing HTTP endpoints, with an in-flight-guarded `/drive` refreshed at ~8 Hz
+while deflected (watchdog-fed), `/stop`-once on center, a client-side camera
+angle integrator → absolute `/camera_aim`, standard-mapping buttons, and
+disconnect/hidden/pagehide failsafes. Also fixed the `/healthz` gamepad-object
+health display. No Go control change — the browser can't bypass server safety.
+
+**Deviations:** none material. Review-driven changes vs. the first draft:
+in-flight guard + watchdog-fed continuous refresh (not send-on-change), normalized
+values (no client speed double-scaling), the camera integrator, and — from the
+code review — `gpPoll` skips while `document.hidden` (codex caught a hidden-page
+re-drive that undercut the failsafe). Camera uses a fixed-rate integrator
+(matching the Go joystick loop) rather than measured `dt`; noted as acceptable.
+
+**Tradeoffs:** front-end-only keeps it minimal and safe (all enforcement stays in
+Go) at the cost of being Chrome-first (Safari's Gamepad API on plain-http LAN is
+unreliable). Pi-pad (004) and browser-pad both driving would funnel through the
+same server arbitration (use one at a time).
+
+**Deploy result (2026-06-14):** rebuilt arm64, rsynced (checksum match),
+restarted; `/healthz` up (serial/camera/gamepad), and `GET /` serves the gamepad
+JS. **Open acceptance step (needs a human + a Mac gamepad):** open
+`http://192.168.1.131:8080` in Chrome, press a button to activate, and confirm
+left stick drives (releasing stops within ~0.5 s), right stick aims, buttons act,
+and backgrounding/unplugging stops the rover. I can't operate a physical gamepad
+or a browser to run this.
