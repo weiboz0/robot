@@ -508,6 +508,118 @@ func (s *sizedReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func TestBuildCameraCmd(t *testing.T) {
+	ctx := context.Background()
+	got := buildCameraCmd(ctx, "v4l2", "/dev/video0", 1280, 720, 30).Args
+	want := []string{"v4l2-ctl", "-d", "/dev/video0",
+		"--set-fmt-video=width=1280,height=720,pixelformat=MJPG",
+		"--stream-mmap", "--stream-count=0", "--stream-to=-"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("v4l2 sized args:\n got %v\nwant %v", got, want)
+	}
+	got = buildCameraCmd(ctx, "v4l2", "/dev/video1", 0, 0, 30).Args
+	if strings.Join(got, " ") != "v4l2-ctl -d /dev/video1 --set-fmt-video=pixelformat=MJPG --stream-mmap --stream-count=0 --stream-to=-" {
+		t.Fatalf("v4l2 unsized args: %v", got)
+	}
+	got = buildCameraCmd(ctx, "rpicam", "", 1280, 720, 30).Args
+	want = []string{"rpicam-vid", "-n", "-t", "0", "--codec", "mjpeg",
+		"--width", "1280", "--height", "720", "--framerate", "30", "-o", "-"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("rpicam args:\n got %v\nwant %v", got, want)
+	}
+	// rpicam with 0 dimensions/fps omits them too ("let the camera choose")
+	got = buildCameraCmd(ctx, "rpicam", "", 0, 0, 0).Args
+	if strings.Join(got, " ") != "rpicam-vid -n -t 0 --codec mjpeg -o -" {
+		t.Fatalf("rpicam unsized args: %v", got)
+	}
+}
+
+func TestCameraRunUnsizedRetryAndExhaustion(t *testing.T) {
+	// All attempts fail instantly → run() should try sized then unsized once,
+	// then stop double-spawning (exhaustion), and surface the unsized error.
+	var mu sync.Mutex
+	var calls [][2]int
+	c := &Camera{mode: "v4l2", width: 1280, height: 720, fps: 30}
+	c.attemptFn = func(ctx context.Context, hub *Hub, w, h int) error {
+		mu.Lock()
+		calls = append(calls, [2]int{w, h})
+		mu.Unlock()
+		return fmt.Errorf("VIDIOC_STREAMON: failed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.run(ctx, newHub()); close(done) }()
+
+	// wait until both the sized and the unsized attempt have happened
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(calls)
+		mu.Unlock()
+		if n >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) < 2 {
+		t.Fatalf("expected sized+unsized attempts, got %v", calls)
+	}
+	if calls[0] != [2]int{1280, 720} || calls[1] != [2]int{0, 0} {
+		t.Fatalf("first two attempts should be sized then unsized: %v", calls[:2])
+	}
+	// exhaustion: at most one unsized (0,0) attempt despite repeated failures
+	unsized := 0
+	for _, call := range calls {
+		if call == [2]int{0, 0} {
+			unsized++
+		}
+	}
+	if unsized != 1 {
+		t.Fatalf("unsized retry should fire once (exhaustion), fired %d times: %v", unsized, calls)
+	}
+	// the surfaced status carries the (clearer) unsized error
+	if _, e := c.status(); !strings.Contains(e, "unsized:") {
+		t.Fatalf("status should surface unsized error, got %q", e)
+	}
+}
+
+func TestResolveCameraMode(t *testing.T) {
+	existing := t.TempDir() + "/video0"
+	os.WriteFile(existing, nil, 0o644)
+	missing := t.TempDir() + "/nope"
+	cases := []struct{ mode, device, want string }{
+		{"auto", existing, "v4l2"},
+		{"auto", missing, "rpicam"},
+		{"v4l2", missing, "v4l2"},
+		{"rpicam", existing, "rpicam"},
+		{"bogus", existing, "rpicam"},
+	}
+	for _, c := range cases {
+		if got := resolveCameraMode(c.mode, c.device); got != c.want {
+			t.Fatalf("resolveCameraMode(%q)=%q want %q", c.mode, got, c.want)
+		}
+	}
+}
+
+func TestTailBuffer(t *testing.T) {
+	var tb tailBuffer
+	tb.Write([]byte("line1\nline2\n"))
+	tb.Write(bytes.Repeat([]byte("x"), 4000))
+	if len(tb.String()) > 2048 {
+		t.Fatalf("tailBuffer not bounded: %d", len(tb.String()))
+	}
+	var tb2 tailBuffer
+	tb2.Write([]byte("first\nVIDIOC_STREAMON: failed"))
+	if lastLine(tb2.String()) != "VIDIOC_STREAMON: failed" {
+		t.Fatalf("lastLine: %q", lastLine(tb2.String()))
+	}
+}
+
 func TestHubLatestWins(t *testing.T) {
 	h := newHub()
 	ch, cancel := h.subscribe()
