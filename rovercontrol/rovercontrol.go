@@ -667,6 +667,9 @@ type App struct {
 
 	gpMu sync.Mutex
 	gpUp bool
+
+	mapping   *GamepadMapping // gamepad control mapping (default or from config)
+	mapSource string          // "default" | "config" | "invalid"
 }
 
 func (app *App) setLights(head, base bool) error {
@@ -820,17 +823,7 @@ func parseJSEvent(b []byte) (jsEvent, bool) {
 	}, true
 }
 
-// gamepad mapping (Xbox-style; raw js0 indices may differ — use -gamepad-debug
-// to re-derive on the actual pad). Defaults mirror rover_joystick.py.
-const (
-	axLX, axLY             = 0, 1
-	axRX, axRY             = 3, 4
-	btnA, btnB, btnX, btnY = 0, 1, 2, 3
-	btnLB, btnRB           = 4, 5
-	btnBack, btnStart      = 6, 7
-	btnL3, btnR3           = 9, 10
-)
-
+// Behavioral tuning (NOT part of the per-pad mapping — see GamepadMapping).
 const (
 	deadzone = 0.15
 	turbo    = 0.40
@@ -841,6 +834,192 @@ const (
 )
 
 var speedSteps = []float64{0.15, 0.20, 0.25, 0.30, 0.40}
+
+// ───────────────────── gamepad mapping (per-pad, configurable) ──────────────
+
+// AxisMap is a stick/trigger axis index plus a sign: Invert=true means
+// stick-up / stick-right reads as +1 regardless of the pad's raw polarity.
+type AxisMap struct {
+	Index  int  `json:"index"`
+	Invert bool `json:"invert"`
+}
+
+// HatMap models the D-pad's three real shapes across pads.
+type HatMap struct {
+	Kind string  `json:"kind"`           // "axis" | "buttons" | "none"
+	Axis AxisMap `json:"axis,omitempty"` // Kind=="axis": vertical axis (+ = up)
+	Up   int     `json:"up,omitempty"`   // Kind=="buttons": up button index
+	Down int     `json:"down,omitempty"` // Kind=="buttons": down button index
+}
+
+// GamepadMapping carries only what identifies a pad's controls (indices + axis
+// signs). Tuning (deadzone/rates/speedSteps) stays in code constants.
+type GamepadMapping struct {
+	Throttle  AxisMap `json:"throttle"` // left stick Y (up = forward)
+	Steer     AxisMap `json:"steer"`    // left stick X (right = right)
+	Pan       AxisMap `json:"pan"`      // right stick X (right = pan right)
+	Tilt      AxisMap `json:"tilt"`     // right stick Y (up = tilt up)
+	Turbo     int     `json:"turbo"`    // hold for higher top speed (RB)
+	Stop      int     `json:"stop"`
+	Estop     int     `json:"estop"`
+	HeadLight int     `json:"head_light"`
+	BaseLight int     `json:"base_light"`
+	Center    int     `json:"center"`
+	Snapshot  int     `json:"snapshot"`
+	Relax     int     `json:"relax"`
+	Lock      int     `json:"lock"`
+	Hat       HatMap  `json:"hat"` // D-pad → speed cap
+}
+
+// defaultMapping reproduces EXACTLY the historical hard-coded constants (and the
+// signs the old loop applied), so with no config file behavior is unchanged.
+func defaultMapping() GamepadMapping {
+	return GamepadMapping{
+		Throttle:  AxisMap{1, true},  // throttle = -axis(LY): up = forward
+		Steer:     AxisMap{0, false}, // axis(LX)
+		Pan:       AxisMap{3, false}, // axis(RX)
+		Tilt:      AxisMap{4, true},  // dTilt = -axis(RY): up = tilt up
+		Turbo:     5,                 // RB
+		Stop:      0,                 // A
+		Snapshot:  1,                 // B
+		HeadLight: 2,                 // X
+		Center:    3,                 // Y
+		BaseLight: 4,                 // LB
+		Estop:     6,                 // Back
+		Relax:     9,                 // L3
+		Lock:      10,                // R3
+		// D-pad vertical on axis 7; up (raw negative) => +1 via Invert.
+		Hat: HatMap{Kind: "axis", Axis: AxisMap{7, true}},
+	}
+}
+
+func (m GamepadMapping) validate() error {
+	idx := []int{m.Throttle.Index, m.Steer.Index, m.Pan.Index, m.Tilt.Index,
+		m.Turbo, m.Stop, m.Estop, m.HeadLight, m.BaseLight, m.Center,
+		m.Snapshot, m.Relax, m.Lock}
+	for _, i := range idx {
+		if i < 0 {
+			return fmt.Errorf("negative control index %d", i)
+		}
+	}
+	switch m.Hat.Kind {
+	case "axis":
+		if m.Hat.Axis.Index < 0 {
+			return fmt.Errorf("negative hat axis %d", m.Hat.Axis.Index)
+		}
+	case "buttons":
+		if m.Hat.Up < 0 || m.Hat.Down < 0 {
+			return fmt.Errorf("negative hat button index")
+		}
+	case "none":
+	default:
+		return fmt.Errorf("invalid hat kind %q", m.Hat.Kind)
+	}
+	return nil
+}
+
+// loadMapping returns (mapping, source). Missing file → default. Present →
+// unmarshalled OVER the default (so partial JSON keeps defaults), then
+// validated. A malformed/invalid file returns an error WITHOUT falling back —
+// the caller disables the gamepad so the rover never drives with wrong controls.
+func loadMapping(path string) (GamepadMapping, string, error) {
+	m := defaultMapping()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return m, "default", nil
+		}
+		return GamepadMapping{}, "invalid", err
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return GamepadMapping{}, "invalid", fmt.Errorf("parse %s: %w", path, err)
+	}
+	if err := m.validate(); err != nil {
+		return GamepadMapping{}, "invalid", fmt.Errorf("validate %s: %w", path, err)
+	}
+	return m, "config", nil
+}
+
+// ── per-tick decision (pure, unit-testable without hardware) ────────────────
+
+// gpState is a snapshot accessor over the live gamepad (or a fake in tests).
+type gpState struct {
+	axis   func(idx int) float64
+	button func(idx int) bool
+}
+
+func axisSigned(st gpState, a AxisMap) float64 {
+	v := st.axis(a.Index)
+	if a.Invert {
+		v = -v
+	}
+	return v
+}
+
+func hatDirection(h HatMap, st gpState) int {
+	switch h.Kind {
+	case "axis":
+		v := axisSigned(st, h.Axis)
+		if v > 0.5 {
+			return 1
+		} else if v < -0.5 {
+			return -1
+		}
+	case "buttons":
+		if st.button(h.Up) {
+			return 1
+		}
+		if st.button(h.Down) {
+			return -1
+		}
+	}
+	return 0
+}
+
+// gpPrev carries edge-detection state across ticks.
+type gpPrev struct {
+	btn map[int]bool
+	hat int
+}
+
+// gpActions is the decision for one tick: which buttons fired (rising edge),
+// the speed-cap step, the deadzoned signed stick values, and turbo.
+type gpActions struct {
+	stop, estop, head, base, snap, center, relax, lock bool
+	hatDelta                                           int
+	throttle, steer, pan, tilt                         float64
+	turbo                                              bool
+}
+
+// computeJoystick reads the mapping against a state snapshot and updates prev.
+func computeJoystick(m *GamepadMapping, st gpState, prev *gpPrev) gpActions {
+	edge := func(idx int) bool {
+		now := st.button(idx)
+		fired := now && !prev.btn[idx]
+		prev.btn[idx] = now
+		return fired
+	}
+	var a gpActions
+	a.stop = edge(m.Stop)
+	a.estop = edge(m.Estop)
+	a.head = edge(m.HeadLight)
+	a.base = edge(m.BaseLight)
+	a.snap = edge(m.Snapshot)
+	a.center = edge(m.Center)
+	a.relax = edge(m.Relax)
+	a.lock = edge(m.Lock)
+	a.turbo = st.button(m.Turbo)
+	hd := hatDirection(m.Hat, st) // speed cap on rising edge only
+	if hd != 0 && prev.hat == 0 {
+		a.hatDelta = hd
+	}
+	prev.hat = hd
+	a.throttle = dz(axisSigned(st, m.Throttle))
+	a.steer = dz(axisSigned(st, m.Steer))
+	a.pan = dz(axisSigned(st, m.Pan))
+	a.tilt = dz(axisSigned(st, m.Tilt))
+	return a
+}
 
 func dz(v float64) float64 {
 	if v < deadzone && v > -deadzone {
@@ -865,8 +1044,14 @@ type gamepad struct {
 	mu      sync.Mutex
 	axes    map[uint8]float64
 	buttons map[uint8]bool
-	hatX    int // D-pad as buttons 13/14 (L/R) or 11/12 (U/D) varies; tracked via axes too
-	hatY    int
+}
+
+// state exposes the gamepad as a gpState (int indices) for computeJoystick.
+func (g *gamepad) state() gpState {
+	return gpState{
+		axis:   func(i int) float64 { return g.axis(uint8(i)) },
+		button: func(i int) bool { return g.button(uint8(i)) },
+	}
 }
 
 func newGamepad() *gamepad {
@@ -920,15 +1105,8 @@ func (app *App) joystickLoop(ctx context.Context, g *gamepad) {
 
 	var left, right float64
 	speedIdx := 2
-	prev := map[uint8]bool{}
-	prevHat := 0
-
-	edge := func(b uint8) bool {
-		now := g.button(b)
-		fired := now && !prev[b]
-		prev[b] = now
-		return fired
-	}
+	prev := &gpPrev{btn: map[int]bool{}}
+	st := g.state()
 
 	for {
 		select {
@@ -937,67 +1115,49 @@ func (app *App) joystickLoop(ctx context.Context, g *gamepad) {
 		case <-ticker.C:
 		}
 
-		if edge(btnStart) {
-			// no process to quit; ignore (kept for parity)
-		}
-		if edge(btnY) {
+		a := computeJoystick(app.mapping, st, prev)
+		if a.center {
 			app.aim.center()
 		}
-		if edge(btnA) {
+		if a.stop {
 			app.move.stop()
 		}
-		if edge(btnX) {
+		if a.head {
 			app.toggleHead()
 		}
-		if edge(btnLB) {
+		if a.base {
 			app.toggleBase()
 		}
-		if edge(btnB) {
+		if a.snap {
 			go app.snapshot(time.Now())
 		}
-		if edge(btnBack) {
+		if a.estop {
 			left, right = 0, 0
 			app.move.doEstop() // latches in Movement; held sticks stay refused
 		}
-		if edge(btnL3) {
+		if a.relax {
 			app.rover.gimbalTorque(false)
 		}
-		if edge(btnR3) {
+		if a.lock {
 			app.rover.gimbalTorque(true)
 		}
-
-		// D-pad up/down change the speed cap (rising edge). On many pads the
-		// D-pad is an axis pair; treat axis 7 (vertical) as the hat.
-		hatY := 0
-		if v := g.axis(7); v < -0.5 {
-			hatY = 1
-		} else if v > 0.5 {
-			hatY = -1
-		}
-		if hatY != 0 && prevHat == 0 {
-			speedIdx = int(clamp(float64(speedIdx+hatY), 0, float64(len(speedSteps)-1)))
+		if a.hatDelta != 0 {
+			speedIdx = int(clamp(float64(speedIdx+a.hatDelta), 0, float64(len(speedSteps)-1)))
 			app.move.setCap(speedSteps[speedIdx])
 		}
-		prevHat = hatY
 
-		// driving from the left stick
 		top := speedSteps[speedIdx]
-		if g.button(btnRB) {
+		if a.turbo {
 			top = turbo
 		}
-		throttle := -dz(g.axis(axLY)) // stick up = forward
-		steer := dz(g.axis(axLX))
-		tgtL, tgtR := driveMix(throttle, steer, top)
+		tgtL, tgtR := driveMix(a.throttle, a.steer, top)
 		step := ramp * dt
 		left = rampToward(left, tgtL, step)
 		right = rampToward(right, tgtR, step)
 		app.move.setDrive(left, right)
 
-		// camera from the right stick (integrate to absolute angles)
-		dPan := dz(g.axis(axRX)) * panRate * dt
-		dTilt := -dz(g.axis(axRY)) * tiltRate * dt
-		if dPan != 0 || dTilt != 0 {
-			app.aim.nudge(dPan, dTilt)
+		if a.pan != 0 || a.tilt != 0 {
+			app.aim.nudge(a.pan*panRate*dt, a.tilt*tiltRate*dt)
 		}
 	}
 }
@@ -1260,7 +1420,7 @@ func (app *App) routes() http.Handler {
 			"ok":      true,
 			"serial":  map[string]any{"up": serUp, "err": serErr},
 			"camera":  map[string]any{"up": camUp, "err": camErr},
-			"gamepad": app.gamepadPresent(),
+			"gamepad": map[string]any{"up": app.gamepadPresent(), "mapping": app.mapSource},
 		})
 	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -1468,10 +1628,18 @@ func main() {
 	camMode := flag.String("camera-mode", "auto", "camera backend: auto|v4l2|rpicam")
 	camDevice := flag.String("camera-device", "/dev/video0", "V4L2 device (v4l2 mode)")
 	gpDebug := flag.Bool("gamepad-debug", false, "print live gamepad indices and exit")
+	gpMap := flag.String("gamepad-map", defaultMapPath(), "gamepad mapping JSON (default if absent)")
+	calibrate := flag.Bool("calibrate", false, "guided gamepad calibration, then exit")
 	flag.Parse()
 
 	if *gpDebug {
 		runGamepadDebug(*jsPath)
+		return
+	}
+	if *calibrate {
+		if err := runCalibrate(*jsPath, *gpMap); err != nil {
+			log.Fatalf("calibrate: %v", err)
+		}
 		return
 	}
 
@@ -1488,6 +1656,17 @@ func main() {
 	app.move = newMovement(rover)
 	app.aim = &CameraAim{r: rover}
 
+	// gamepad mapping: missing → default; malformed/invalid → disable the pad
+	// (don't drive with wrong controls), surfaced in /healthz.
+	mp, src, mErr := loadMapping(*gpMap)
+	app.mapSource = src
+	if mErr != nil {
+		log.Printf("gamepad: mapping %s invalid (%v) — joystick DISABLED; fix the file", *gpMap, mErr)
+	} else {
+		app.mapping = &mp
+		log.Printf("gamepad: mapping %s", src)
+	}
+
 	ctx := context.Background()
 
 	// serial: try now, retry in the background so a busy port doesn't kill us.
@@ -1496,8 +1675,8 @@ func main() {
 	// camera
 	go app.cam.run(ctx, app.hub)
 
-	// joystick (optional)
-	if *jsPath != "" {
+	// joystick (optional; only if the mapping loaded)
+	if *jsPath != "" && app.mapping != nil {
 		if f, err := os.Open(*jsPath); err == nil {
 			log.Printf("gamepad: reading %s", *jsPath)
 			go app.runGamepad(ctx, f)
@@ -1573,6 +1752,199 @@ func runGamepadDebug(path string) {
 				kind = "button"
 			}
 			fmt.Printf("%s #%d = %d\n", kind, e.number, e.value)
+		}
+	}
+}
+
+func defaultMapPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "gamepad.json"
+	}
+	if r, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = r
+	}
+	return filepath.Join(filepath.Dir(exe), "gamepad.json")
+}
+
+const calibThreshold = 0.7 // axis must cross this (of full scale) to count
+
+// runCalibrate is a guided terminal wizard: for each control it waits for the
+// pad to return to neutral, then captures the moved axis (index + sign) or the
+// pressed button. JS_EVENT_INIT events are ignored; a step times out to "skip"
+// (keeps the default). The result is written atomically to mapPath.
+func runCalibrate(jsPath, mapPath string) error {
+	f, err := os.Open(jsPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	events := make(chan jsEvent, 128)
+	go func() {
+		buf := make([]byte, 8)
+		for {
+			if _, err := io.ReadFull(f, buf); err != nil {
+				close(events)
+				return
+			}
+			if e, ok := parseJSEvent(buf); ok && !e.isInit { // mask init burst
+				events <- e
+			}
+		}
+	}()
+
+	fmt.Println("Gamepad calibration — follow each prompt. A step auto-skips")
+	fmt.Print("(keeps the default) after ~12s if you don't move that control.\n\n")
+	m := defaultMapping()
+
+	// axes: prompt asks for a direction; Invert makes that direction read +1.
+	if a, ok := captureAxis(events, "Push LEFT stick UP (forward)"); ok {
+		m.Throttle = a
+	}
+	if a, ok := captureAxis(events, "Push LEFT stick RIGHT"); ok {
+		m.Steer = a
+	}
+	if a, ok := captureAxis(events, "Push RIGHT stick RIGHT (camera pan right)"); ok {
+		m.Pan = a
+	}
+	if a, ok := captureAxis(events, "Push RIGHT stick UP (camera tilt up)"); ok {
+		m.Tilt = a
+	}
+	// buttons
+	for _, step := range []struct {
+		prompt string
+		dst    *int
+	}{
+		{"Hold/press TURBO (higher top speed)", &m.Turbo},
+		{"Press STOP wheels", &m.Stop},
+		{"Press EMERGENCY STOP", &m.Estop},
+		{"Press HEAD light toggle", &m.HeadLight},
+		{"Press BASE light toggle", &m.BaseLight},
+		{"Press CENTER camera", &m.Center},
+		{"Press SNAPSHOT", &m.Snapshot},
+		{"Press RELAX gimbal", &m.Relax},
+		{"Press LOCK gimbal", &m.Lock},
+	} {
+		if b, ok := captureButton(events, step.prompt); ok {
+			*step.dst = b
+		}
+	}
+	m.Hat = captureHat(events)
+
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := mapPath + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, mapPath); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	fmt.Printf("\nWrote mapping to %s — restart rovercontrol to use it.\n", mapPath)
+	return nil
+}
+
+// waitNeutral drains events until the pad is quiet (no event for 250ms), i.e.
+// sticks centered and buttons released, so the next capture sees a fresh move.
+func waitNeutral(events <-chan jsEvent) {
+	for {
+		select {
+		case _, ok := <-events:
+			if !ok {
+				return
+			}
+		case <-time.After(250 * time.Millisecond):
+			return
+		}
+	}
+}
+
+func captureAxis(events <-chan jsEvent, prompt string) (AxisMap, bool) {
+	waitNeutral(events) // drain BEFORE prompting so a fast move isn't swallowed
+	fmt.Printf("  %s ... ", prompt)
+	deadline := time.After(12 * time.Second)
+	for {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				fmt.Println("(device closed)")
+				return AxisMap{}, false
+			}
+			if e.etype == jsEventAxis {
+				v := float64(e.value) / 32767.0
+				if v > calibThreshold || v < -calibThreshold {
+					// Invert when the pushed direction reads negative, so the
+					// requested direction maps to +1.
+					inv := v < 0
+					fmt.Printf("axis %d%s\n", e.number, map[bool]string{true: " (inverted)"}[inv])
+					return AxisMap{Index: int(e.number), Invert: inv}, true
+				}
+			}
+		case <-deadline:
+			fmt.Println("(skipped, kept default)")
+			return AxisMap{}, false
+		}
+	}
+}
+
+func captureButton(events <-chan jsEvent, prompt string) (int, bool) {
+	waitNeutral(events) // drain BEFORE prompting so a fast press isn't swallowed
+	if prompt != "" {
+		fmt.Printf("  %s ... ", prompt)
+	}
+	deadline := time.After(12 * time.Second)
+	for {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				fmt.Println("(device closed)")
+				return 0, false
+			}
+			if e.etype == jsEventButton && e.value != 0 {
+				fmt.Printf("button %d\n", e.number)
+				return int(e.number), true
+			}
+		case <-deadline:
+			fmt.Println("(skipped, kept default)")
+			return 0, false
+		}
+	}
+}
+
+// captureHat detects the D-pad shape: an axis move → Kind "axis"; a button →
+// Kind "buttons" (then asks for DOWN); a timeout → Kind "none".
+func captureHat(events <-chan jsEvent) HatMap {
+	waitNeutral(events) // drain BEFORE prompting so a fast press isn't swallowed
+	fmt.Print("  Press D-pad UP (or wait to skip the speed-cap D-pad) ... ")
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				return HatMap{Kind: "none"}
+			}
+			if e.etype == jsEventAxis {
+				v := float64(e.value) / 32767.0
+				if v > calibThreshold || v < -calibThreshold {
+					fmt.Printf("axis %d\n", e.number)
+					return HatMap{Kind: "axis", Axis: AxisMap{int(e.number), v < 0}}
+				}
+			}
+			if e.etype == jsEventButton && e.value != 0 {
+				up := int(e.number)
+				fmt.Printf("button %d\n", up)
+				// captureButton drains the UP release first, then prompts DOWN.
+				if dn, ok := captureButton(events, "Now press D-pad DOWN"); ok {
+					return HatMap{Kind: "buttons", Up: up, Down: dn}
+				}
+				return HatMap{Kind: "none"}
+			}
+		case <-deadline:
+			fmt.Println("(skipped)")
+			return HatMap{Kind: "none"}
 		}
 	}
 }
