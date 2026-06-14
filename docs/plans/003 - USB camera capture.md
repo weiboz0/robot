@@ -142,4 +142,32 @@ warning and `main` validates the flag.
 
 ## Post-execution report
 
-_(filled in at the end: what shipped, deviations, tradeoffs, deploy result)_
+**Shipped (PR #5, merged to main):** a V4L2 capture backend in `rovercontrol.go`
+— `resolveCameraMode` (auto/v4l2/rpicam), `buildCameraCmd` (v4l2-ctl MJPG or
+rpicam-vid; dims/fps omitted when ≤0), a hardened `Camera.run` (unsized retry
+with one-shot exhaustion, floored backoff, both-error surfacing, mode-aware
+status/log), bounded stderr capture, and `-camera-mode`/`-camera-device` flags.
+Frame splitter / hub / snapshot / `/video_feed` unchanged. New unit tests for the
+command builder, mode resolver, tailBuffer, and the run-loop retry/exhaustion
+control flow (via an injectable `attemptFn`).
+
+**Deviations from the plan:** none material. Beyond the plan we added, from code
+review: a floored backoff (no zero-delay re-spawn / hot-loop), an
+`unsizedExhausted` flag (stop double-spawning the unsized retry every cycle), and
+rpicam zero-dimension omission (the plan only specified v4l2). codex's first code
+review was REQUEST-CHANGES (rpicam zero-dims; dropped unsized error) — both fixed
+and re-verified to APPROVE.
+
+**Tradeoffs:** camera backend is chosen once at startup (no hot-plug
+re-detection) — explicit `-camera-mode` is the escape hatch. Capture shells out
+to `v4l2-ctl` (already on the rover) rather than reading V4L2 ioctls in-process —
+simpler and dependency-light, at the cost of one child process (same model as the
+rpicam path). Snapshot/video reuse the unchanged MJPEG path, so format fidelity is
+identical to before.
+
+**Deploy result (verified live on the rover, 2026-06-14):** rebuilt arm64,
+rsynced (checksum match), restarted the controller. `/healthz` →
+`camera.up=true` (v4l2, /dev/video0, 1280×720), `serial.up=true`, `gamepad=true`.
+`/video_feed` serves multipart MJPEG (frame starts `ff d8`); `POST /snapshot`
+wrote a valid 190 KB JPEG to `~/robot/photos`. `@reboot` autostart unchanged
+(auto-detects v4l2). The deploy that was "everything but video" is now complete.
