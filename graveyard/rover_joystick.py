@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SUPERSEDED by rovercontrol (single-file Go controller, docs/plans/002), which
+# reads the gamepad itself. Kept as the reference gamepad mapping until the Go
+# joystick is verified on the Pi, then removed (see docs/plans/002 cleanup).
 """Drive the rover with a USB gamepad plugged into the rover — direct serial.
 
 Runs ON the rover. Uses rover_direct (UART control) so it needs no HTTP service.

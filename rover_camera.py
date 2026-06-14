@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SUPERSEDED by rovercontrol (single-file Go controller, docs/plans/002), which
+# captures snapshots itself. Kept only because the LLM chatbot (rover_chat.py)
+# still imports it. To be repointed to the controller's HTTP API or removed.
 """Grab a still photo from the rover's camera.
 
 Two capture paths, tried in order, because the camera can be owned by either:

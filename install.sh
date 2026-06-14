@@ -5,7 +5,7 @@ set -e
 DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
 mkdir -p "$HOME/.local/bin"
-for cmd in chatbot roverweb; do
+for cmd in chatbot roverctl; do
   chmod +x "$DIR/$cmd"
   ln -sf "$DIR/$cmd" "$HOME/.local/bin/$cmd"
   echo "Linked: $cmd -> $DIR/$cmd"
@@ -24,4 +24,5 @@ case ":$PATH:" in
     ;;
 esac
 
-echo "Done. Run:  chatbot   (or:  roverweb  for the photo gallery + live view)"
+echo "Done. Run:  chatbot   (or:  roverctl  to launch the rover controller;"
+echo "            it needs the rovercontrol-arm64 binary — see docs/plans/002)"

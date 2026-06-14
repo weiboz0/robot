@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SUPERSEDED by rovercontrol (single-file Go controller, docs/plans/002) — kept
+# only because the LLM chatbot (rover_chat.py) still imports it. To be repointed
+# to the controller's HTTP API or removed in a follow-up.
 """Direct serial control of the Waveshare UGV rover — no HTTP service needed.
 
 Runs ON the rover (ssh ws@192.168.1.131). Talks straight to the ESP32 sub-
