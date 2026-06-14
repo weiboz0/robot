@@ -5,6 +5,8 @@
 // camera (rpicam-vid MJPEG live view + still snapshots), reads a gamepad plugged
 // into the Pi, and exposes everything over HTTP where the URL path IS the
 // command (POST /move_left, /drive?l=&r=, /camera_up, /light_head?on=1, ...).
+// Camera capture auto-selects a USB UVC cam (v4l2-ctl, MJPG) or a CSI cam
+// (rpicam-vid) — see -camera-mode.
 // It serves a built-in web UI at "/" as the default client. No CLI, no chatbot.
 //
 // It fully replaces (for control + camera use) the stock ugv_rpi app.py, the
@@ -427,15 +429,20 @@ func splitFrames(r io.Reader, emit func([]byte)) error {
 	}
 }
 
-// Camera manages the rpicam-vid process and tracks a user-visible status so a
-// busy CSI sensor (e.g. stock app.py still holding it) surfaces in /healthz and
-// the UI instead of silently looping forever.
+// Camera manages the capture process and tracks a user-visible status so a busy
+// or missing camera surfaces in /healthz and the UI instead of silently looping.
+// Two capture backends: "v4l2" (USB UVC cam via v4l2-ctl, MJPG) and "rpicam"
+// (CSI via rpicam-vid). "auto" picks v4l2 when the device node exists.
 type Camera struct {
+	mode, device       string // resolved mode ("v4l2"/"rpicam"); V4L2 device path
 	width, height, fps int
 
 	mu      sync.Mutex
 	up      bool
 	lastErr string
+
+	// attemptFn overrides runOnce in tests (nil = use runOnce).
+	attemptFn func(ctx context.Context, hub *Hub, w, h int) error
 }
 
 func (c *Camera) status() (bool, string) {
@@ -450,57 +457,165 @@ func (c *Camera) setStatus(up bool, err string) {
 	c.mu.Unlock()
 }
 
+// resolveCameraMode turns "auto" into a concrete backend: v4l2 if the device
+// node exists (the USB cam on this rover), else rpicam (CSI). An explicit
+// v4l2/rpicam is honored; anything else falls back to rpicam. Resolved once at
+// startup (no hot-plug detection — pass -camera-mode explicitly if needed).
+func resolveCameraMode(mode, device string) string {
+	switch mode {
+	case "v4l2", "rpicam":
+		return mode
+	case "auto":
+		if _, err := os.Stat(device); err == nil {
+			return "v4l2"
+		}
+		return "rpicam"
+	default:
+		log.Printf("camera: unknown -camera-mode %q; using rpicam", mode)
+		return "rpicam"
+	}
+}
+
+// buildCameraCmd returns the capture command that writes concatenated MJPG to
+// stdout. For v4l2, width/height are only set when both > 0 (so width=0 lets the
+// camera pick a supported resolution — the unsized-retry escape hatch).
+func buildCameraCmd(ctx context.Context, mode, device string, w, h, fps int) *exec.Cmd {
+	if mode == "v4l2" {
+		fmtArg := "--set-fmt-video=pixelformat=MJPG"
+		if w > 0 && h > 0 {
+			fmtArg = fmt.Sprintf("--set-fmt-video=width=%d,height=%d,pixelformat=MJPG", w, h)
+		}
+		return exec.CommandContext(ctx, "v4l2-ctl", "-d", device,
+			fmtArg, "--stream-mmap", "--stream-count=0", "--stream-to=-")
+	}
+	// rpicam-vid: omit width/height/framerate when ≤0 so "0 = let the camera
+	// choose" works for CSI too (not just v4l2).
+	args := []string{"-n", "-t", "0", "--codec", "mjpeg"}
+	if w > 0 && h > 0 {
+		args = append(args, "--width", strconv.Itoa(w), "--height", strconv.Itoa(h))
+	}
+	if fps > 0 {
+		args = append(args, "--framerate", strconv.Itoa(fps))
+	}
+	args = append(args, "-o", "-")
+	return exec.CommandContext(ctx, "rpicam-vid", args...)
+}
+
 func (c *Camera) run(ctx context.Context, hub *Hub) {
+	attempt := c.runOnce
+	if c.attemptFn != nil {
+		attempt = c.attemptFn
+	}
 	backoff := time.Second
-	loggedBusy := false
+	loggedFail := false
+	unsizedExhausted := false // stop the unsized retry once it has also failed
 	for ctx.Err() == nil {
-		err := c.runOnce(ctx, hub)
+		start := time.Now()
+		err := attempt(ctx, hub, c.width, c.height)
 		if ctx.Err() != nil {
 			return
 		}
-		msg := "rpicam-vid unavailable"
-		if err != nil {
-			msg = err.Error()
+		// codex: an unsupported resolution shouldn't be a permanent failure —
+		// retry once unsized (v4l2 only). Once that also fails, stop retrying it
+		// (glm: avoid double-spawning every backoff cycle). Surface BOTH errors.
+		if err != nil && c.mode == "v4l2" && c.width > 0 && c.height > 0 && !unsizedExhausted {
+			err2 := attempt(ctx, hub, 0, 0)
+			if ctx.Err() != nil {
+				return
+			}
+			if err2 == nil {
+				err = nil
+			} else {
+				unsizedExhausted = true
+				err = fmt.Errorf("sized: %v; unsized: %v", err, err2)
+			}
 		}
-		c.setStatus(false, msg)
-		// Log a recurring failure (camera busy / missing) once, not every retry.
-		if !loggedBusy {
-			log.Printf("camera: unavailable (%s); will keep retrying quietly", msg)
-			loggedBusy = true
+		// A clean exit only counts as "healthy" if it actually streamed for a
+		// while; a process that exits 0 immediately (e.g. a finite stream) is
+		// treated as a failure so we never hot-loop spawning it.
+		if err == nil && time.Since(start) > 3*time.Second {
+			backoff = time.Second
+			loggedFail = false
+			unsizedExhausted = false // healthy stream — re-allow the probe later
+		} else {
+			if err == nil {
+				err = errors.New("camera stream ended immediately")
+			}
+			c.setStatus(false, err.Error())
+			if !loggedFail { // log a recurring failure once, not every retry
+				log.Printf("camera: %s unavailable (%v); will keep retrying quietly", c.mode, err)
+				loggedFail = true
+			}
+			if backoff < 15*time.Second {
+				backoff *= 2
+			}
 		}
+		// Always wait the (≥1s) backoff before re-spawning — no zero-delay path.
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
 			return
 		}
-		if backoff < 15*time.Second {
-			backoff *= 2
-		}
 	}
 }
 
-func (c *Camera) runOnce(ctx context.Context, hub *Hub) error {
-	cmd := exec.CommandContext(ctx, "rpicam-vid",
-		"-n", "-t", "0", "--codec", "mjpeg",
-		"--width", strconv.Itoa(c.width),
-		"--height", strconv.Itoa(c.height),
-		"--framerate", strconv.Itoa(c.fps),
-		"-o", "-")
+func (c *Camera) runOnce(ctx context.Context, hub *Hub, w, h int) error {
+	cmd := buildCameraCmd(ctx, c.mode, c.device, w, h, c.fps)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
+	var stderr tailBuffer // keep the last bytes of stderr for diagnosis
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	c.setStatus(true, "")
-	log.Printf("camera: rpicam-vid started (%dx%d@%dfps)", c.width, c.height, c.fps)
+	if c.mode == "v4l2" {
+		log.Printf("camera: v4l2 started (%dx%d, %s)", w, h, c.device)
+	} else {
+		log.Printf("camera: rpicam started (%dx%d@%dfps)", w, h, c.fps)
+	}
 	splitErr := splitFrames(stdout, hub.publish)
 	waitErr := cmd.Wait()
 	if waitErr != nil {
+		if s := strings.TrimSpace(stderr.String()); s != "" {
+			return fmt.Errorf("%v: %s", waitErr, lastLine(s))
+		}
 		return waitErr
 	}
 	return splitErr
+}
+
+// tailBuffer keeps only the last ~2KB written — bounded stderr capture so a
+// chatty producer can't grow memory, while still surfacing the error tail.
+type tailBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > 2048 {
+		t.buf = t.buf[len(t.buf)-2048:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.buf)
+}
+
+func lastLine(s string) string {
+	s = strings.TrimRight(s, "\r\n")
+	if i := strings.LastIndexAny(s, "\r\n"); i >= 0 {
+		return s[i+1:]
+	}
+	return s
 }
 
 // CameraAim tracks the current pan/tilt so HTTP nudges and the joystick share
@@ -1347,9 +1462,11 @@ func main() {
 	photos := flag.String("photos", defaultPhotoDir(), "photo directory")
 	serialPath := flag.String("serial", "/dev/ttyAMA0", "ESP32 serial device")
 	jsPath := flag.String("gamepad", "/dev/input/js0", "joystick device ('' to disable)")
-	width := flag.Int("width", 1280, "camera width")
-	height := flag.Int("height", 720, "camera height")
-	fps := flag.Int("fps", 30, "camera fps")
+	width := flag.Int("width", 1280, "camera width (0 = let the camera choose)")
+	height := flag.Int("height", 720, "camera height (0 = let the camera choose)")
+	fps := flag.Int("fps", 30, "camera fps (rpicam only)")
+	camMode := flag.String("camera-mode", "auto", "camera backend: auto|v4l2|rpicam")
+	camDevice := flag.String("camera-device", "/dev/video0", "V4L2 device (v4l2 mode)")
 	gpDebug := flag.Bool("gamepad-debug", false, "print live gamepad indices and exit")
 	flag.Parse()
 
@@ -1358,11 +1475,14 @@ func main() {
 		return
 	}
 
+	mode := resolveCameraMode(*camMode, *camDevice)
+	log.Printf("camera: backend %s (device %s)", mode, *camDevice)
 	rover := &Rover{}
 	app := &App{
-		rover:    rover,
-		hub:      newHub(),
-		cam:      &Camera{width: *width, height: *height, fps: *fps},
+		rover: rover,
+		hub:   newHub(),
+		cam: &Camera{mode: mode, device: *camDevice,
+			width: *width, height: *height, fps: *fps},
 		photoDir: *photos,
 	}
 	app.move = newMovement(rover)
