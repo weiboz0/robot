@@ -193,4 +193,28 @@ on-rover calibrate/verify. 7. Post-execution report.
 
 ## Post-execution report
 
-_(filled in at the end)_
+**Shipped (PR #8, merged):** a configurable gamepad mapping (`GamepadMapping`
+with per-axis sign + `HatMap`), `defaultMapping()` pinned to the historical
+constants, `loadMapping` (missing→default; malformed→disable-not-default;
+partial-over-defaults), a pure `computeJoystick` seam with `joystickLoop`
+refactored onto it (byte-for-byte identical behavior), a `-calibrate` wizard
+(init-masked, neutral-before-prompt, threshold+sign capture, D-pad shape
+detection, atomic write), `-gamepad-map`/`-calibrate` flags, and `/healthz`
+`gamepad:{up,mapping}`. Unit coverage 72% (floor 70%).
+
+**Deviations:** none material. The biggest review-driven changes vs. the first
+draft: mapping carries axis **sign** (not index-only), malformed config
+**disables** the pad instead of silently defaulting, and calibrate waits neutral
+**before** prompting (codex caught a first-input-swallow bug).
+
+**Tradeoffs:** a bad mapping file stops the joystick (HTTP control still works),
+chosen over silently driving reversed. Calibration is a terminal wizard on the
+rover (a web calibrator is deferred). Deadzone/rates stay code constants (not in
+the JSON) to keep calibration about pad identity, not tuning.
+
+**Deploy result (2026-06-14):** rebuilt arm64, rsynced (checksum match),
+restarted. `/healthz` → `gamepad:{up:true, mapping:"default"}`, serial + camera
+up. Deploy is non-regressive (default = old behavior). **Open acceptance step
+(needs a human at the rover):** run `rovercontrol-arm64 -calibrate`, move each
+control as prompted, restart, and confirm sticks/buttons map correctly — I can't
+operate the physical gamepad. Until then the default mapping is in effect.
