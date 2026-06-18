@@ -161,4 +161,31 @@ trip/pin). Opus's one non-blocking note (warn at end of calibrate, not just at
 load) was applied — `runCalibrate` now prints the no-e-stop warning immediately.
 
 ## Post-execution report
-_(filled in at the end)_
+
+**Shipped (PR #15, merged):** all per-button controls
+(Turbo/Stop/Estop/HeadLight/BaseLight/Center/Snapshot/Relax/Lock) are now
+`ControlMap{button|axis|none}`, so any control can be a button, a held
+trigger-axis, or disabled. `ControlMap.UnmarshalJSON` keeps old `gamepad.json`
+files working (legacy bare ints; null/absent keep defaults). Edges keyed by
+control name; calibrate skip→disabled with a no-e-stop warning. Coverage 72.6%.
+
+**Deviations:** none from the (revised) plan. The two plan-review catches that
+shaped it: the mandatory `null` guard in `UnmarshalJSON` (Opus prototyped that
+`json.Unmarshal("null",&int)`→0 would corrupt a non-zero default) and
+calibrate-skip-must-disable (codex).
+
+**Tradeoffs:** marshaled configs are a touch verbose (every control writes a zero
+`axis` object) but round-trip exactly. Converting *all* controls (not just
+relax/lock) was slightly more than the minimum, but gives one uniform model so a
+single `-calibrate` configures any pad.
+
+**Why it was needed:** the user's gamepad has L1/L2/R1/R2 but **no L3/R3**, and
+L2/R2 are analog triggers — so the old int-button relax/lock couldn't move there.
+Now they can.
+
+**Deploy result (2026-06-18):** rebuilt arm64, rsynced (checksum match),
+restarted; `/healthz` up, default behavior unchanged. **No motion commands sent**
+(cat-safety). **Open acceptance step (yours, cat clear):** run
+`rovercontrol-arm64 -calibrate` and put **Relax→L2, Lock→R2** (press the
+triggers), pressing a button for everything you have and skipping what you don't;
+restart; the gimbal relax/lock now live on your triggers.
