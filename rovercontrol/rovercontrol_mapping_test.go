@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -43,7 +44,7 @@ func TestCaptureHatAxis(t *testing.T) {
 
 func TestComputeJoystickCameraSigns(t *testing.T) {
 	m := defaultMapping()
-	prev := &gpPrev{btn: map[int]bool{}}
+	prev := &gpPrev{ctrl: map[string]bool{}}
 	// default: pan axis 3 (not inverted) → right stick right = +pan;
 	// tilt axis 4 inverted → right stick up (raw negative) = +tilt.
 	a := computeJoystick(&m, fakeState(map[int]float64{3: 1.0, 4: -1.0}, nil), prev)
@@ -110,6 +111,73 @@ func fakeState(axes map[int]float64, btns map[int]bool) gpState {
 	}
 }
 
+func btnCtl(i int) ControlMap { return ControlMap{Kind: "button", Index: i} }
+
+// TestControlMapJSON covers the plan-007 backward-compat unmarshalling.
+func TestControlMapJSON(t *testing.T) {
+	// legacy bare int → button
+	var c ControlMap
+	if err := json.Unmarshal([]byte("9"), &c); err != nil || c != btnCtl(9) {
+		t.Fatalf("legacy int: %+v %v", c, err)
+	}
+	// object form
+	c = ControlMap{}
+	if err := json.Unmarshal([]byte(`{"kind":"axis","axis":{"index":5,"invert":true}}`), &c); err != nil ||
+		c.Kind != "axis" || c.Axis != (AxisMap{5, true}) {
+		t.Fatalf("object: %+v %v", c, err)
+	}
+	// null over a non-zero default must KEEP the default (not collapse to button 0)
+	c = btnCtl(9)
+	if err := json.Unmarshal([]byte("null"), &c); err != nil || c != btnCtl(9) {
+		t.Fatalf("null must keep default: %+v %v", c, err)
+	}
+	// round-trip
+	in := ControlMap{Kind: "button", Index: 7}
+	b, _ := json.Marshal(in)
+	var out ControlMap
+	json.Unmarshal(b, &out)
+	if out != in {
+		t.Fatalf("round-trip: %+v != %+v", out, in)
+	}
+}
+
+// TestLoadMappingLegacyAndDefaults: an old plan-004/006 bare-int config loads
+// with the right button bindings, and omitted controls keep their defaults.
+func TestLoadMappingLegacyAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "legacy.json")
+	// bare-int controls (old shape) + an omitted "lock" + null "relax"
+	os.WriteFile(p, []byte(`{"stop":0,"estop":6,"turbo":5,"relax":null,
+		"hat":{"kind":"axis","axis":{"index":7,"invert":true}}}`), 0o644)
+	m, src, err := loadMapping(p)
+	if err != nil || src != "config" {
+		t.Fatalf("legacy → %s %v", src, err)
+	}
+	if m.Stop != btnCtl(0) || m.Estop != btnCtl(6) || m.Turbo != btnCtl(5) {
+		t.Fatalf("legacy ints not applied: stop=%+v estop=%+v turbo=%+v", m.Stop, m.Estop, m.Turbo)
+	}
+	if m.Relax != btnCtl(9) { // null kept the default (9), not 0
+		t.Fatalf("null relax did not keep default: %+v", m.Relax)
+	}
+	if m.Lock != btnCtl(10) { // omitted kept the default
+		t.Fatalf("omitted lock did not keep default: %+v", m.Lock)
+	}
+}
+
+func TestControlAsTriggerAndDisabled(t *testing.T) {
+	m := defaultMapping()
+	m.Relax = ControlMap{Kind: "axis", Axis: AxisMap{5, false}} // relax on a trigger
+	m.Lock = ControlMap{Kind: "none"}                           // lock disabled
+	// trigger past threshold → relax edge fires
+	if a := computeJoystick(&m, fakeState(map[int]float64{5: 1.0}, nil), &gpPrev{ctrl: map[string]bool{}}); !a.relax {
+		t.Fatal("trigger-bound relax did not fire")
+	}
+	// disabled lock never fires even if button 10 is pressed
+	if a := computeJoystick(&m, fakeState(nil, map[int]bool{10: true}), &gpPrev{ctrl: map[string]bool{}}); a.lock {
+		t.Fatal("disabled lock fired")
+	}
+}
+
 func TestControlMapHeld(t *testing.T) {
 	none := ControlMap{Kind: "none"}
 	if none.held(fakeState(map[int]float64{0: 1}, map[int]bool{0: true})) {
@@ -157,12 +225,12 @@ func TestComputeJoystickNewControls(t *testing.T) {
 	m.PanicStop = ControlMap{Kind: "button", Index: 9}
 	m.HatX = HatMap{Kind: "buttons", Up: 14, Down: 15} // right=Up=+1
 	// precision held (trigger), boost held (button)
-	a := computeJoystick(&m, fakeState(map[int]float64{2: 1.0}, map[int]bool{7: true}), &gpPrev{btn: map[int]bool{}})
+	a := computeJoystick(&m, fakeState(map[int]float64{2: 1.0}, map[int]bool{7: true}), &gpPrev{ctrl: map[string]bool{}})
 	if !a.precision || !a.boost {
 		t.Fatalf("precision/boost not held: %+v", a)
 	}
 	// PanicStop rising edge → estop, via its own slot (doesn't depend on m.Estop)
-	prev := &gpPrev{btn: map[int]bool{}}
+	prev := &gpPrev{ctrl: map[string]bool{}}
 	if a := computeJoystick(&m, fakeState(nil, map[int]bool{9: true}), prev); !a.estop {
 		t.Fatal("panic stop did not fold into estop")
 	}
@@ -170,7 +238,7 @@ func TestComputeJoystickNewControls(t *testing.T) {
 		t.Fatal("panic stop fired twice while held")
 	}
 	// D-pad right → pan nudge +1 (rising edge), separate from speed hat
-	if a := computeJoystick(&m, fakeState(nil, map[int]bool{14: true}), &gpPrev{btn: map[int]bool{}}); a.panNudge != 1 {
+	if a := computeJoystick(&m, fakeState(nil, map[int]bool{14: true}), &gpPrev{ctrl: map[string]bool{}}); a.panNudge != 1 {
 		t.Fatalf("pan nudge right: %d", a.panNudge)
 	}
 }
@@ -201,8 +269,9 @@ func TestDefaultMappingPinned(t *testing.T) {
 	want := GamepadMapping{
 		Throttle: AxisMap{1, true}, Steer: AxisMap{0, false},
 		Pan: AxisMap{3, false}, Tilt: AxisMap{4, true},
-		Turbo: 5, Stop: 0, Snapshot: 1, HeadLight: 2, Center: 3,
-		BaseLight: 4, Estop: 6, Relax: 9, Lock: 10,
+		Turbo: btnCtl(5), Stop: btnCtl(0), Snapshot: btnCtl(1), HeadLight: btnCtl(2),
+		Center: btnCtl(3), BaseLight: btnCtl(4), Estop: btnCtl(6),
+		Relax: btnCtl(9), Lock: btnCtl(10),
 		Hat: HatMap{Kind: "axis", Axis: AxisMap{7, true}},
 		// plan 006: new controls default disabled
 		Precision: ControlMap{Kind: "none"}, Boost: ControlMap{Kind: "none"},
@@ -252,7 +321,7 @@ func TestLoadMapping(t *testing.T) {
 func TestComputeJoystickHonorsMapping(t *testing.T) {
 	m := defaultMapping()
 	m.Throttle = AxisMap{9, false} // remap throttle to axis 9, not inverted
-	prev := &gpPrev{btn: map[int]bool{}}
+	prev := &gpPrev{ctrl: map[string]bool{}}
 	// axis 9 fully forward → throttle +1; default (axis 1) ignored
 	a := computeJoystick(&m, fakeState(map[int]float64{9: 1.0, 1: -1.0}, nil), prev)
 	if a.throttle <= 0.9 {
@@ -260,7 +329,7 @@ func TestComputeJoystickHonorsMapping(t *testing.T) {
 	}
 	// inverted axis reverses: push axis 9 to -1 with Invert → +1
 	m.Throttle = AxisMap{9, true}
-	a = computeJoystick(&m, fakeState(map[int]float64{9: -1.0}, nil), &gpPrev{btn: map[int]bool{}})
+	a = computeJoystick(&m, fakeState(map[int]float64{9: -1.0}, nil), &gpPrev{ctrl: map[string]bool{}})
 	if a.throttle <= 0.9 {
 		t.Fatalf("inverted throttle wrong sign: %v", a.throttle)
 	}
@@ -268,8 +337,8 @@ func TestComputeJoystickHonorsMapping(t *testing.T) {
 
 func TestComputeJoystickButtonEdges(t *testing.T) {
 	m := defaultMapping()
-	prev := &gpPrev{btn: map[int]bool{}}
-	st := fakeState(nil, map[int]bool{m.Stop: true})
+	prev := &gpPrev{ctrl: map[string]bool{}}
+	st := fakeState(nil, map[int]bool{m.Stop.Index: true})
 	if a := computeJoystick(&m, st, prev); !a.stop {
 		t.Fatal("stop edge not detected")
 	}
@@ -282,20 +351,20 @@ func TestComputeJoystickButtonEdges(t *testing.T) {
 func TestComputeJoystickHat(t *testing.T) {
 	// axis hat: default axis 7 inverted, up (raw -1) → +1 speed step
 	m := defaultMapping()
-	if a := computeJoystick(&m, fakeState(map[int]float64{7: -1.0}, nil), &gpPrev{btn: map[int]bool{}}); a.hatDelta != 1 {
+	if a := computeJoystick(&m, fakeState(map[int]float64{7: -1.0}, nil), &gpPrev{ctrl: map[string]bool{}}); a.hatDelta != 1 {
 		t.Fatalf("axis hat up: %d", a.hatDelta)
 	}
 	// buttons hat
 	m.Hat = HatMap{Kind: "buttons", Up: 11, Down: 12}
-	if a := computeJoystick(&m, fakeState(nil, map[int]bool{11: true}), &gpPrev{btn: map[int]bool{}}); a.hatDelta != 1 {
+	if a := computeJoystick(&m, fakeState(nil, map[int]bool{11: true}), &gpPrev{ctrl: map[string]bool{}}); a.hatDelta != 1 {
 		t.Fatalf("button hat up: %d", a.hatDelta)
 	}
-	if a := computeJoystick(&m, fakeState(nil, map[int]bool{12: true}), &gpPrev{btn: map[int]bool{}}); a.hatDelta != -1 {
+	if a := computeJoystick(&m, fakeState(nil, map[int]bool{12: true}), &gpPrev{ctrl: map[string]bool{}}); a.hatDelta != -1 {
 		t.Fatalf("button hat down: %d", a.hatDelta)
 	}
 	// none hat: never changes speed
 	m.Hat = HatMap{Kind: "none"}
-	if a := computeJoystick(&m, fakeState(map[int]float64{7: -1.0}, nil), &gpPrev{btn: map[int]bool{}}); a.hatDelta != 0 {
+	if a := computeJoystick(&m, fakeState(map[int]float64{7: -1.0}, nil), &gpPrev{ctrl: map[string]bool{}}); a.hatDelta != 0 {
 		t.Fatalf("none hat moved: %d", a.hatDelta)
 	}
 }
