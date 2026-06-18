@@ -852,6 +852,26 @@ type HatMap struct {
 	Down int     `json:"down,omitempty"` // Kind=="buttons": down button index
 }
 
+// ControlMap is an optional control bound to a button, a held trigger-axis, or
+// disabled. Unlike a bare int it distinguishes "none" from "button 0", and it
+// handles triggers that report as axes. Default zero value is Kind=="" → treated
+// as disabled.
+type ControlMap struct {
+	Kind  string  `json:"kind"`            // "button" | "axis" | "none" | ""
+	Index int     `json:"index,omitempty"` // Kind=="button"
+	Axis  AxisMap `json:"axis,omitempty"`  // Kind=="axis": held when axisSigned > 0.5
+}
+
+func (c ControlMap) held(st gpState) bool {
+	switch c.Kind {
+	case "button":
+		return st.button(c.Index)
+	case "axis":
+		return axisSigned(st, c.Axis) > 0.5
+	}
+	return false
+}
+
 // GamepadMapping carries only what identifies a pad's controls (indices + axis
 // signs). Tuning (deadzone/rates/speedSteps) stays in code constants.
 type GamepadMapping struct {
@@ -868,7 +888,13 @@ type GamepadMapping struct {
 	Snapshot  int     `json:"snapshot"`
 	Relax     int     `json:"relax"`
 	Lock      int     `json:"lock"`
-	Hat       HatMap  `json:"hat"` // D-pad → speed cap
+	Hat       HatMap  `json:"hat"` // D-pad vertical → speed cap
+
+	// Optional, default-disabled (enabled by -calibrate). Plan 006.
+	Precision ControlMap `json:"precision"`  // hold → slow mode
+	Boost     ControlMap `json:"boost"`      // hold → max speed
+	PanicStop ControlMap `json:"panic_stop"` // press → instant e-stop (2nd panic)
+	HatX      HatMap     `json:"hat_x"`      // D-pad horizontal → fine camera pan
 }
 
 // defaultMapping reproduces EXACTLY the historical hard-coded constants (and the
@@ -890,30 +916,83 @@ func defaultMapping() GamepadMapping {
 		Lock:      10,                // R3
 		// D-pad vertical on axis 7; up (raw negative) => +1 via Invert.
 		Hat: HatMap{Kind: "axis", Axis: AxisMap{7, true}},
+		// New optional controls default DISABLED — enabled via -calibrate so we
+		// never guess colliding indices (plan 006).
+		Precision: ControlMap{Kind: "none"},
+		Boost:     ControlMap{Kind: "none"},
+		PanicStop: ControlMap{Kind: "none"},
+		HatX:      HatMap{Kind: "none"},
 	}
 }
 
+func (c ControlMap) validate() error {
+	switch c.Kind {
+	case "button":
+		if c.Index < 0 {
+			return fmt.Errorf("negative button index %d", c.Index)
+		}
+	case "axis":
+		if c.Axis.Index < 0 {
+			return fmt.Errorf("negative axis index %d", c.Axis.Index)
+		}
+	case "none", "":
+	default:
+		return fmt.Errorf("invalid control kind %q", c.Kind)
+	}
+	return nil
+}
+
+func validateHat(h HatMap) error {
+	switch h.Kind {
+	case "axis":
+		if h.Axis.Index < 0 {
+			return fmt.Errorf("negative hat axis %d", h.Axis.Index)
+		}
+	case "buttons":
+		if h.Up < 0 || h.Down < 0 {
+			return fmt.Errorf("negative hat button index")
+		}
+	case "none", "":
+	default:
+		return fmt.Errorf("invalid hat kind %q", h.Kind)
+	}
+	return nil
+}
+
 func (m GamepadMapping) validate() error {
-	idx := []int{m.Throttle.Index, m.Steer.Index, m.Pan.Index, m.Tilt.Index,
-		m.Turbo, m.Stop, m.Estop, m.HeadLight, m.BaseLight, m.Center,
+	btns := []int{m.Turbo, m.Stop, m.Estop, m.HeadLight, m.BaseLight, m.Center,
 		m.Snapshot, m.Relax, m.Lock}
-	for _, i := range idx {
+	for _, i := range append(btns, m.Throttle.Index, m.Steer.Index, m.Pan.Index, m.Tilt.Index) {
 		if i < 0 {
 			return fmt.Errorf("negative control index %d", i)
 		}
 	}
-	switch m.Hat.Kind {
-	case "axis":
-		if m.Hat.Axis.Index < 0 {
-			return fmt.Errorf("negative hat axis %d", m.Hat.Axis.Index)
+	if err := validateHat(m.Hat); err != nil {
+		return err
+	}
+	if err := validateHat(m.HatX); err != nil {
+		return err
+	}
+	for _, c := range []ControlMap{m.Precision, m.Boost, m.PanicStop} {
+		if err := c.validate(); err != nil {
+			return err
 		}
-	case "buttons":
-		if m.Hat.Up < 0 || m.Hat.Down < 0 {
-			return fmt.Errorf("negative hat button index")
+	}
+	// Non-fatal: warn if two button-controls share an index (likely a calibration
+	// slip — e.g. a new control landing on an already-used button) — surfaced in
+	// the log without rejecting an intentional config.
+	dup := btns
+	for _, c := range []ControlMap{m.Precision, m.Boost, m.PanicStop} {
+		if c.Kind == "button" {
+			dup = append(dup, c.Index)
 		}
-	case "none":
-	default:
-		return fmt.Errorf("invalid hat kind %q", m.Hat.Kind)
+	}
+	seen := map[int]bool{}
+	for _, i := range dup {
+		if seen[i] {
+			log.Printf("gamepad: warning — button %d is bound to more than one action", i)
+		}
+		seen[i] = true
 	}
 	return nil
 }
@@ -978,17 +1057,19 @@ func hatDirection(h HatMap, st gpState) int {
 
 // gpPrev carries edge-detection state across ticks.
 type gpPrev struct {
-	btn map[int]bool
-	hat int
+	btn   map[int]bool
+	hat   int  // vertical D-pad (speed cap)
+	hatX  int  // horizontal D-pad (camera pan)
+	panic bool // PanicStop held-state for its own rising edge
 }
 
 // gpActions is the decision for one tick: which buttons fired (rising edge),
-// the speed-cap step, the deadzoned signed stick values, and turbo.
+// the speed-cap step, the deadzoned signed stick values, and the held modifiers.
 type gpActions struct {
 	stop, estop, head, base, snap, center, relax, lock bool
-	hatDelta                                           int
+	hatDelta, panNudge                                 int
 	throttle, steer, pan, tilt                         float64
-	turbo                                              bool
+	turbo, boost, precision                            bool
 }
 
 // computeJoystick reads the mapping against a state snapshot and updates prev.
@@ -1001,7 +1082,6 @@ func computeJoystick(m *GamepadMapping, st gpState, prev *gpPrev) gpActions {
 	}
 	var a gpActions
 	a.stop = edge(m.Stop)
-	a.estop = edge(m.Estop)
 	a.head = edge(m.HeadLight)
 	a.base = edge(m.BaseLight)
 	a.snap = edge(m.Snapshot)
@@ -1009,16 +1089,48 @@ func computeJoystick(m *GamepadMapping, st gpState, prev *gpPrev) gpActions {
 	a.relax = edge(m.Relax)
 	a.lock = edge(m.Lock)
 	a.turbo = st.button(m.Turbo)
+	a.boost = m.Boost.held(st)
+	a.precision = m.Precision.held(st)
+	// e-stop: the Estop button OR the optional PanicStop, each on a rising edge.
+	panicNow := m.PanicStop.held(st)
+	panicEdge := panicNow && !prev.panic
+	prev.panic = panicNow
+	a.estop = edge(m.Estop) || panicEdge
 	hd := hatDirection(m.Hat, st) // speed cap on rising edge only
 	if hd != 0 && prev.hat == 0 {
 		a.hatDelta = hd
 	}
 	prev.hat = hd
+	hx := hatDirection(m.HatX, st) // camera pan nudge on rising edge (+ = right)
+	if hx != 0 && prev.hatX == 0 {
+		a.panNudge = hx
+	}
+	prev.hatX = hx
 	a.throttle = dz(axisSigned(st, m.Throttle))
 	a.steer = dz(axisSigned(st, m.Steer))
 	a.pan = dz(axisSigned(st, m.Pan))
 	a.tilt = dz(axisSigned(st, m.Tilt))
 	return a
+}
+
+const precisionCap = 0.15 // top speed while the precision modifier is held
+const fineNudgeDeg = 10.0 // camera pan per D-pad ←/→ press
+
+// topSpeed resolves the wheel speed cap for one tick. Precedence: start at the
+// selected step, apply turbo, then boost (max), then precision LAST so it always
+// wins (slow mode is the safety, so it overrides turbo/boost).
+func topSpeed(idx int, turboHeld, boostHeld, precisionHeld bool) float64 {
+	top := speedSteps[idx]
+	if turboHeld {
+		top = turbo
+	}
+	if boostHeld {
+		top = speedLimit
+	}
+	if precisionHeld && top > precisionCap {
+		top = precisionCap
+	}
+	return top
 }
 
 func dz(v float64) float64 {
@@ -1145,11 +1257,11 @@ func (app *App) joystickLoop(ctx context.Context, g *gamepad) {
 			speedIdx = int(clamp(float64(speedIdx+a.hatDelta), 0, float64(len(speedSteps)-1)))
 			app.move.setCap(speedSteps[speedIdx])
 		}
-
-		top := speedSteps[speedIdx]
-		if a.turbo {
-			top = turbo
+		if a.panNudge != 0 { // D-pad ←/→ fine camera pan
+			app.aim.nudge(float64(a.panNudge)*fineNudgeDeg, 0)
 		}
+
+		top := topSpeed(speedIdx, a.turbo, a.boost, a.precision)
 		tgtL, tgtR := driveMix(a.throttle, a.steer, top)
 		step := ramp * dt
 		left = rampToward(left, tgtL, step)
@@ -1875,7 +1987,22 @@ func runCalibrate(jsPath, mapPath string) error {
 			*step.dst = b
 		}
 	}
-	m.Hat = captureHat(events)
+	m.Hat = captureHat(events, "Press D-pad UP", "speed cap")
+	// New optional controls (plan 006): a button OR a held trigger; skip to leave
+	// disabled. Then the horizontal D-pad for fine camera pan.
+	for _, step := range []struct {
+		prompt string
+		dst    *ControlMap
+	}{
+		{"Hold the PRECISION (slow) trigger/button", &m.Precision},
+		{"Hold the BOOST (fast) trigger/button", &m.Boost},
+		{"Press your INSTANT-STOP (panic) button", &m.PanicStop},
+	} {
+		if c, ok := captureControl(events, step.prompt); ok {
+			*step.dst = c
+		}
+	}
+	m.HatX = captureHat(events, "Press D-pad RIGHT", "camera pan")
 
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
@@ -1961,10 +2088,12 @@ func captureButton(events <-chan jsEvent, prompt string) (int, bool) {
 }
 
 // captureHat detects the D-pad shape: an axis move → Kind "axis"; a button →
-// Kind "buttons" (then asks for DOWN); a timeout → Kind "none".
-func captureHat(events <-chan jsEvent) HatMap {
+// Kind "buttons" (then asks for the opposite direction); a timeout → "none".
+// posPrompt is the positive-direction prompt (e.g. "Press D-pad UP"); label
+// names what it controls (for the skip message).
+func captureHat(events <-chan jsEvent, posPrompt, label string) HatMap {
 	waitNeutral(events) // drain BEFORE prompting so a fast press isn't swallowed
-	fmt.Print("  Press D-pad UP (or wait to skip the speed-cap D-pad) ... ")
+	fmt.Printf("  %s (or wait to skip the %s D-pad) ... ", posPrompt, label)
 	deadline := time.After(10 * time.Second)
 	for {
 		select {
@@ -1980,17 +2109,47 @@ func captureHat(events <-chan jsEvent) HatMap {
 				}
 			}
 			if e.etype == jsEventButton && e.value != 0 {
-				up := int(e.number)
-				fmt.Printf("button %d\n", up)
-				// captureButton drains the UP release first, then prompts DOWN.
-				if dn, ok := captureButton(events, "Now press D-pad DOWN"); ok {
-					return HatMap{Kind: "buttons", Up: up, Down: dn}
+				pos := int(e.number)
+				fmt.Printf("button %d\n", pos)
+				if neg, ok := captureButton(events, "Now press the OPPOSITE D-pad direction"); ok {
+					return HatMap{Kind: "buttons", Up: pos, Down: neg}
 				}
 				return HatMap{Kind: "none"}
 			}
 		case <-deadline:
 			fmt.Println("(skipped)")
 			return HatMap{Kind: "none"}
+		}
+	}
+}
+
+// captureControl captures an optional control that may be a button OR a held
+// trigger (axis): whichever the user activates past threshold. Skip → false.
+func captureControl(events <-chan jsEvent, prompt string) (ControlMap, bool) {
+	waitNeutral(events)
+	fmt.Printf("  %s (or wait to skip) ... ", prompt)
+	deadline := time.After(12 * time.Second)
+	for {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				fmt.Println("(device closed)")
+				return ControlMap{}, false
+			}
+			if e.etype == jsEventAxis {
+				v := float64(e.value) / 32767.0
+				if v > calibThreshold || v < -calibThreshold {
+					fmt.Printf("axis %d%s\n", e.number, map[bool]string{true: " (inverted)"}[v < 0])
+					return ControlMap{Kind: "axis", Axis: AxisMap{int(e.number), v < 0}}, true
+				}
+			}
+			if e.etype == jsEventButton && e.value != 0 {
+				fmt.Printf("button %d\n", e.number)
+				return ControlMap{Kind: "button", Index: int(e.number)}, true
+			}
+		case <-deadline:
+			fmt.Println("(skipped, stays disabled)")
+			return ControlMap{}, false
 		}
 	}
 }

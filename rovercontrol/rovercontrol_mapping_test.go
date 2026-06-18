@@ -35,7 +35,7 @@ func TestCaptureButton(t *testing.T) {
 func TestCaptureHatAxis(t *testing.T) {
 	ch := make(chan jsEvent, 8)
 	go func() { time.Sleep(400 * time.Millisecond); ch <- axisEv(7, -30000) }()
-	h := captureHat(ch)
+	h := captureHat(ch, "Press D-pad UP", "test")
 	if h.Kind != "axis" || h.Axis.Index != 7 || !h.Axis.Invert { // raw-neg up → Invert
 		t.Fatalf("captureHat axis = %+v", h)
 	}
@@ -63,8 +63,29 @@ func TestCaptureHatButtons(t *testing.T) {
 		time.Sleep(400 * time.Millisecond)
 		ch <- btnEv(12)
 	}()
-	if h := captureHat(ch); h.Kind != "buttons" || h.Up != 11 || h.Down != 12 {
+	if h := captureHat(ch, "Press D-pad UP", "test"); h.Kind != "buttons" || h.Up != 11 || h.Down != 12 {
 		t.Fatalf("captureHat buttons = %+v", h)
+	}
+}
+
+func TestCaptureControl(t *testing.T) {
+	// button press → Kind button
+	ch := make(chan jsEvent, 8)
+	go func() { time.Sleep(400 * time.Millisecond); ch <- btnEv(7) }()
+	if c, ok := captureControl(ch, "press"); !ok || c.Kind != "button" || c.Index != 7 {
+		t.Fatalf("button control: %+v %v", c, ok)
+	}
+	// trigger held (axis) → Kind axis
+	ch2 := make(chan jsEvent, 8)
+	go func() { time.Sleep(400 * time.Millisecond); ch2 <- axisEv(5, 30000) }()
+	if c, ok := captureControl(ch2, "hold"); !ok || c.Kind != "axis" || c.Axis.Index != 5 {
+		t.Fatalf("axis control: %+v %v", c, ok)
+	}
+	// closed device → skip
+	ch3 := make(chan jsEvent)
+	close(ch3)
+	if _, ok := captureControl(ch3, "x"); ok {
+		t.Fatal("closed device returned ok")
 	}
 }
 
@@ -76,7 +97,7 @@ func TestCaptureClosedDevice(t *testing.T) {
 	}
 	ch2 := make(chan jsEvent)
 	close(ch2)
-	if h := captureHat(ch2); h.Kind != "none" {
+	if h := captureHat(ch2, "Press D-pad UP", "test"); h.Kind != "none" {
 		t.Fatalf("captureHat on closed device = %+v", h)
 	}
 }
@@ -86,6 +107,90 @@ func fakeState(axes map[int]float64, btns map[int]bool) gpState {
 	return gpState{
 		axis:   func(i int) float64 { return axes[i] },
 		button: func(i int) bool { return btns[i] },
+	}
+}
+
+func TestControlMapHeld(t *testing.T) {
+	none := ControlMap{Kind: "none"}
+	if none.held(fakeState(map[int]float64{0: 1}, map[int]bool{0: true})) {
+		t.Fatal("none should never be held")
+	}
+	btn := ControlMap{Kind: "button", Index: 7}
+	if !btn.held(fakeState(nil, map[int]bool{7: true})) || btn.held(fakeState(nil, nil)) {
+		t.Fatal("button held wrong")
+	}
+	trig := ControlMap{Kind: "axis", Axis: AxisMap{5, false}}
+	if !trig.held(fakeState(map[int]float64{5: 1.0}, nil)) || trig.held(fakeState(map[int]float64{5: 0.2}, nil)) {
+		t.Fatal("axis trigger held wrong")
+	}
+	// zero-value ControlMap (old config without the field) is disabled, not button 0
+	var zero ControlMap
+	if zero.held(fakeState(nil, map[int]bool{0: true})) {
+		t.Fatal("zero-value ControlMap must be disabled, not button 0")
+	}
+}
+
+func TestTopSpeedPrecedence(t *testing.T) {
+	base := speedSteps[2] // 0.25
+	if topSpeed(2, false, false, false) != base {
+		t.Fatal("plain cap")
+	}
+	if topSpeed(2, true, false, false) != turbo {
+		t.Fatal("turbo")
+	}
+	if topSpeed(2, false, true, false) != speedLimit {
+		t.Fatal("boost = max")
+	}
+	// precision wins over turbo AND boost
+	if topSpeed(2, true, true, true) != precisionCap {
+		t.Fatalf("precision should win: %v", topSpeed(2, true, true, true))
+	}
+	if topSpeed(2, false, false, true) != precisionCap {
+		t.Fatal("precision alone")
+	}
+}
+
+func TestComputeJoystickNewControls(t *testing.T) {
+	m := defaultMapping()
+	m.Precision = ControlMap{Kind: "axis", Axis: AxisMap{2, false}} // LT trigger
+	m.Boost = ControlMap{Kind: "button", Index: 7}
+	m.PanicStop = ControlMap{Kind: "button", Index: 9}
+	m.HatX = HatMap{Kind: "buttons", Up: 14, Down: 15} // right=Up=+1
+	// precision held (trigger), boost held (button)
+	a := computeJoystick(&m, fakeState(map[int]float64{2: 1.0}, map[int]bool{7: true}), &gpPrev{btn: map[int]bool{}})
+	if !a.precision || !a.boost {
+		t.Fatalf("precision/boost not held: %+v", a)
+	}
+	// PanicStop rising edge → estop, via its own slot (doesn't depend on m.Estop)
+	prev := &gpPrev{btn: map[int]bool{}}
+	if a := computeJoystick(&m, fakeState(nil, map[int]bool{9: true}), prev); !a.estop {
+		t.Fatal("panic stop did not fold into estop")
+	}
+	if a := computeJoystick(&m, fakeState(nil, map[int]bool{9: true}), prev); a.estop {
+		t.Fatal("panic stop fired twice while held")
+	}
+	// D-pad right → pan nudge +1 (rising edge), separate from speed hat
+	if a := computeJoystick(&m, fakeState(nil, map[int]bool{14: true}), &gpPrev{btn: map[int]bool{}}); a.panNudge != 1 {
+		t.Fatalf("pan nudge right: %d", a.panNudge)
+	}
+}
+
+func TestLoadMappingBackwardCompat(t *testing.T) {
+	// an old plan-004 config without the plan-006 fields must load them DISABLED
+	dir := t.TempDir()
+	p := filepath.Join(dir, "old.json")
+	os.WriteFile(p, []byte(`{"stop":0,"estop":6,"hat":{"kind":"axis","axis":{"index":7,"invert":true}}}`), 0o644)
+	m, src, err := loadMapping(p)
+	if err != nil || src != "config" {
+		t.Fatalf("old config → %s %v", src, err)
+	}
+	for _, c := range []ControlMap{m.Precision, m.Boost, m.PanicStop} {
+		if c.Kind != "none" {
+			t.Fatalf("old config gained an enabled control: %+v", c)
+		}
+	}
+	if m.HatX.Kind != "none" {
+		t.Fatalf("old config gained HatX: %+v", m.HatX)
 	}
 }
 
@@ -99,6 +204,9 @@ func TestDefaultMappingPinned(t *testing.T) {
 		Turbo: 5, Stop: 0, Snapshot: 1, HeadLight: 2, Center: 3,
 		BaseLight: 4, Estop: 6, Relax: 9, Lock: 10,
 		Hat: HatMap{Kind: "axis", Axis: AxisMap{7, true}},
+		// plan 006: new controls default disabled
+		Precision: ControlMap{Kind: "none"}, Boost: ControlMap{Kind: "none"},
+		PanicStop: ControlMap{Kind: "none"}, HatX: HatMap{Kind: "none"},
 	}
 	if m != want {
 		t.Fatalf("defaultMapping drifted:\n got %+v\nwant %+v", m, want)
