@@ -154,4 +154,27 @@ into the dup-warning) was applied. Coverage 72.3%, race-clean.
 
 ## Post-execution report
 
-_(filled in at the end)_
+**Shipped (PR #12, merged):** four optional gamepad controls — LT precision/slow,
+RT boost, Start instant-e-stop, D-pad ←/→ fine camera pan — via a new
+`ControlMap{Kind:button|axis|none}`, all default-disabled and enabled by
+`-calibrate`. `topSpeed` pure helper with precision-wins precedence; `PanicStop`
+and `HatX` own edge slots; `validate` extended + duplicate-button warning;
+calibrate gained `captureControl`/`HatX` prompts. Coverage 72.3%.
+
+**Deviations:** the big one came from plan review — the *first* draft guessed
+default button indices that **collided** with existing bindings (Estop=6,
+Relax=9) and mismodeled triggers as buttons. Both reviewers caught it; the
+resolution (disabled-by-default `ControlMap`, enabled via calibration) is safer
+and is why the four controls don't work until you run `-calibrate`.
+
+**Tradeoffs:** the new controls are inert until calibrated — deliberate, to avoid
+silently mis-mapping a pad we haven't probed. Since calibration is needed anyway
+to fix the *existing* mapping, one `-calibrate` run enables everything.
+
+**Deploy result (2026-06-18):** rebuilt arm64, rsynced (checksum match),
+restarted; `/healthz` up (serial/camera/gamepad), no behavior change (new
+controls disabled). **No motion commands were sent** — per the standing cat-safety
+rule. **Open acceptance step (needs a human + the cat clear):** run
+`rovercontrol-arm64 -calibrate` on the rover, do the new prompts (precision/boost
+triggers, instant-stop button, D-pad left/right), restart, and verify LT slows,
+RT boosts, Start instant-stops, and D-pad ←/→ nudges the camera.
