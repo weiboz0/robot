@@ -518,13 +518,19 @@ func TestBuildCameraCmd(t *testing.T) {
 	got := buildCameraCmd(ctx, "v4l2", "/dev/video0", 1280, 720, 30).Args
 	want := []string{"v4l2-ctl", "-d", "/dev/video0",
 		"--set-fmt-video=width=1280,height=720,pixelformat=MJPG",
-		"--stream-mmap", "--stream-count=0", "--stream-to=-"}
+		"--set-parm=30", "--stream-mmap", "--stream-count=0", "--stream-to=-"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("v4l2 sized args:\n got %v\nwant %v", got, want)
 	}
-	got = buildCameraCmd(ctx, "v4l2", "/dev/video1", 0, 0, 30).Args
+	// fps==0 omits --set-parm (let the camera free-run at its default).
+	got = buildCameraCmd(ctx, "v4l2", "/dev/video1", 0, 0, 0).Args
 	if strings.Join(got, " ") != "v4l2-ctl -d /dev/video1 --set-fmt-video=pixelformat=MJPG --stream-mmap --stream-count=0 --stream-to=-" {
-		t.Fatalf("v4l2 unsized args: %v", got)
+		t.Fatalf("v4l2 unsized/no-fps args: %v", got)
+	}
+	// the low-latency defaults wire through to a real framerate cap on v4l2.
+	got = buildCameraCmd(ctx, "v4l2", "/dev/video0", defaultCamWidth, defaultCamHeight, defaultCamFPS).Args
+	if strings.Join(got, " ") != "v4l2-ctl -d /dev/video0 --set-fmt-video=width=640,height=480,pixelformat=MJPG --set-parm=15 --stream-mmap --stream-count=0 --stream-to=-" {
+		t.Fatalf("v4l2 default args: %v", got)
 	}
 	got = buildCameraCmd(ctx, "rpicam", "", 1280, 720, 30).Args
 	want = []string{"rpicam-vid", "-n", "-t", "0", "--codec", "mjpeg",
