@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -39,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -437,13 +439,27 @@ type Camera struct {
 	mode, device       string // resolved mode ("v4l2"/"rpicam"); V4L2 device path
 	width, height, fps int
 
+	// lastFrame is the UnixNano of the most recent published frame, read by the
+	// stall watchdog. atomic so the splitter and watchdog don't race (-race).
+	lastFrame atomic.Int64
+
 	mu      sync.Mutex
 	up      bool
 	lastErr string
 
-	// attemptFn overrides runOnce in tests (nil = use runOnce).
-	attemptFn func(ctx context.Context, hub *Hub, w, h int) error
+	// Test injection (all nil/zero in production):
+	//   attemptFn    overrides runOnce entirely.
+	//   newCmd       overrides the capture command runOnce spawns.
+	//   stallTimeout overrides camStallTimeout for the watchdog.
+	attemptFn    func(ctx context.Context, hub *Hub, w, h int) error
+	newCmd       func(ctx context.Context, w, h int) *exec.Cmd
+	stallTimeout time.Duration
 }
+
+// errStalled marks a capture attempt that was killed by the frame-staleness
+// watchdog (producer alive but silent). Camera.run respawns it quickly instead
+// of treating it as a hard failure (which would grow the backoff).
+var errStalled = errors.New("camera produced no frames; restarting")
 
 func (c *Camera) status() (bool, string) {
 	c.mu.Lock()
@@ -476,6 +492,15 @@ func resolveCameraMode(mode, device string) string {
 	}
 }
 
+// Default camera capture geometry — favours low-latency teleop over sharpness.
+// Override per-launch with -width/-height/-fps. (USB/V4L2 honours -fps via
+// --set-parm; see buildCameraCmd.)
+const (
+	defaultCamWidth  = 640
+	defaultCamHeight = 480
+	defaultCamFPS    = 15
+)
+
 // buildCameraCmd returns the capture command that writes concatenated MJPG to
 // stdout. For v4l2, width/height are only set when both > 0 (so width=0 lets the
 // camera pick a supported resolution — the unsized-retry escape hatch).
@@ -485,8 +510,14 @@ func buildCameraCmd(ctx context.Context, mode, device string, w, h, fps int) *ex
 		if w > 0 && h > 0 {
 			fmtArg = fmt.Sprintf("--set-fmt-video=width=%d,height=%d,pixelformat=MJPG", w, h)
 		}
-		return exec.CommandContext(ctx, "v4l2-ctl", "-d", device,
-			fmtArg, "--stream-mmap", "--stream-count=0", "--stream-to=-")
+		args := []string{"-d", device, fmtArg}
+		if fps > 0 {
+			// Without --set-parm the USB cam ignores -fps and free-runs at its
+			// default (~30fps), so the bandwidth/lag reduction never lands.
+			args = append(args, fmt.Sprintf("--set-parm=%d", fps))
+		}
+		args = append(args, "--stream-mmap", "--stream-count=0", "--stream-to=-")
+		return exec.CommandContext(ctx, "v4l2-ctl", args...)
 	}
 	// rpicam-vid: omit width/height/framerate when ≤0 so "0 = let the camera
 	// choose" works for CSI too (not just v4l2).
@@ -518,17 +549,39 @@ func (c *Camera) run(ctx context.Context, hub *Hub) {
 		// codex: an unsupported resolution shouldn't be a permanent failure —
 		// retry once unsized (v4l2 only). Once that also fails, stop retrying it
 		// (glm: avoid double-spawning every backoff cycle). Surface BOTH errors.
-		if err != nil && c.mode == "v4l2" && c.width > 0 && c.height > 0 && !unsizedExhausted {
+		// A stall isn't a resolution problem, so don't probe unsized for one; but
+		// if the unsized attempt itself streamed then stalled, treat that as a
+		// stall too (fast respawn), not exhaustion.
+		if err != nil && !errors.Is(err, errStalled) &&
+			c.mode == "v4l2" && c.width > 0 && c.height > 0 && !unsizedExhausted {
 			err2 := attempt(ctx, hub, 0, 0)
 			if ctx.Err() != nil {
 				return
 			}
 			if err2 == nil {
 				err = nil
+			} else if errors.Is(err2, errStalled) {
+				err = errStalled
 			} else {
 				unsizedExhausted = true
 				err = fmt.Errorf("sized: %v; unsized: %v", err, err2)
 			}
+		}
+		// A stall (producer alive but silent, from either attempt) isn't a hard
+		// failure: respawn quickly with backoff reset, and flip status down so the
+		// UI shows the placeholder instead of the frozen last frame.
+		if errors.Is(err, errStalled) {
+			c.setStatus(false, "no frames; restarting")
+			log.Printf("camera: %s stalled (no frames for %s); restarting", c.mode, camStallTimeout)
+			backoff = time.Second
+			loggedFail = false
+			unsizedExhausted = false
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			continue
 		}
 		// A clean exit only counts as "healthy" if it actually streamed for a
 		// while; a process that exits 0 immediately (e.g. a finite stream) is
@@ -560,7 +613,18 @@ func (c *Camera) run(ctx context.Context, hub *Hub) {
 }
 
 func (c *Camera) runOnce(ctx context.Context, hub *Hub, w, h int) error {
-	cmd := buildCameraCmd(ctx, c.mode, c.device, w, h, c.fps)
+	// Per-attempt context so the stall watchdog can kill a silent-but-alive
+	// producer (which otherwise wedges splitFrames' blocking Read forever).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	build := c.newCmd
+	if build == nil {
+		build = func(ctx context.Context, w, h int) *exec.Cmd {
+			return buildCameraCmd(ctx, c.mode, c.device, w, h, c.fps)
+		}
+	}
+	cmd := build(ctx, w, h)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -570,14 +634,68 @@ func (c *Camera) runOnce(ctx context.Context, hub *Hub, w, h int) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	c.setStatus(true, "")
 	if c.mode == "v4l2" {
 		log.Printf("camera: v4l2 started (%dx%d, %s)", w, h, c.device)
 	} else {
 		log.Printf("camera: rpicam started (%dx%d@%dfps)", w, h, c.fps)
 	}
-	splitErr := splitFrames(stdout, hub.publish)
+
+	// Frame-staleness watchdog. The clock starts now (an implicit first-frame
+	// grace ≈ stall timeout); each published frame refreshes it. If no frame
+	// arrives within the timeout, cancel the producer so this attempt ends and
+	// run() respawns it.
+	timeout := c.stallTimeout
+	if timeout <= 0 {
+		timeout = camStallTimeout
+	}
+	c.lastFrame.Store(time.Now().UnixNano())
+	stalled := make(chan struct{})
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		tick := timeout / 2
+		if tick <= 0 || tick > time.Second {
+			tick = time.Second
+		}
+		t := time.NewTicker(tick)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, c.lastFrame.Load())) > timeout {
+					close(stalled)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	// Status flips up only on the FIRST published frame (not at process start),
+	// so a respawn that produces nothing keeps the camera "down" and videoFeed
+	// serves the placeholder rather than the stale pre-stall frame (codex #1).
+	firstFrame := true
+	splitErr := splitFrames(stdout, func(frame []byte) {
+		c.lastFrame.Store(time.Now().UnixNano())
+		if firstFrame {
+			firstFrame = false
+			c.setStatus(true, "")
+		}
+		hub.publish(frame)
+	})
 	waitErr := cmd.Wait()
+	cancel()
+	<-watchdogDone
+
+	// If the watchdog fired, report it as a stall (fast respawn) rather than a
+	// generic producer error.
+	select {
+	case <-stalled:
+		return errStalled
+	default:
+	}
 	if waitErr != nil {
 		if s := strings.TrimSpace(stderr.String()); s != "" {
 			return fmt.Errorf("%v: %s", waitErr, lastLine(s))
@@ -1608,13 +1726,42 @@ func photoName(path, prefix string) (string, bool) {
 	return name, safePhotoName(name)
 }
 
+// Stream tuning.
+//   streamWriteTimeout — max time a single MJPEG frame write may block before we
+//     drop the slow/stuck client (it reconnects); also prevents a wedged client
+//     from pinning the handler/keepalive forever.
+//   streamSendBuffer — per-connection TCP send-buffer cap so a slow link can't
+//     build a multi-frame backlog (latency); the kernel may round/double it, so
+//     this only approximately bounds in-flight frames.
+//   camStallTimeout — respawn a producer that has gone silent (see runOnce).
+const (
+	streamWriteTimeout = 5 * time.Second
+	streamSendBuffer   = 256 << 10
+	camStallTimeout    = 5 * time.Second
+)
+
+// connCtxKey stashes the raw net.Conn in each request's context (via
+// http.Server.ConnContext) so videoFeed can tune the socket's send buffer.
+type connCtxKey struct{}
+
+// tuneStreamConn shrinks the MJPEG client's TCP send buffer so a slow link can't
+// accumulate a multi-frame backlog. No-op if the conn wasn't stashed or isn't TCP.
+func tuneStreamConn(ctx context.Context) {
+	if c, ok := ctx.Value(connCtxKey{}).(net.Conn); ok {
+		if tcp, ok := c.(*net.TCPConn); ok {
+			_ = tcp.SetWriteBuffer(streamSendBuffer)
+		}
+	}
+}
+
 func (app *App) videoFeed(w http.ResponseWriter, r *http.Request) {
 	const boundary = "rovercamframe"
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	rc := http.NewResponseController(w)
+	tuneStreamConn(r.Context())
 	frames, cancel := app.hub.subscribe()
 	defer cancel()
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
@@ -1625,6 +1772,16 @@ func (app *App) videoFeed(w http.ResponseWriter, r *http.Request) {
 	keep := time.NewTicker(time.Second)
 	defer keep.Stop()
 	send := func(frame []byte) bool {
+		// Camera down → placeholder, never the stale real frame the hub may still
+		// hold from before a stall. Applies to every send path (incl. the frame
+		// preloaded into a fresh subscription).
+		if up, _ := app.cam.status(); !up {
+			frame = placeholderFrame
+		}
+		// Bound how long one frame may block a slow/stuck client; on timeout (or
+		// any write/flush error) return false → close → the <img> reconnects.
+		// SetWriteDeadline is ErrNotSupported under httptest recorders; ignore it.
+		_ = rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
 		if _, err := fmt.Fprintf(w, "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
 			boundary, len(frame)); err != nil {
 			return false
@@ -1635,8 +1792,7 @@ func (app *App) videoFeed(w http.ResponseWriter, r *http.Request) {
 		if _, err := fmt.Fprint(w, "\r\n"); err != nil {
 			return false
 		}
-		flusher.Flush()
-		return true
+		return rc.Flush() == nil
 	}
 	for {
 		select {
@@ -1646,7 +1802,7 @@ func (app *App) videoFeed(w http.ResponseWriter, r *http.Request) {
 			}
 		case <-keep.C:
 			f := app.hub.latestFrame()
-			if up, _ := app.cam.status(); !up || f == nil {
+			if f == nil {
 				f = placeholderFrame
 			}
 			if !send(f) {
@@ -1809,9 +1965,9 @@ func main() {
 	photos := flag.String("photos", defaultPhotoDir(), "photo directory")
 	serialPath := flag.String("serial", "/dev/ttyAMA0", "ESP32 serial device")
 	jsPath := flag.String("gamepad", "/dev/input/js0", "joystick device ('' to disable)")
-	width := flag.Int("width", 1280, "camera width (0 = let the camera choose)")
-	height := flag.Int("height", 720, "camera height (0 = let the camera choose)")
-	fps := flag.Int("fps", 30, "camera fps (rpicam only)")
+	width := flag.Int("width", defaultCamWidth, "camera width (0 = let the camera choose)")
+	height := flag.Int("height", defaultCamHeight, "camera height (0 = let the camera choose)")
+	fps := flag.Int("fps", defaultCamFPS, "camera fps (v4l2 via --set-parm, rpicam --framerate; 0 = camera default)")
 	camMode := flag.String("camera-mode", "auto", "camera backend: auto|v4l2|rpicam")
 	camDevice := flag.String("camera-device", "/dev/video0", "V4L2 device (v4l2 mode)")
 	gpDebug := flag.Bool("gamepad-debug", false, "print live gamepad indices and exit")
@@ -1874,7 +2030,15 @@ func main() {
 
 	go app.move.runWatchdog(ctx)
 
-	srv := &http.Server{Addr: ":" + *port, Handler: app.routes()}
+	srv := &http.Server{
+		Addr:    ":" + *port,
+		Handler: app.routes(),
+		// Stash the raw conn so videoFeed can shrink the stream socket's send
+		// buffer (latency bound).
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return context.WithValue(ctx, connCtxKey{}, c)
+		},
+	}
 	log.Printf("rovercontrol: http://0.0.0.0:%s  (photos: %s)", *port, *photos)
 	log.Fatal(srv.ListenAndServe())
 }
