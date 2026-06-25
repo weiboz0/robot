@@ -22,175 +22,23 @@ Setup (any machine):
 import json
 import os
 import re
-import socket
 import sys
 import time
 
-import rover_client          # stdlib-only (urllib); safe to import anywhere
-import rover_camera          # stdlib-only; safe to import anywhere
 import dobot
+
+from rover_backend import RoverCtl, detect_rover
+from llm_config import load_dotenv
 
 BASE_URL = os.environ.get("OPENCODE_BASE_URL", "").strip() or "https://opencode.ai/zen/go/v1"
 MODEL = os.environ.get("OPENCODE_MODEL", "").strip() or "minimax-m3"
 
-ROVER_HTTP_HOST, ROVER_HTTP_PORT = "192.168.1.131", 5000
 
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 def strip_think(text: str) -> str:
     return _THINK.sub("", text or "").strip()
-
-
-def load_dotenv() -> None:
-    here = os.path.dirname(os.path.abspath(__file__))
-    for p in (os.path.expanduser("~/.env"), os.path.join(here, ".env")):
-        if not os.path.exists(p):
-            continue
-        with open(p) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
-def _reachable(host: str, port: int, timeout: float = 2.0) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-
-# --------------------------------------------------------------- rover backend
-class RoverCtl:
-    """Common rover interface over either the serial or HTTP backend."""
-
-    def __init__(self, backend: str, port: str = None):
-        self.backend = backend          # "serial" | "http"
-        self.pan = 0.0
-        self.tilt = 0.0
-        if backend == "serial":
-            import rover_direct
-            self._rd = rover_direct
-            if rover_direct.stop_http_service():
-                print("stopped ugv_rpi/app.py to free the serial port.")
-            self._r = rover_direct.Rover(port=port)   # open the detected path, don't re-detect
-            self.where = self._r.port
-        else:
-            self.where = f"http://{ROVER_HTTP_HOST}:{ROVER_HTTP_PORT}"
-
-    def set_camera(self, pan, tilt):
-        self.pan = _clamp(float(pan), -180.0, 180.0)
-        self.tilt = _clamp(float(tilt), -45.0, 90.0)
-        if self.backend == "serial":
-            self._r.set_camera(self.pan, self.tilt)
-        else:
-            rover_client.set_camera(self.pan, self.tilt)
-
-    def drive(self, left, right, seconds):
-        # clamp here too (defense-in-depth; backends also clamp)
-        left = _clamp(float(left), -0.5, 0.5)
-        right = _clamp(float(right), -0.5, 0.5)
-        seconds = _clamp(float(seconds), 0.0, 5.0)
-        if self.backend == "serial":
-            self._r.drive_for(left, right, seconds)
-        else:
-            rover_client.drive(left, right, seconds)
-
-    def move(self, left, right):
-        # continuous, no auto-stop
-        left = _clamp(float(left), -0.5, 0.5)
-        right = _clamp(float(right), -0.5, 0.5)
-        if self.backend == "serial":
-            self._r.drive(left, right)
-        else:
-            rover_client.move(left, right)
-
-    def stop(self):
-        if self.backend == "serial":
-            self._r.stop()
-        else:
-            rover_client.stop()
-
-    def estop(self):
-        if self.backend == "serial":
-            self._r.estop()
-        else:
-            rover_client.estop()
-
-    def lights(self, front=0, base=0):
-        front = int(_clamp(float(front), 0, 255))
-        base = int(_clamp(float(base), 0, 255))
-        if self.backend == "serial":
-            self._r.lights(front, base)
-        else:
-            rover_client.lights(front, base)
-        return front, base
-
-    def set_torque(self, lock):
-        if self.backend == "serial":
-            self._r.servo_torque(lock)
-        else:
-            rover_client.servo_torque(lock)
-
-    def oled(self, line, text):
-        if self.backend == "serial":
-            self._r.oled(int(line), text)
-        else:
-            rover_client.oled(int(line), text)
-
-    def oled_default(self):
-        if self.backend == "serial":
-            self._r.oled_default()
-        else:
-            rover_client.oled_default()
-
-    def center(self):
-        self.set_camera(0, 0)
-
-    def photo(self):
-        # On HTTP (a computer) grab from the rover's stream -> saves locally here.
-        # On serial (the Pi) the web app is down, so rover_camera uses rpicam-still.
-        host = ROVER_HTTP_HOST if self.backend == "http" else "127.0.0.1"
-        return rover_camera.take_photo(wait=True, host=host)
-
-    def demo(self):
-        # motor + camera self-test (backend-agnostic, mirrors rover_direct.demo)
-        self.set_camera(0, 45); time.sleep(2)
-        self.set_camera(0, -30); time.sleep(2)
-        self.set_camera(-45, 0); time.sleep(2)
-        self.center(); time.sleep(1)
-        self.drive(0.15, 0.15, 0.6)   # nudge forward
-        self.drive(0.2, -0.2, 0.5)    # spin right
-
-    def close(self):
-        if self.backend == "serial":
-            self._r.close()
-
-
-def detect_rover():
-    # Single source of truth for the serial device: rover_direct.detect_port()
-    # is board-aware (Pi 5 -> /dev/ttyAMA0; older Pis -> /dev/serial0). Use serial
-    # only if that exact device exists, and open *that* path (no re-detect mismatch).
-    try:
-        import rover_direct
-        port = rover_direct.detect_port()
-    except Exception:
-        port = None
-    if port and os.path.exists(port):
-        try:
-            return RoverCtl("serial", port=port)
-        except Exception as e:
-            print(f"rover serial detected ({port}) but failed to open: {e}")
-    if _reachable(ROVER_HTTP_HOST, ROVER_HTTP_PORT):
-        return RoverCtl("http")
-    return None
 
 
 # ----------------------------------------------------- rover $-command parser
@@ -245,6 +93,8 @@ def rover_command(r: RoverCtl, line: str) -> str:
         return f"?? unknown rover command '{c}'"
     except (IndexError, ValueError):
         return "bad args"
+    except NotImplementedError as e:
+        return str(e)                       # e.g. OLED via the rovercontrol backend
 
 
 # --------------------------------------------------------------------- tools

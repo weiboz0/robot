@@ -17,7 +17,7 @@ import json
 import os
 import sys
 
-from chatbot import load_dotenv
+from llm_config import load_dotenv
 
 from volcengine.base.Service import Service
 from volcengine.ServiceInfo import ServiceInfo
