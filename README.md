@@ -7,8 +7,8 @@ MG400 robotic arm.
 One chatbot that controls **both the rover and the Dobot MG400** in natural language.
 Same file, no per-machine edits — it **auto-detects** what it can reach:
 
-- **Rover**: direct serial if a serial port exists (on the Pi), else the rover's HTTP
-  API if reachable (on a computer), else disabled.
+- **Rover**: direct serial if a serial port exists (on the Pi), else the Go controller's
+  `:8080` API if its serial is up, else the legacy app.py `:5000` API, else disabled.
 - **Dobot** (`192.168.1.6`): TCP-IP if reachable, else disabled.
 
 Runs on the rover's Raspberry Pi or any computer (the Dobot can't run it itself).
@@ -41,20 +41,11 @@ chat is off but `$` commands work.
 > The Dobot must be in **Remote/TCP control mode** (unlock in DobotStudio Pro) or it
 > replies `-1`. Run the tests with `python -m unittest discover -s tests -t .`.
 
-## Chatbot (`chatbot.py`)
-A terminal chatbot that chats and drives the rover via natural language. Works
-with OpenAI-compatible providers (ARK / DashScope / OpenCode) selected from
-`.env`. Rover actions are exposed as tools (`set_camera`, `drive`, `stop`) that
-POST to the rover's web app.
-
-```bash
-python3 -m venv .venv && ./.venv/bin/pip install openai
-cp .env.example .env   # then fill in keys
-./.venv/bin/python chatbot.py
-```
-
-Config lives in `.env` (not committed): provider keys, `PROVIDER`, and per-provider
-`*_MODEL` / `*_BASE_URL`.
+## Chatbot config (`.env`)
+`agent_chat.py` (above) is the one chatbot — same file on the rover (direct serial) or any
+computer (HTTP). It and the model-listing helpers read provider config from `.env` (not
+committed) via `llm_config.py`: provider keys, `PROVIDER`, and per-provider `*_MODEL` /
+`*_BASE_URL` (ARK / DashScope / OpenCode).
 
 ## Helpers
 - `list_models.py <provider>` — list a provider's model catalog.
@@ -72,20 +63,17 @@ rover            # interactive  (launcher -> ~/robot/rover_direct.py)
 rover demo       # self-test
 ```
 
-## Direct-control chatbot (`rover_chat.py`)
-Also runs **on the rover**. An LLM (OpenCode / minimax-m3 by default) drives the
-rover over direct serial, so fuzzy commands work — "look up a bit", "spin
-around". Prefix a line with `$` to run a direct command instead of chatting
-(`$up 45`, `$drive 0.2 0.2 1`, `$help`). Needs `OPENCODE_API_KEY` in `~/.env`
-and `openai` installed in the rover's venv.
-
-```bash
-roverchat        # launcher -> ~/robot/rover_chat.py
-```
+## Gamepad control (the Go controller)
+The gamepad is handled by the Go controller (`rovercontrol/`), which reads a USB gamepad
+plugged into the **Pi** directly and also serves the camera + a control API on `:8080`.
+Run it on the rover (build + deploy the `rovercontrol-arm64` binary, then start it); the
+joystick "just works" and the live view + photo gallery are at `http://192.168.1.131:8080/`.
+The Python chatbot drives the same controller over that `:8080` API. (The old Python
+joystick scripts now live in `graveyard/`.)
 
 ## Running on the rover via git
 The rover programs live in this repo; on the rover they're cloned at `~/robot`
-and run via the `rover` / `roverchat` launchers. To update:
+and run via the `rover` / `chatbot` launchers. To update:
 
 ```bash
 ssh rover

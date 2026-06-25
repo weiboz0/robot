@@ -9,11 +9,11 @@ Usage:
 Note: this lists each provider's foundation-model catalog. To see your ARK
 inference endpoints (ep-..., e.g. MiniMax), use list_ark_endpoints.py instead.
 
-Reads keys/config from .env via chatbot.PROVIDERS.
+Reads keys/config from .env via llm_config.PROVIDERS.
 """
 import sys
 
-from chatbot import PROVIDERS, load_dotenv, pick_provider, resolve_base_url
+from llm_config import PROVIDERS, load_dotenv, pick_provider, resolve_base_url
 import os
 
 

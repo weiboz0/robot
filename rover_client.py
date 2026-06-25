@@ -4,24 +4,51 @@ The rover runs app.py (Flask) on :5000, which owns the serial port to the
 ESP32. We send JSON control commands through its /send_command endpoint as
 `base -c {json}` strings instead of opening the serial port ourselves.
 """
+from __future__ import annotations
+
 import json
 import time
 import urllib.parse
 import urllib.request
 
 ROVER_HOST = "192.168.1.131"
-ENDPOINT = f"http://{ROVER_HOST}:5000/send_command"
+_PORT = 5000
+_TIMEOUT = 4.0
 
 
-def _send_json(cmd: dict) -> None:
+def _endpoint() -> str:
+    return f"http://{ROVER_HOST}:{_PORT}/send_command"
+
+
+# Back-compat for callers that import ENDPOINT directly; set_host() keeps it current.
+ENDPOINT = _endpoint()
+
+
+def set_host(host: str) -> None:
+    """Point all subsequent commands at a different rover host (e.g. from --host)."""
+    global ROVER_HOST, ENDPOINT
+    ROVER_HOST = host
+    ENDPOINT = _endpoint()
+
+
+def set_timeout(seconds: float) -> None:
+    """Set the default per-request HTTP timeout (the gamepad uses a short one so a
+    stuck link can't back commands up)."""
+    global _TIMEOUT
+    _TIMEOUT = float(seconds)
+
+
+def _send_json(cmd: dict, timeout: float | None = None) -> None:
     """POST one ESP32 JSON command to the running rover app.
 
     The rover parses `base -c {json}` by splitting on spaces and reading the
     third token, so the JSON must be COMPACT (no spaces) or it won't parse.
+    The URL is rebuilt from ROVER_HOST each call so set_host() takes effect.
     """
     compact = json.dumps(cmd, separators=(",", ":"))
     body = urllib.parse.urlencode({"command": "base -c " + compact}).encode()
-    urllib.request.urlopen(ENDPOINT, data=body, timeout=4).read()
+    urllib.request.urlopen(_endpoint(), data=body,
+                           timeout=_TIMEOUT if timeout is None else timeout).read()
 
 
 def set_camera(pan: float = 0.0, tilt: float = 0.0) -> None:
