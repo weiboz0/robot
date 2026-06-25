@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# rovernocam — rovercontrol WITHOUT the camera: joystick + serial control + HTTP.
+# /video_feed serves the placeholder; /snapshot 503s. See docs/plans/013.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  D="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"; [[ $SOURCE != /* ]] && SOURCE="$D/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+BIN="$DIR/rovercontrol-arm64"
+[ -x "$BIN" ] || { echo "rovernocam: $BIN missing — build+copy the arm64 binary" >&2; exit 1; }
+exec "$BIN" -photos "$DIR/photos" "$@" -camera-mode off

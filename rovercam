@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# rovercam — rovercontrol in CAMERA-ONLY mode: no joystick, no serial control.
+# Live view + snapshots on :8080; drive/lights/gimbal endpoints return 503.
+# See docs/plans/013. Mode flags are last so they win over any extra args.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  D="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"; [[ $SOURCE != /* ]] && SOURCE="$D/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+BIN="$DIR/rovercontrol-arm64"
+[ -x "$BIN" ] || { echo "rovercam: $BIN missing — build+copy the arm64 binary" >&2; exit 1; }
+exec "$BIN" -photos "$DIR/photos" "$@" -gamepad '' -serial ''
