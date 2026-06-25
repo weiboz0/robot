@@ -190,3 +190,51 @@ func TestRunOnceWatchdogStallAndFirstFrameStatus(t *testing.T) {
 		t.Fatal("expected at least one frame published before the stall")
 	}
 }
+
+// driveGate: an idle gamepad must stay silent (so HTTP /drive isn't overridden),
+// while an active or ramping-down stick keeps commanding, with one final stop on
+// release (plan 012).
+func TestDriveGate(t *testing.T) {
+	cases := []struct {
+		name                       string
+		tgtL, tgtR, curL, curR     float64
+		wasActive                  bool
+		wantEmit, wantActive       bool
+	}{
+		{"steady idle", 0, 0, 0, 0, false, false, false},
+		{"stick pushed", 0.25, 0.25, 0.1, 0.1, false, true, true},
+		{"ramping down (tgt 0, cur != 0)", 0, 0, 0.05, 0.05, true, true, true},
+		{"release transition (final stop)", 0, 0, 0, 0, true, true, false},
+		{"steady idle after stop", 0, 0, 0, 0, false, false, false},
+		{"turn in place", -0.2, 0.2, 0, 0, false, true, true},
+	}
+	for _, c := range cases {
+		emit, active := driveGate(c.tgtL, c.tgtR, c.curL, c.curR, c.wasActive)
+		if emit != c.wantEmit || active != c.wantActive {
+			t.Errorf("%s: driveGate=(%v,%v) want (%v,%v)", c.name, emit, active, c.wantEmit, c.wantActive)
+		}
+	}
+}
+
+// Carry wasActive across ticks: a release ramps down (emitting), emits one final
+// stop, then goes silent — the state machine the loop relies on (plan 012).
+func TestDriveGateReleaseSequence(t *testing.T) {
+	steps := []struct {
+		tgtL, tgtR, curL, curR float64
+		wantEmit               bool
+	}{
+		{0.2, 0.2, 0.1, 0.1, true}, // pushing
+		{0, 0, 0.05, 0.05, true},   // released, ramping down
+		{0, 0, 0, 0, true},         // reached zero → final stop
+		{0, 0, 0, 0, false},        // idle → silent (HTTP can drive)
+		{0, 0, 0, 0, false},        // still silent
+	}
+	wasActive := false
+	for i, s := range steps {
+		emit, active := driveGate(s.tgtL, s.tgtR, s.curL, s.curR, wasActive)
+		if emit != s.wantEmit {
+			t.Errorf("step %d: emit=%v want %v", i, emit, s.wantEmit)
+		}
+		wasActive = active
+	}
+}

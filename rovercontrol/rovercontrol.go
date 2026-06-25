@@ -1353,6 +1353,15 @@ func (g *gamepad) reader(ctx context.Context, dev io.Reader) {
 	}
 }
 
+// driveGate decides whether joystickLoop should command drive this tick. While the
+// stick is active (or ramping to a stop) it commands; once fully idle it goes silent
+// so an idle gamepad doesn't override HTTP /drive. wasActive carries the previous
+// tick's state so exactly one final stop is emitted on the active→idle transition.
+func driveGate(tgtL, tgtR, curL, curR float64, wasActive bool) (emit, active bool) {
+	active = tgtL != 0 || tgtR != 0 || curL != 0 || curR != 0
+	return active || wasActive, active
+}
+
 // joystickLoop applies the deadzone + slew ramp and commands motion every tick
 // (a held-steady stick emits no events, so motion must be re-commanded on a
 // fixed dt — and that refresh also keeps the watchdog from auto-stopping a
@@ -1363,6 +1372,7 @@ func (app *App) joystickLoop(ctx context.Context, g *gamepad) {
 	defer ticker.Stop()
 
 	var left, right float64
+	var wasActive bool
 	speedIdx := 2
 	prev := &gpPrev{ctrl: map[string]bool{}}
 	st := g.state()
@@ -1413,7 +1423,13 @@ func (app *App) joystickLoop(ctx context.Context, g *gamepad) {
 		step := ramp * dt
 		left = rampToward(left, tgtL, step)
 		right = rampToward(right, tgtR, step)
-		app.move.setDrive(left, right)
+		// Only command drive while the stick is active (or ramping to a stop);
+		// an idle gamepad stays silent so HTTP /drive (chatbot) gets through.
+		emit, active := driveGate(tgtL, tgtR, left, right, wasActive)
+		if emit {
+			app.move.setDrive(left, right)
+		}
+		wasActive = active
 
 		if a.pan != 0 || a.tilt != 0 {
 			app.aim.nudge(a.pan*panRate*dt, a.tilt*tiltRate*dt)
