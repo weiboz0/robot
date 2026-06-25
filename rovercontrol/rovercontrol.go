@@ -479,7 +479,7 @@ func (c *Camera) setStatus(up bool, err string) {
 // startup (no hot-plug detection — pass -camera-mode explicitly if needed).
 func resolveCameraMode(mode, device string) string {
 	switch mode {
-	case "v4l2", "rpicam":
+	case "v4l2", "rpicam", "off":
 		return mode
 	case "auto":
 		if _, err := os.Stat(device); err == nil {
@@ -1984,7 +1984,7 @@ func main() {
 	width := flag.Int("width", defaultCamWidth, "camera width (0 = let the camera choose)")
 	height := flag.Int("height", defaultCamHeight, "camera height (0 = let the camera choose)")
 	fps := flag.Int("fps", defaultCamFPS, "camera fps (v4l2 via --set-parm, rpicam --framerate; 0 = camera default)")
-	camMode := flag.String("camera-mode", "auto", "camera backend: auto|v4l2|rpicam")
+	camMode := flag.String("camera-mode", "auto", "camera backend: auto|v4l2|rpicam|off")
 	camDevice := flag.String("camera-device", "/dev/video0", "V4L2 device (v4l2 mode)")
 	gpDebug := flag.Bool("gamepad-debug", false, "print live gamepad indices and exit")
 	gpMap := flag.String("gamepad-map", defaultMapPath(), "gamepad mapping JSON (default if absent)")
@@ -2029,10 +2029,21 @@ func main() {
 	ctx := context.Background()
 
 	// serial: try now, retry in the background so a busy port doesn't kill us.
-	go openSerialWithRetry(ctx, rover, *serialPath)
+	// -serial '' skips it entirely (control endpoints 503 via requireSerial).
+	if *serialPath != "" {
+		go openSerialWithRetry(ctx, rover, *serialPath)
+	} else {
+		rover.setStatus(nil, "disabled")
+		log.Printf("serial: disabled (-serial '')")
+	}
 
-	// camera
-	go app.cam.run(ctx, app.hub)
+	// camera (-camera-mode off skips it; videoFeed then serves the placeholder)
+	if mode != "off" {
+		go app.cam.run(ctx, app.hub)
+	} else {
+		app.cam.setStatus(false, "disabled")
+		log.Printf("camera: disabled (-camera-mode off)")
+	}
 
 	// joystick (optional; only if the mapping loaded)
 	if *jsPath != "" && app.mapping != nil {

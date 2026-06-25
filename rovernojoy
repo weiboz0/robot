@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# rovernojoy — rovercontrol WITHOUT the joystick: camera + serial control + HTTP.
+# Use when the chatbot / HTTP should fully own drive (no gamepad). See docs/plans/013.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  D="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"; [[ $SOURCE != /* ]] && SOURCE="$D/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+BIN="$DIR/rovercontrol-arm64"
+[ -x "$BIN" ] || { echo "rovernojoy: $BIN missing — build+copy the arm64 binary" >&2; exit 1; }
+exec "$BIN" -photos "$DIR/photos" "$@" -gamepad ''

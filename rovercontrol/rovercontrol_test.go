@@ -608,6 +608,7 @@ func TestResolveCameraMode(t *testing.T) {
 		{"auto", missing, "rpicam"},
 		{"v4l2", missing, "v4l2"},
 		{"rpicam", existing, "rpicam"},
+		{"off", existing, "off"}, // explicit off must NOT fall through to rpicam
 		{"bogus", existing, "rpicam"},
 	}
 	for _, c := range cases {
