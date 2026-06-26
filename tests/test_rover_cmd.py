@@ -53,7 +53,24 @@ class FakeRover:
         return "photos/rover_test.jpg"
 
     def center(self):
-        self.set_camera(0, 0)
+        self.calls.append(("center",))
+        self.pan = self.tilt = 0.0
+
+    def set_speed(self, cap):
+        cap = max(0.0, min(0.5, float(cap)))
+        self.calls.append(("set_speed", cap))
+        self._cap = cap
+        return cap
+
+    def get_speed(self):
+        return getattr(self, "_cap", 0.5)
+
+    def status(self):
+        return {"backend": self.backend, "where": "fake", "serial": {"up": True},
+                "camera": {"up": None}, "gamepad": {"up": None}, "speed_cap": self.get_speed()}
+
+    def list_photos(self):
+        return ["rover_b.jpg", "rover_a.jpg"]
 
 
 class RoverCmdTest(unittest.TestCase):
@@ -129,9 +146,56 @@ class RoverCmdTest(unittest.TestCase):
         self.assertIn(("photo",), r.calls)
         self.assertIn(".jpg", out)
 
+    def test_center_command(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "center")
+        self.assertIn(("center",), r.calls)
+
+    def test_speed_set_and_query(self):
+        r = FakeRover()
+        out = agent_chat.rover_command(r, "speed 0.3")
+        self.assertIn(("set_speed", 0.3), r.calls)
+        self.assertIn("0.3", out)
+        q = agent_chat.rover_command(r, "speed")          # no arg → query
+        self.assertIn("0.3", q)
+
+    def test_status_command(self):
+        r = FakeRover()
+        out = agent_chat.rover_command(r, "status")
+        self.assertIn("backend", out)
+        self.assertIn("speed_cap", out)
+
+    def test_photos_command(self):
+        r = FakeRover()
+        out = agent_chat.rover_command(r, "photos")
+        self.assertIn("rover_b.jpg", out)
+
     def test_unknown_command(self):
         r = FakeRover()
         self.assertIn("unknown", agent_chat.rover_command(r, "bogus").lower())
+
+
+class ToolSurfaceTest(unittest.TestCase):
+    """Plan 014: the new controller-parity capabilities are real LLM tools and
+    run_tool dispatches them (codex nit: $-cmd tests alone miss tool promotion)."""
+
+    def test_build_tools_includes_new_tools(self):
+        tools = agent_chat.build_tools(FakeRover(), None)
+        names = {t["function"]["name"] for t in tools}
+        for n in ("rover_set_speed", "rover_get_status", "rover_center_camera",
+                  "rover_gimbal_torque", "rover_list_photos"):
+            self.assertIn(n, names)
+
+    def test_run_tool_dispatches_new_tools(self):
+        r = FakeRover()
+        self.assertIn("centered", agent_chat.run_tool(r, None, "rover_center_camera", {}))
+        agent_chat.run_tool(r, None, "rover_gimbal_torque", {"lock": False})
+        self.assertIn(("torque", False), r.calls)
+        out = agent_chat.run_tool(r, None, "rover_set_speed", {"cap": 0.2})
+        self.assertIn(("set_speed", 0.2), r.calls)
+        self.assertIn("0.2", out)
+        self.assertIn("backend", agent_chat.run_tool(r, None, "rover_get_status", {}))
+        self.assertIn("rover_b.jpg", agent_chat.run_tool(r, None, "rover_list_photos", {}))
 
 
 class RoverCtlClampTest(unittest.TestCase):

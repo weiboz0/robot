@@ -90,6 +90,15 @@ def rover_command(r: RoverCtl, line: str) -> str:
             r.demo(); return "demo done"
         if c == "photo":
             p = r.photo(); return f"photo saved -> {p}" if p else "photo failed (camera busy?)"
+        if c == "speed":
+            if args:
+                return f"speed cap -> {r.set_speed(float(args[0]))}"
+            return f"speed cap = {r.get_speed()} (max wheel magnitude 0..0.5)"
+        if c == "status":
+            return json.dumps(r.status())
+        if c == "photos":
+            ps = r.list_photos()
+            return f"{len(ps)} photo(s): {', '.join(ps[:20])}" if ps else "no photos yet"
         return f"?? unknown rover command '{c}'"
     except (IndexError, ValueError):
         return "bad args"
@@ -125,6 +134,26 @@ def build_tools(rover, arm):
                  "line": {"type": "number"}, "text": {"type": "string"}}, "required": ["line", "text"]}},
             {"name": "rover_photo",
              "description": "Take a photo with the rover's camera. Returns the saved image file path.",
+             "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_center_camera", "description": "Re-center the rover camera (level, facing forward).",
+             "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_gimbal_torque",
+             "description": "Lock or relax the camera gimbal servos. lock=false relaxes them so the "
+                            "camera can be hand-positioned; lock=true holds position.",
+             "parameters": {"type": "object", "properties": {
+                 "lock": {"type": "boolean"}}, "required": ["lock"]}},
+            {"name": "rover_set_speed",
+             "description": "Set the rover speed cap = max wheel magnitude, 0..0.5 (lower = slower). "
+                            "This is the safe way to slow ALL driving. On the Go controller this cap "
+                            "is shared with the gamepad, so it is not exclusively yours.",
+             "parameters": {"type": "object", "properties": {
+                 "cap": {"type": "number"}}, "required": ["cap"]}},
+            {"name": "rover_get_status",
+             "description": "Get rover status: which backend, and whether serial/camera/gamepad are up, "
+                            "plus the current speed cap.",
+             "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_list_photos",
+             "description": "List photo filenames taken by the rover camera, newest first.",
              "parameters": {"type": "object", "properties": {}}},
         ]
     if arm is not None:
@@ -166,6 +195,21 @@ def run_tool(rover, arm, name, a):
             rover.oled(a.get("line", 0), txt); return "oled updated"
         if name == "rover_photo":
             p = rover.photo(); return f"photo saved to {p}" if p else "photo failed (camera busy?)"
+        if name == "rover_center_camera":
+            rover.center(); return "camera centered"
+        if name == "rover_gimbal_torque":
+            lock = bool(a.get("lock", True)); rover.set_torque(lock)
+            return "gimbal locked" if lock else "gimbal relaxed"
+        if name == "rover_set_speed":
+            cap = a.get("cap")
+            if cap is None:
+                return "rover_set_speed needs cap (0..0.5)"
+            return f"speed cap set to {rover.set_speed(cap)}"
+        if name == "rover_get_status":
+            return json.dumps(rover.status())
+        if name == "rover_list_photos":
+            ps = rover.list_photos()
+            return f"{len(ps)} photo(s): {', '.join(ps[:20])}" if ps else "no photos yet"
         if name == "dobot_get_pose":
             return arm.pose()
         if name == "dobot_get_mode":
@@ -187,7 +231,10 @@ SYSTEM = (
     "robotic arm, depending on which tools are provided — only use tools that exist. "
     "Keep actions small and safe unless told otherwise. Rover: tilt + is up; wheel "
     "speeds small (<=0.3); lights are PWM 0..255 (front=head, base=chassis, 0=off); "
-    "you can take a photo with the camera. "
+    "you can take a photo with the camera, list photos, center the camera, and "
+    "lock/relax the gimbal. The speed cap (rover_set_speed, 0..0.5) is the safe "
+    "way to slow all driving; on the Go controller it is shared with the gamepad. "
+    "Use rover_get_status to check what is connected. "
     "Dobot: coordinates are mm (x,y,z) and degrees (r); move "
     "conservatively and enable the arm before moving. After acting, briefly say what "
     "you did. Be concise."
@@ -242,6 +289,7 @@ def main():
                     print("rover camera: up/down/left/right [deg], cam P T, center, relax, lock\n"
                           "rover motors: drive L R [s], move L R, fwd/back/spinl/spinr [s], stop, estop\n"
                           "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear, demo, photo\n"
+                          "rover meta:   speed [CAP 0..0.5], status, photos\n"
                           "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
                 elif cmd.lower().startswith("dobot"):
                     raw = cmd[5:].strip()

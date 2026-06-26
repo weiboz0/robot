@@ -46,6 +46,12 @@ class RoverCtl:
         self.backend = backend          # "serial" | "rovercontrol" | "http"
         self.pan = 0.0
         self.tilt = 0.0
+        # Speed cap = max wheel magnitude on the 0..0.5 scale. rovercontrol owns
+        # this server-side; serial/http emulate it by scaling wheel commands by
+        # (2 * cap) — the same multiplier rovercontrol applies — so the same
+        # drive(l,r) yields the same effective speed on every backend. Default
+        # 0.5 ⇒ factor 1.0 ⇒ serial/http behaviour unchanged.
+        self._cap = 0.5
         if backend == "serial":
             import rover_direct
             self._rd = rover_direct
@@ -73,9 +79,17 @@ class RoverCtl:
         else:
             self._http.set_camera(self.pan, self.tilt)
 
+    def _scale(self, v):
+        """Apply the speed cap on serial/http by scaling the wheel value by the
+        same (2 * cap) factor rovercontrol uses. rovercontrol scales server-side,
+        so its values pass through unscaled (no double-cap)."""
+        v = _clamp(float(v), -0.5, 0.5)
+        if self.backend == "rovercontrol":
+            return v
+        return _clamp(v * 2.0 * self._cap, -0.5, 0.5)
+
     def drive(self, left, right, seconds):
-        left = _clamp(float(left), -0.5, 0.5)
-        right = _clamp(float(right), -0.5, 0.5)
+        left, right = self._scale(left), self._scale(right)
         seconds = _clamp(float(seconds), 0.0, 5.0)
         if self.backend == "serial":
             self._r.drive_for(left, right, seconds)
@@ -83,12 +97,26 @@ class RoverCtl:
             self._http.drive(left, right, seconds)
 
     def move(self, left, right):
-        left = _clamp(float(left), -0.5, 0.5)
-        right = _clamp(float(right), -0.5, 0.5)
+        left, right = self._scale(left), self._scale(right)
         if self.backend == "serial":
             self._r.drive(left, right)
         else:
             self._http.move(left, right)
+
+    def set_speed(self, cap):
+        """Set the speed cap (max wheel magnitude, 0..0.5). rovercontrol pushes
+        it server-side; serial/http store it locally (applied in _scale)."""
+        cap = _clamp(float(cap), 0.0, 0.5)
+        if self.backend == "rovercontrol":
+            self._http.set_speed(cap)
+        else:
+            self._cap = cap
+        return cap
+
+    def get_speed(self):
+        if self.backend == "rovercontrol":
+            return self._http.get_speed()
+        return self._cap
 
     def stop(self):
         if self.backend == "serial":
@@ -137,7 +165,51 @@ class RoverCtl:
             raise NotImplementedError("OLED is not available via rovercontrol (:8080)")
 
     def center(self):
-        self.set_camera(0, 0)
+        # rovercontrol has a dedicated /camera_center; serial/http have no
+        # distinct endpoint, so aiming to (0,0) is identical.
+        if self.backend == "rovercontrol":
+            self._http.center()
+            self.pan = self.tilt = 0.0
+        else:
+            self.set_camera(0, 0)
+
+    def status(self):
+        """Stable shape across backends; unknown fields are explicit None."""
+        st = {"backend": self.backend, "where": self.where,
+              "serial": {"up": False}, "camera": {"up": None},
+              "gamepad": {"up": None}, "speed_cap": None}
+        if self.backend == "rovercontrol":
+            try:
+                h = self._http.healthz(timeout=2.0)
+                for k in ("serial", "camera", "gamepad"):
+                    if isinstance(h.get(k), dict):
+                        st[k] = h[k]
+            except Exception as e:
+                st["serial"] = {"up": False, "err": str(e)}
+            try:    # a /speed hiccup must not downgrade an otherwise-good healthz
+                st["speed_cap"] = self.get_speed()
+            except Exception:
+                pass
+        elif self.backend == "serial":
+            ser = getattr(self._r, "ser", None)
+            st["serial"] = {"up": bool(getattr(ser, "is_open", True))}
+            st["speed_cap"] = self._cap
+        else:                                   # http (app.py reachable)
+            st["serial"] = {"up": True}
+            st["speed_cap"] = self._cap
+        return st
+
+    def list_photos(self):
+        """Photo filenames newest-first. rovercontrol → GET /photos; serial/http
+        → the local photo dir (where take_photo saves)."""
+        if self.backend == "rovercontrol":
+            return self._http.list_photos()
+        try:
+            names = [f for f in os.listdir(rover_camera.PHOTO_DIR)
+                     if f.lower().endswith(".jpg")]
+        except OSError:
+            return []
+        return sorted(names, reverse=True)
 
     def photo(self):
         # serial (Pi, app down) → rpicam-still fallback; HTTP backends → grab one

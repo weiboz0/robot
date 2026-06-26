@@ -153,6 +153,29 @@ rsync -z rovercontrol-arm64 rover:robot/      # then restart on the rover (above
 
 ---
 
+## 5. Chatbot exposure (`agent_chat.py`)
+
+The Python chatbot reaches the rover through `RoverCtl` (auto-detecting serial /
+rovercontrol / app.py) and now covers the controller's full **control** surface —
+as LLM tools and `$`-commands:
+
+| Capability | LLM tool | `$` command |
+|---|---|---|
+| drive (auto-stop), stop, e-stop | `rover_drive` / `rover_stop` / `rover_estop` | `drive` `fwd` `back` `spinl` `spinr` `stop` `estop` |
+| camera aim / center | `rover_set_camera` / `rover_center_camera` | `cam` `up` `down` `left` `right` `center` |
+| lights | `rover_lights` | `light` |
+| gimbal lock / relax | `rover_gimbal_torque` | `relax` `lock` |
+| **speed cap** (`/speed`) | `rover_set_speed` | `speed [CAP]` |
+| **status** (`/healthz`) | `rover_get_status` | `status` |
+| photo + **list** (`/snapshot`, `/photos`) | `rover_photo` / `rover_list_photos` | `photo` `photos` |
+| OLED (serial/app.py only) | `rover_oled` | `oled` `oledclear` |
+
+Deliberately **not** LLM tools: continuous `move` (no auto-stop; serial/app.py have
+no server watchdog — `$move` stays human-only), and photo *delete*/byte-fetch
+(gallery work — that's `rover_web.py`). The speed cap is the safe global throttle;
+on rovercontrol it is **shared with the gamepad**, so it isn't exclusively the
+chatbot's.
+
 ## Notes
 - One process owns the serial port **and** the camera, so the stock ugv_rpi
   `app.py` must not run alongside it (its `@reboot` autostart is disabled).

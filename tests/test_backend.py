@@ -149,6 +149,89 @@ class RovercontrolBackendTest(unittest.TestCase):
         self.assertEqual(calls, [("move", 0.2, 0.2), ("torque", True)])
 
 
+class SpeedCapTest(unittest.TestCase):
+    """Plan 014: cap = max wheel magnitude; serial/http SCALE by 2*cap to match
+    rovercontrol's multiplier; rovercontrol is NOT scaled locally (no double-cap)."""
+
+    def test_serial_scales_by_two_cap(self):
+        fake = fake_rover_direct()
+        sys.modules["rover_direct"] = fake
+        try:
+            r = rover_backend.RoverCtl("serial", port="/dev/x")
+            self.assertEqual(r.get_speed(), 0.5)         # default = full
+            r.move(0.2, 0.2)                             # cap 0.5 → factor 1.0 → unchanged
+            r.set_speed(0.25)                            # factor 0.5
+            self.assertEqual(r.get_speed(), 0.25)
+            r.move(0.2, 0.2)                             # → 0.1 effective on EVERY backend
+            r.drive(0.4, -0.4, 1.0)                      # → 0.2 / -0.2
+        finally:
+            sys.modules.pop("rover_direct", None)
+        self.assertIn(("drive", 0.2, 0.2), fake._rover.calls)        # unscaled at cap 0.5
+        self.assertIn(("drive", 0.1, 0.1), fake._rover.calls)        # scaled at cap 0.25
+        self.assertIn(("drive_for", 0.2, -0.2, 1.0), fake._rover.calls)
+
+    def test_rovercontrol_not_double_capped(self):
+        rcc = rover_backend.rovercontrol_client
+        calls = []
+        with mock.patch.object(rcc, "set_host", lambda h: None), \
+             mock.patch.object(rcc, "move", side_effect=lambda l, r: calls.append((l, r))), \
+             mock.patch.object(rcc, "set_speed", side_effect=lambda c: calls.append(("set", c))), \
+             mock.patch.object(rcc, "get_speed", return_value=0.25):
+            r = rover_backend.RoverCtl("rovercontrol", http_host="1.1.1.1")
+            r.set_speed(0.25)                            # goes to the server, not local
+            r.move(0.2, 0.2)                             # raw value to client (server scales)
+            self.assertEqual(r.get_speed(), 0.25)
+        self.assertEqual(calls, [("set", 0.25), (0.2, 0.2)])
+
+    def test_set_speed_clamped(self):
+        fake = fake_rover_direct()
+        sys.modules["rover_direct"] = fake
+        try:
+            r = rover_backend.RoverCtl("serial", port="/dev/x")
+            self.assertEqual(r.set_speed(99), 0.5)       # clamps to 0.5
+            self.assertEqual(r.set_speed(-1), 0.0)
+        finally:
+            sys.modules.pop("rover_direct", None)
+
+
+class StatusAndExtrasTest(unittest.TestCase):
+    def test_serial_status_shape_and_list_photos(self):
+        fake = fake_rover_direct()
+        sys.modules["rover_direct"] = fake
+        try:
+            r = rover_backend.RoverCtl("serial", port="/dev/x")
+            st = r.status()
+            with mock.patch.object(rover_backend.os, "listdir",
+                                   return_value=["rover_b.jpg", "rover_a.jpg", "x.txt"]):
+                photos = r.list_photos()
+        finally:
+            sys.modules.pop("rover_direct", None)
+        self.assertEqual(set(st), {"backend", "where", "serial", "camera",
+                                   "gamepad", "speed_cap"})
+        self.assertEqual(st["backend"], "serial")
+        self.assertEqual(st["speed_cap"], 0.5)
+        self.assertIsNone(st["camera"]["up"])            # unknown on serial
+        self.assertEqual(photos, ["rover_b.jpg", "rover_a.jpg"])   # newest first, .jpg only
+
+    def test_rovercontrol_status_passthrough_and_center(self):
+        rcc = rover_backend.rovercontrol_client
+        calls = []
+        health = {"serial": {"up": True}, "camera": {"up": True},
+                  "gamepad": {"up": False, "mapping": "default"}}
+        with mock.patch.object(rcc, "set_host", lambda h: None), \
+             mock.patch.object(rcc, "healthz", return_value=health), \
+             mock.patch.object(rcc, "get_speed", return_value=0.25), \
+             mock.patch.object(rcc, "center", side_effect=lambda: calls.append("center")), \
+             mock.patch.object(rcc, "set_camera", side_effect=lambda p, t: calls.append(("aim", p, t))):
+            r = rover_backend.RoverCtl("rovercontrol", http_host="1.1.1.1")
+            st = r.status()
+            r.center()                                   # must hit /camera_center, NOT /camera_aim
+        self.assertEqual(st["camera"], {"up": True})
+        self.assertEqual(st["speed_cap"], 0.25)
+        self.assertEqual(st["backend"], "rovercontrol")
+        self.assertEqual(calls, ["center"])              # codex blocker: real endpoint
+
+
 class ImportSmokeTest(unittest.TestCase):
     def test_core_modules_import(self):
         import importlib
