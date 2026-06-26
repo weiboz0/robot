@@ -104,6 +104,8 @@ def rover_command(r: RoverCtl, line: str) -> str:
         return "bad args"
     except NotImplementedError as e:
         return str(e)                       # e.g. OLED via the rovercontrol backend
+    except Exception as e:                  # a backend/network error must not kill the REPL
+        return f"error: {e}"
 
 
 # --------------------------------------------------------------------- tools
@@ -241,6 +243,27 @@ SYSTEM = (
 )
 
 
+MAX_HISTORY = 24    # cap recent messages kept (the system message is always kept)
+
+
+def trim_history(messages, limit=MAX_HISTORY):
+    """Keep the system message + the most recent <=limit messages, snapping the
+    kept window to start on a 'user' message so a tool reply is never separated
+    from its assistant.tool_calls (some providers reject an orphaned tool msg).
+    Mutates and returns `messages`. Call at a user-turn boundary, not mid-loop."""
+    if len(messages) <= limit + 1:
+        return messages
+    tail = messages[-limit:]
+    for i, m in enumerate(tail):        # advance to the first user msg in the window
+        if m.get("role") == "user":
+            tail = tail[i:]
+            break
+    else:
+        tail = []
+    messages[:] = messages[:1] + tail
+    return messages
+
+
 def main():
     load_dotenv()
     print("detecting robots...")
@@ -295,10 +318,12 @@ def main():
                     raw = cmd[5:].strip()
                     if arm is None:
                         print("  dobot not connected")
-                    elif raw.startswith("Mov"):
-                        print(" ", arm.motion(raw))
                     else:
-                        print(" ", arm.dashboard(raw))
+                        try:                # a socket error must not kill the REPL
+                            print(" ", arm.motion(raw) if raw.startswith("Mov")
+                                  else arm.dashboard(raw))
+                        except Exception as e:
+                            print(f"  dobot error: {e}")
                 elif rover is not None:
                     print(" ", rover_command(rover, cmd))
                 else:
@@ -307,33 +332,43 @@ def main():
             if client is None:
                 print("  chat off — use $ commands ($help)")
                 continue
+            trim_history(messages)              # P3: cap history at the user-turn boundary
             messages.append({"role": "user", "content": user})
-            while True:
-                print("  (thinking…)", end="\r", flush=True)
-                resp = client.chat.completions.create(
-                    model=MODEL, messages=messages, tools=tools, max_tokens=8192)
-                print(" " * 14, end="\r")
-                msg = resp.choices[0].message
-                content = strip_think(msg.content)
-                am = {"role": "assistant", "content": content}
-                if msg.tool_calls:
-                    am["tool_calls"] = [{"id": tc.id, "type": "function",
-                                         "function": {"name": tc.function.name,
-                                                      "arguments": tc.function.arguments}}
-                                        for tc in msg.tool_calls]
-                messages.append(am)
-                if content:
-                    print(f"\nbot> {content}\n")
-                if not msg.tool_calls:
-                    break
-                for tc in msg.tool_calls:
-                    try:
-                        args = json.loads(tc.function.arguments or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
-                    print(f"  [{tc.function.name}({args})]")
-                    out = run_tool(rover, arm, tc.function.name, args)
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(out)})
+            try:
+                while True:
+                    print("  (thinking…)", end="\r", flush=True)
+                    resp = client.chat.completions.create(
+                        model=MODEL, messages=messages, tools=tools, max_tokens=8192)
+                    print(" " * 14, end="\r")
+                    msg = resp.choices[0].message
+                    content = strip_think(msg.content)
+                    # P4: store None (not "") so providers that reject empty content don't choke
+                    am = {"role": "assistant", "content": content or None}
+                    if msg.tool_calls:
+                        am["tool_calls"] = [{"id": tc.id, "type": "function",
+                                             "function": {"name": tc.function.name,
+                                                          "arguments": tc.function.arguments}}
+                                            for tc in msg.tool_calls]
+                    messages.append(am)
+                    if content:
+                        print(f"\nbot> {content}\n")
+                    if not msg.tool_calls:
+                        break
+                    for tc in msg.tool_calls:
+                        raw = tc.function.arguments or "{}"
+                        try:
+                            args = json.loads(raw)
+                        except json.JSONDecodeError:
+                            # P5: tell the model what it sent so it can self-correct
+                            print(f"  [{tc.function.name}: invalid JSON args]")
+                            messages.append({"role": "tool", "tool_call_id": tc.id,
+                                             "content": f"error: arguments were not valid JSON: {raw}"})
+                            continue
+                        print(f"  [{tc.function.name}({args})]")
+                        out = run_tool(rover, arm, tc.function.name, args)
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(out)})
+            except Exception as e:             # P1: an LLM/network error returns to the prompt
+                print(f"\n  chat error: {e}")
     finally:
         if rover is not None:
             rover.close()

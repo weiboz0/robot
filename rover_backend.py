@@ -194,8 +194,8 @@ class RoverCtl:
             ser = getattr(self._r, "ser", None)
             st["serial"] = {"up": bool(getattr(ser, "is_open", True))}
             st["speed_cap"] = self._cap
-        else:                                   # http (app.py reachable)
-            st["serial"] = {"up": True}
+        else:                                   # http (app.py reachable; ESP32 link unknown)
+            st["serial"] = {"up": None}
             st["speed_cap"] = self._cap
         return st
 

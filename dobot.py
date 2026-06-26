@@ -24,7 +24,11 @@ class Dobot:
     def __init__(self, host: str = DOBOT_HOST, timeout: float = 5.0):
         self.host = host
         self.dash = socket.create_connection((host, DASH_PORT), timeout=timeout)
-        self.move = socket.create_connection((host, MOVE_PORT), timeout=timeout)
+        try:
+            self.move = socket.create_connection((host, MOVE_PORT), timeout=timeout)
+        except OSError:                 # don't leak the dashboard socket if motion fails
+            self.dash.close()
+            raise
         self.dash.settimeout(timeout)
         self.move.settimeout(timeout)
 

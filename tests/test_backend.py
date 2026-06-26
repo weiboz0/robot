@@ -231,6 +231,15 @@ class StatusAndExtrasTest(unittest.TestCase):
         self.assertEqual(st["backend"], "rovercontrol")
         self.assertEqual(calls, ["center"])              # codex blocker: real endpoint
 
+    def test_http_status_serial_unknown(self):
+        # P8: app.py reachable != ESP32 link up → serial.up is None (unknown), not True.
+        rc = rover_backend.rover_client
+        with mock.patch.object(rc, "set_host", lambda h: None):
+            r = rover_backend.RoverCtl("http", http_host="1.2.3.4")
+            st = r.status()
+        self.assertEqual(st["backend"], "http")
+        self.assertIsNone(st["serial"]["up"])
+
 
 class ImportSmokeTest(unittest.TestCase):
     def test_core_modules_import(self):
