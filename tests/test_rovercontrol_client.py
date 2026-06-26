@@ -88,6 +88,43 @@ class RovercontrolClientTest(unittest.TestCase):
         rc.stop()
         self.assertIn("5.6.7.8:8080", self.last())
 
+    def test_set_speed_posts_cap(self):
+        rc.set_speed(0.25)
+        m, url = self.calls[-1]
+        self.assertEqual(m, "POST")
+        self.assertIn("/speed?", url)
+        self.assertIn("cap=0.25", url)
+
+    def test_set_speed_clamps(self):
+        rc.set_speed(9)
+        self.assertIn("cap=0.5", self.last())
+
+
+class FakeJSONResp:
+    def __init__(self, body): self._b = body.encode()
+    def read(self): return self._b
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+class RovercontrolGetTest(unittest.TestCase):
+    """GET endpoints that parse JSON bodies (get_speed, list_photos)."""
+
+    def setUp(self):
+        self._orig = rc.urllib.request.urlopen
+
+    def tearDown(self):
+        rc.urllib.request.urlopen = self._orig
+
+    def test_get_speed_parses_cap(self):
+        rc.urllib.request.urlopen = lambda url, timeout=None: FakeJSONResp('{"ok":true,"cap":0.3}')
+        self.assertEqual(rc.get_speed(), 0.3)
+
+    def test_list_photos_parses(self):
+        rc.urllib.request.urlopen = lambda url, timeout=None: FakeJSONResp(
+            '{"photos":["rover_b.jpg","rover_a.jpg"]}')
+        self.assertEqual(rc.list_photos(), ["rover_b.jpg", "rover_a.jpg"])
+
 
 if __name__ == "__main__":
     unittest.main()

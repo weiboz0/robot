@@ -100,6 +100,25 @@ def snapshot() -> None:
     _post("/snapshot")
 
 
+def set_speed(cap: float) -> None:
+    """Set the controller's speed cap (max wheel magnitude, 0..0.5). The
+    controller scales /drive by this and shares it with the gamepad."""
+    _post("/speed", {"cap": max(0.0, min(0.5, float(cap)))})
+
+
+def get_speed(timeout: float = 2.0) -> float:
+    """GET /speed → current cap (float)."""
+    with urllib.request.urlopen(_base() + "/speed", timeout=timeout) as r:
+        return float(json.loads(r.read().decode()).get("cap", 0.0))
+
+
+def list_photos(timeout: float = 2.0) -> list:
+    """GET /photos → list of photo filenames (newest first, as the controller
+    orders them)."""
+    with urllib.request.urlopen(_base() + "/photos", timeout=timeout) as r:
+        return list(json.loads(r.read().decode()).get("photos", []))
+
+
 def healthz(timeout: float = 2.0) -> dict:
     """GET /healthz → parsed JSON (raises on unreachable / bad response)."""
     with urllib.request.urlopen(_base() + "/healthz", timeout=timeout) as r:
