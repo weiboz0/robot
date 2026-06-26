@@ -15,6 +15,10 @@ done
 declare -a ALIASES=("cb:chatbot")
 for pair in "${ALIASES[@]}"; do
   alias_name="${pair%%:*}"; target="${pair##*:}"
+  if [ ! -f "$DIR/$target" ]; then
+    echo "install.sh: $target not found, skipping alias $alias_name" >&2
+    continue
+  fi
   ln -sf "$DIR/$target" "$HOME/.local/bin/$alias_name"
   echo "Linked: $alias_name -> $DIR/$target (alias)"
 done

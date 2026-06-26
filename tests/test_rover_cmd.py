@@ -175,6 +175,49 @@ class RoverCmdTest(unittest.TestCase):
         self.assertIn("unknown", agent_chat.rover_command(r, "bogus").lower())
 
 
+class RoverCmdErrorTest(unittest.TestCase):
+    """P2: a backend/network exception must not crash the REPL — return a string."""
+
+    def test_backend_exception_returns_error(self):
+        class Boom(FakeRover):
+            def stop(self):
+                raise OSError("link down")
+        out = agent_chat.rover_command(Boom(), "stop")
+        self.assertIsInstance(out, str)
+        self.assertIn("error", out.lower())
+
+
+class TrimHistoryTest(unittest.TestCase):
+    """P3: cap history, always keep the system message, snap the window to a user
+    boundary so a tool reply is never orphaned from its assistant.tool_calls."""
+
+    def test_short_history_untouched(self):
+        msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "a"}]
+        agent_chat.trim_history(msgs, limit=24)
+        self.assertEqual(len(msgs), 2)
+
+    def test_keeps_system_and_snaps_to_user(self):
+        msgs = [{"role": "system", "content": "S"}]
+        for i in range(40):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": f"a{i}"})
+        agent_chat.trim_history(msgs, limit=10)
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertEqual(msgs[1]["role"], "user")           # snapped to a user boundary
+        self.assertLessEqual(len(msgs), 1 + 10)
+
+    def test_never_orphans_tool_message(self):
+        msgs = [{"role": "system", "content": "S"}]
+        for i in range(20):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": [{"id": f"t{i}"}]})
+            msgs.append({"role": "tool", "tool_call_id": f"t{i}", "content": "ok"})
+        agent_chat.trim_history(msgs, limit=8)
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertEqual(msgs[1]["role"], "user")           # never starts on tool/assistant
+
+
 class ToolSurfaceTest(unittest.TestCase):
     """Plan 014: the new controller-parity capabilities are real LLM tools and
     run_tool dispatches them (codex nit: $-cmd tests alone miss tool promotion)."""

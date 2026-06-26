@@ -35,7 +35,8 @@ def _post(path: str, params: dict = None, timeout: float | None = None) -> None:
     if params:
         url += "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, method="POST")
-    urllib.request.urlopen(req, timeout=_TIMEOUT if timeout is None else timeout).read()
+    with urllib.request.urlopen(req, timeout=_TIMEOUT if timeout is None else timeout) as r:
+        r.read()
 
 
 def _norm(v: float) -> float:

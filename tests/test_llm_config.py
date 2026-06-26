@@ -53,6 +53,24 @@ class LoadDotenvTest(unittest.TestCase):
                 for k in ("FOO_HOME", "FOO_REPO"):
                     os.environ.pop(k, None)
 
+    def test_strips_export_prefix(self):
+        # P10: tolerate `export VAR=value` lines copied from shell tutorials.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as repo:
+            with open(os.path.join(home, ".env"), "w") as f:
+                f.write("export EXP_VAR=3\n")
+            open(os.path.join(repo, ".env"), "w").close()
+            os.environ.pop("EXP_VAR", None)
+            os.environ.pop("export EXP_VAR", None)
+            with mock.patch("llm_config.os.path.expanduser",
+                            lambda p: os.path.join(home, ".env") if p == "~/.env" else p), \
+                 mock.patch("llm_config.os.path.dirname", return_value=repo):
+                llm_config.load_dotenv()
+            try:
+                self.assertEqual(os.environ.get("EXP_VAR"), "3")
+                self.assertIsNone(os.environ.get("export EXP_VAR"))
+            finally:
+                os.environ.pop("EXP_VAR", None)
+
 
 if __name__ == "__main__":
     unittest.main()

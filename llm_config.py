@@ -20,7 +20,10 @@ def load_dotenv() -> None:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, _, v = line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+                    k = k.strip()
+                    if k.startswith("export "):     # tolerate `export VAR=value` lines
+                        k = k[len("export "):].strip()
+                    os.environ.setdefault(k, v.strip().strip('"').strip("'"))
 
 
 PROVIDERS = {

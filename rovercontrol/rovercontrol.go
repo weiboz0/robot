@@ -31,10 +31,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -143,6 +145,17 @@ func (r *Rover) setStatus(l serialLink, errMsg string) {
 }
 
 func (r *Rover) setLink(l serialLink) { r.setStatus(l, "") }
+
+// closeLink closes and clears the serial link (used on graceful shutdown).
+func (r *Rover) closeLink() {
+	r.mu.Lock()
+	l := r.link
+	r.link, r.lastErr = nil, "shut down"
+	r.mu.Unlock()
+	if l != nil {
+		l.Close()
+	}
+}
 
 // initLink runs the boot sequence (echo off, feedback off, Gimbal module —
 // required for pan/tilt) directly on a link before it is published, so a
@@ -745,18 +758,25 @@ type CameraAim struct {
 }
 
 func (a *CameraAim) set(pan, tilt float64) (float64, float64) {
-	p, t, _ := a.r.aimCamera(pan, tilt)
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.setLocked(pan, tilt)
+}
+
+// setLocked writes the absolute aim and records it; the caller holds a.mu so a
+// concurrent nudge can't read a stale base and lose this update. The serial
+// write (aimCamera → r.mu) happens under a.mu — ordering a.mu→r.mu is consistent
+// (nothing takes a.mu while holding r.mu) and the write is camera-only, ms-bounded.
+func (a *CameraAim) setLocked(pan, tilt float64) (float64, float64) {
+	p, t, _ := a.r.aimCamera(pan, tilt)
 	a.pan, a.tilt = p, t
-	a.mu.Unlock()
 	return p, t
 }
 
 func (a *CameraAim) nudge(dPan, dTilt float64) (float64, float64) {
 	a.mu.Lock()
-	p, t := a.pan+dPan, a.tilt+dTilt
-	a.mu.Unlock()
-	return a.set(p, t)
+	defer a.mu.Unlock()
+	return a.setLocked(a.pan+dPan, a.tilt+dTilt)
 }
 
 func (a *CameraAim) center() (float64, float64) { return a.set(0, 0) }
@@ -790,32 +810,41 @@ type App struct {
 	mapSource string          // "default" | "config" | "invalid"
 }
 
-func (app *App) setLights(head, base bool) error {
+// updateLights computes the new on/off state from the current state under a
+// single held lock (so concurrent toggles/sets can't lose an update), commits
+// it, then writes the PWM after unlocking. Returns the new (head, base) state.
+func (app *App) updateLights(next func(h, b bool) (bool, bool)) (bool, bool, error) {
 	app.lightMu.Lock()
-	app.headOn, app.baseOn = head, base
-	app.lightMu.Unlock()
+	defer app.lightMu.Unlock()
+	h, b := next(app.headOn, app.baseOn)
+	app.headOn, app.baseOn = h, b
 	hv, bv := 0, 0
-	if head {
+	if h {
 		hv = 255
 	}
-	if base {
+	if b {
 		bv = 255
 	}
-	return app.rover.lights(hv, bv)
+	// Write under lightMu so the hardware write order matches the commit order —
+	// two concurrent toggles can't leave the lights disagreeing with state.
+	// lightMu→r.mu ordering is consistent (nothing takes lightMu while holding
+	// r.mu); the write is a single LED command, ms-bounded.
+	return h, b, app.rover.lights(hv, bv)
+}
+
+func (app *App) setLights(head, base bool) error {
+	_, _, err := app.updateLights(func(_, _ bool) (bool, bool) { return head, base })
+	return err
 }
 
 func (app *App) toggleHead() (bool, error) {
-	app.lightMu.Lock()
-	h, b := !app.headOn, app.baseOn
-	app.lightMu.Unlock()
-	return h, app.setLights(h, b)
+	h, _, err := app.updateLights(func(h, b bool) (bool, bool) { return !h, b })
+	return h, err
 }
 
 func (app *App) toggleBase() (bool, error) {
-	app.lightMu.Lock()
-	h, b := app.headOn, !app.baseOn
-	app.lightMu.Unlock()
-	return b, app.setLights(h, b)
+	_, b, err := app.updateLights(func(h, b bool) (bool, bool) { return h, !b })
+	return b, err
 }
 
 // snapshot writes the latest camera frame to the photo dir, collision-safe
@@ -1463,6 +1492,11 @@ func floatParam(r *http.Request, name string, def float64) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("bad %s=%q", name, s)
 	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		// NaN/Inf survive clamp() and would poison shared state (m.cap) or make
+		// writeJSON fail after the 200 header — reject them up front.
+		return 0, fmt.Errorf("bad %s=%q", name, s)
+	}
 	return v, nil
 }
 
@@ -1599,15 +1633,11 @@ func (app *App) routes() http.Handler {
 				}
 			default:
 				state = on != 0
-				app.lightMu.Lock()
-				h, b := app.headOn, app.baseOn
-				app.lightMu.Unlock()
 				if which == "head" {
-					h = state
+					_, _, e = app.updateLights(func(_, b bool) (bool, bool) { return state, b })
 				} else {
-					b = state
+					_, _, e = app.updateLights(func(h, _ bool) (bool, bool) { return h, state })
 				}
-				e = app.setLights(h, b)
 			}
 			if e != nil {
 				errJSON(w, http.StatusInternalServerError, e.Error())
@@ -2026,7 +2056,10 @@ func main() {
 		log.Printf("gamepad: mapping %s", src)
 	}
 
-	ctx := context.Background()
+	// Cancel on SIGINT/SIGTERM: this stops the camera child, watchdog, gamepad,
+	// and serial-retry goroutines, and triggers the graceful shutdown below.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// serial: try now, retry in the background so a busy port doesn't kill us.
 	// -serial '' skips it entirely (control endpoints 503 via requireSerial).
@@ -2066,8 +2099,25 @@ func main() {
 			return context.WithValue(ctx, connCtxKey{}, c)
 		},
 	}
+	// Graceful shutdown: on signal, stop the wheels (a stop, not a move — safe)
+	// while the link is still open, close the serial port, then drain the server.
+	go func() {
+		<-ctx.Done()
+		log.Printf("rovercontrol: signal received, shutting down")
+		// doEstop (not stop): latch e-stop so a /drive racing in the window before
+		// closeLink is refused — the watchdog goroutine is already cancelled here.
+		app.move.doEstop()
+		rover.closeLink()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
+
 	log.Printf("rovercontrol: http://0.0.0.0:%s  (photos: %s)", *port, *photos)
-	log.Fatal(srv.ListenAndServe())
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+	log.Printf("rovercontrol: stopped")
 }
 
 func openSerialWithRetry(ctx context.Context, rover *Rover, path string) {
@@ -2082,6 +2132,10 @@ func openSerialWithRetry(ctx context.Context, rover *Rover, path string) {
 			link.Close()
 			rover.setStatus(nil, "init failed: "+err.Error())
 			log.Printf("serial: init failed on %s: %v; retrying", path, err)
+		} else if ctx.Err() != nil {
+			// shutting down — don't publish a link closeLink() will never see
+			link.Close()
+			return
 		} else {
 			rover.setStatus(link, "")
 			log.Printf("serial: connected on %s @115200", path)

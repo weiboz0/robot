@@ -60,8 +60,13 @@ def stop_http_service() -> bool:
         pids = [p for p in out.stdout.split() if p]
         if not pids:
             return False
-        subprocess.run(["pkill", "-f", "ugv_rpi/app.py"])
+        rc = subprocess.run(["pkill", "-f", "ugv_rpi/app.py"]).returncode
         time.sleep(1.5)  # let it release the port
+        still = subprocess.run(["pgrep", "-f", "ugv_rpi/app.py"],
+                               capture_output=True, text=True).stdout.split()
+        if still:           # pkill failed (perms/race) — don't claim the port is free
+            print(f"[stop_http_service] pkill rc={rc}; app.py still running ({' '.join(still)})")
+            return False
         return True
     except Exception as e:
         print(f"[stop_http_service] {e}")

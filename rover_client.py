@@ -47,8 +47,9 @@ def _send_json(cmd: dict, timeout: float | None = None) -> None:
     """
     compact = json.dumps(cmd, separators=(",", ":"))
     body = urllib.parse.urlencode({"command": "base -c " + compact}).encode()
-    urllib.request.urlopen(_endpoint(), data=body,
-                           timeout=_TIMEOUT if timeout is None else timeout).read()
+    with urllib.request.urlopen(_endpoint(), data=body,
+                                timeout=_TIMEOUT if timeout is None else timeout) as r:
+        r.read()
 
 
 def set_camera(pan: float = 0.0, tilt: float = 0.0) -> None:

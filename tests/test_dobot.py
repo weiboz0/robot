@@ -59,6 +59,24 @@ class DobotTest(unittest.TestCase):
         self.assertIn("EnableRobot()", self.socks[0][1].sent)
         self.assertIn("ClearError()", self.socks[0][1].sent)
 
+    def test_dash_closed_if_move_port_fails(self):
+        # P11: if the motion-port connect fails, the dashboard socket must not leak.
+        closed = []
+
+        class DashSock(FakeSock):
+            def close(self_inner):
+                closed.append(True)
+
+        def fake_conn(addr, timeout=None):
+            if addr[1] == dobot.MOVE_PORT:
+                raise OSError("connection refused")
+            return DashSock()
+
+        socket.create_connection = fake_conn
+        with self.assertRaises(OSError):
+            dobot.Dobot()
+        self.assertEqual(closed, [True], "dashboard socket leaked on move-port failure")
+
 
 if __name__ == "__main__":
     unittest.main()
