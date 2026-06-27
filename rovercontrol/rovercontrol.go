@@ -1928,15 +1928,14 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
    style="width:5em;padding:6px;border-radius:6px;border:0" onchange="setCap(this.value)"></label>
  <span id="capShow"><small>cap 0.25</small></span> <small>(0..0.5, not m/s)</small>
 </div>
-<div class="bar">
+<form class="bar" style="margin:0" onsubmit="runCmd();return false">
  <input id="cmdin" type="text" autocomplete="off" spellcheck="false"
   placeholder="command — e.g. drive 0.2 0.2 · camera_aim 30 0 · light_head on · speed 0.15 · relax · stop"
-  style="flex:1;min-width:220px;padding:8px;border-radius:6px;border:0"
-  onkeydown="if(event.key==='Enter')runCmd()">
- <button onclick="runCmd()">Send</button>
- <button onclick="toggleHelp()">❔ Commands</button>
+  style="flex:1;min-width:220px;padding:8px;border-radius:6px;border:0">
+ <button type="submit">Send</button>
+ <button type="button" onclick="toggleHelp()">❔ Commands</button>
  <small id="cmdout">type a command, Enter to send (drive is a ~0.5s pulse)</small>
-</div>
+</form>
 <div id="cmdhelp" class="help" style="display:none">
  <table>
   <tr><td>drive L R</td><td>drive, −1..1 (scaled by speed cap; ~0.5s pulse, then auto-stops)</td></tr>
