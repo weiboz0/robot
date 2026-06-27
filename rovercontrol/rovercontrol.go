@@ -1919,9 +1919,21 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  <button onclick="cmd('light_base')">base light</button>
  <button onclick="cmd('gimbal_relax')">relax gimbal</button>
  <button onclick="cmd('gimbal_lock')">lock gimbal</button>
- <label>speed <input id="cap" type="range" min="0" max="0.5" step="0.05" value="0.25"
-   onchange="fetch('/speed?cap='+this.value,{method:'POST'})"></label>
+ <label>speed cap <input id="cap" type="range" min="0" max="0.5" step="0.01" value="0.25"
+   oninput="document.getElementById('capNum').value=this.value" onchange="setCap(this.value)">
+  <input id="capNum" type="number" min="0" max="0.5" step="0.01" value="0.25"
+   style="width:5em;padding:6px;border-radius:6px;border:0" onchange="setCap(this.value)"></label>
+ <span id="capShow"><small>cap 0.25</small></span> <small>(0..0.5, not m/s)</small>
 </div>
+<div class="bar">
+ <input id="cmdin" type="text" autocomplete="off" spellcheck="false"
+  placeholder="command — e.g. drive 0.2 0.2 · camera_aim 30 0 · light_head on · speed 0.15 · relax · stop"
+  style="flex:1;min-width:220px;padding:8px;border-radius:6px;border:0"
+  onkeydown="if(event.key==='Enter')runCmd()">
+ <button onclick="runCmd()">Send</button>
+ <small id="cmdout">type a command, Enter to send (drive is a ~0.5s pulse)</small>
+</div>
+<div class="bar"><button class="warn" onclick="clearAll()">🗑 Clear all photos</button></div>
 <div class="grid" id="gallery"></div>
 <script>
 const cmd = (c,q='')=>fetch('/'+c+(q?'?'+q:''),{method:'POST'});
@@ -1940,11 +1952,66 @@ async function load(){
   '<figure><a href="/photos/'+n+'" target="_blank"><img loading="lazy" src="/photos/'+n+'"></a>'+
   '<figcaption><span>'+n+'</span><button class="warn" onclick="del(\''+n+'\')">del</button></figcaption></figure>').join('');
 }
-async function del(n){await fetch('/delete_photo/'+n,{method:'POST'});seen='';load();}
+async function del(n){await fetch('/delete_photo/'+encodeURIComponent(n),{method:'POST'});seen='';load();}
+async function clearAll(){const p=await(await fetch('/photos')).json();const ns=p.photos||[];
+ if(!ns.length||!confirm('Delete all '+ns.length+' photos?'))return;
+ for(const n of ns){await fetch('/delete_photo/'+encodeURIComponent(n),{method:'POST'});}
+ seen='';load();}
+
+// ── speed cap: slider + number input + live value, synced from the server ────
+function syncCap(v){v=Number(v);const c=document.getElementById('cap'),n=document.getElementById('capNum'),
+ s=document.getElementById('capShow');if(c)c.value=v;if(n)n.value=v;if(s)s.innerHTML='<small>cap '+v.toFixed(2)+'</small>';}
+function setCap(v){v=Number(v);if(!Number.isFinite(v))v=0;v=Math.max(0,Math.min(0.5,v));
+ fetch('/speed?'+new URLSearchParams({cap:v}),{method:'POST'}).then(r=>r.json()).then(j=>syncCap(j.cap!==undefined?j.cap:v)).catch(()=>syncCap(v));}
+async function initCap(){try{const j=await(await fetch('/speed')).json();if(j.cap!==undefined)syncCap(j.cap);}catch(e){}}
+
+// ── direct command box: controller commands → existing HTTP endpoints ────────
+// Pure client mapping; the server keeps all clamps/watchdog/estop. No raw serial.
+const CMD_ALIAS={relax:'gimbal_relax',lock:'gimbal_lock',snap:'snapshot',fwd:'move_forward',back:'move_back'};
+const CMD_REQ={drive:['l','r'],camera_aim:['pan','tilt'],speed:['cap']};       // required numeric args
+const CMD_OPT={move_forward:'ms',move_back:'ms',move_left:'ms',move_right:'ms', // one optional numeric arg
+ camera_up:'deg',camera_down:'deg',camera_left:'deg',camera_right:'deg'};
+const CMD_LIGHT=['light_head','light_base'];                                    // optional on|off
+const CMD_NOARG=['stop','estop','camera_center','gimbal_relax','gimbal_lock','snapshot'];
+function cout(m){document.getElementById('cmdout').textContent=m;}             // textContent: no XSS
+function cnum(s){const v=Number(s);return Number.isFinite(v)?v:null;}          // rejects '10abc'/NaN/Inf (empty tokens are gated by the arity checks)
+function runCmd(){
+ const raw=document.getElementById('cmdin').value.trim();if(!raw)return;
+ const t=raw.split(/\s+/);let c=(t[0]||'').toLowerCase();const a=t.slice(1);
+ c=CMD_ALIAS[c]||c;
+ let qs=null;
+ if(CMD_REQ[c]){const k=CMD_REQ[c];
+  if(a.length!==k.length)return cout('✗ '+c+' needs '+k.length+' number(s): '+k.join(' '));
+  qs=new URLSearchParams();for(let i=0;i<k.length;i++){const v=cnum(a[i]);if(v===null)return cout('✗ not a number: '+a[i]);qs.set(k[i],v);}
+ }else if(CMD_OPT[c]){
+  if(a.length>1)return cout('✗ '+c+' takes at most one number');
+  if(a.length===1){const v=cnum(a[0]);if(v===null)return cout('✗ not a number: '+a[0]);qs=new URLSearchParams();qs.set(CMD_OPT[c],v);}
+ }else if(CMD_LIGHT.includes(c)){
+  if(a.length>1)return cout('✗ '+c+' takes on|off or nothing');
+  if(a.length===1){const s=a[0].toLowerCase();
+   if(s==='on'||s==='1'||s==='true'){qs=new URLSearchParams();qs.set('on',1);}
+   else if(s==='off'||s==='0'||s==='false'){qs=new URLSearchParams();qs.set('on',0);}
+   else return cout('✗ '+c+' arg must be on|off');}
+ }else if(CMD_NOARG.includes(c)){
+  if(a.length)return cout('✗ '+c+' takes no args');
+ }else return cout('✗ unknown command: '+t[0]);
+ const path='/'+c+(qs?'?'+qs.toString():'');
+ cout('… '+raw);
+ fetch(path,{method:'POST'}).then(r=>r.json().then(j=>({ok:r.ok,j})).catch(()=>({ok:r.ok,j:{}}))).then(function(res){
+  if(res.ok){let extra='';const j=res.j||{};
+   if(j.cap!==undefined){extra=' (cap '+j.cap+')';syncCap(j.cap);}
+   else if(j.pan!==undefined){extra=' (pan '+j.pan+' tilt '+j.tilt+')';}
+   else if(j.on!==undefined){extra=' ('+(j.on?'on':'off')+')';}
+   cout('✓ '+raw+extra);
+   if(c==='snapshot'){seen='';load();}
+  }else cout('✗ '+raw+' → '+((res.j&&res.j.error)||'HTTP error'));
+ }).catch(e=>cout('✗ '+e));
+ document.getElementById('cmdin').value='';
+}
 async function health(){try{const h=await(await fetch('/healthz')).json();
  document.getElementById('health').innerHTML='<small>serial '+(h.serial.up?'✓':'✗')+
  ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad.up?'✓':'–')+'</small>';}catch(e){}}
-setInterval(()=>{load();health();},2000);load();health();
+setInterval(()=>{load();health();},2000);load();health();initCap();
 
 // ── Mac-side gamepad: Gamepad API → existing HTTP endpoints (no server change).
 // Drive is in-flight-guarded and refreshed continuously while deflected (feeds
