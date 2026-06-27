@@ -17,6 +17,8 @@ func TestWebUIHasNewControls(t *testing.T) {
 	for _, want := range []string{
 		`id="cmdin"`,    // command box
 		`runCmd(`,       // command parser
+		`onsubmit="runCmd`, // Enter submits the form (reliable across browsers)
+		`type="submit"`, // Send is the form's submit button
 		`id="capNum"`,   // type-in speed value
 		`Clear all`,     // clear-all button
 		`clearAll(`,     // clear-all handler
