@@ -21,6 +21,8 @@ func TestWebUIHasNewControls(t *testing.T) {
 		`Clear all`,     // clear-all button
 		`clearAll(`,     // clear-all handler
 		`initCap(`,      // load-time speed read
+		`toggleHelp(`,   // commands help button + panel
+		`id="cmdhelp"`,  // the commands panel
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)

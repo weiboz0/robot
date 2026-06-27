@@ -1882,6 +1882,9 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  figure img{width:100%;display:block;aspect-ratio:4/3;object-fit:cover}
  figcaption{font-size:10px;padding:5px;display:flex;justify-content:space-between;gap:5px;word-break:break-all}
  small{color:#999}
+ .help{max-width:640px;margin:6px auto;background:#1c1c1c;border-radius:8px;padding:10px 12px;font-size:13px}
+ .help td{padding:2px 10px 2px 0;vertical-align:top}
+ .help td:first-child{font-family:monospace;color:#9cf;white-space:nowrap}
 </style></head><body>
 <header><h1>🤖 Rover controller</h1>
  <button class="warn" onclick="cmd('estop')">⛔ E-STOP</button>
@@ -1931,7 +1934,24 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
   style="flex:1;min-width:220px;padding:8px;border-radius:6px;border:0"
   onkeydown="if(event.key==='Enter')runCmd()">
  <button onclick="runCmd()">Send</button>
+ <button onclick="toggleHelp()">❔ Commands</button>
  <small id="cmdout">type a command, Enter to send (drive is a ~0.5s pulse)</small>
+</div>
+<div id="cmdhelp" class="help" style="display:none">
+ <table>
+  <tr><td>drive L R</td><td>drive, −1..1 (scaled by speed cap; ~0.5s pulse, then auto-stops)</td></tr>
+  <tr><td>move_forward|back|left|right [MS]</td><td>nudge for MS ms (default 400)</td></tr>
+  <tr><td>stop</td><td>stop the wheels</td></tr>
+  <tr><td>estop</td><td>emergency stop (wheels + gimbal)</td></tr>
+  <tr><td>camera_aim PAN TILT</td><td>aim camera (pan −180..180, tilt −45..90, + is up)</td></tr>
+  <tr><td>camera_up|down|left|right [DEG]</td><td>nudge camera (default 15°)</td></tr>
+  <tr><td>camera_center</td><td>re-center the camera</td></tr>
+  <tr><td>light_head|light_base [on|off]</td><td>no arg = toggle; or set on / off</td></tr>
+  <tr><td>relax / lock</td><td>relax / lock the gimbal servos (hand-position the camera)</td></tr>
+  <tr><td>speed CAP</td><td>set the speed cap, 0..0.5 (max wheel magnitude)</td></tr>
+  <tr><td>snapshot</td><td>take a photo</td></tr>
+ </table>
+ <small>aliases: relax=gimbal_relax · lock=gimbal_lock · snap=snapshot · fwd=move_forward · back=move_back</small>
 </div>
 <div class="bar"><button class="warn" onclick="clearAll()">🗑 Clear all photos</button></div>
 <div class="grid" id="gallery"></div>
@@ -1975,6 +1995,7 @@ const CMD_LIGHT=['light_head','light_base'];                                    
 const CMD_NOARG=['stop','estop','camera_center','gimbal_relax','gimbal_lock','snapshot'];
 function cout(m){document.getElementById('cmdout').textContent=m;}             // textContent: no XSS
 function cnum(s){const v=Number(s);return Number.isFinite(v)?v:null;}          // rejects '10abc'/NaN/Inf (empty tokens are gated by the arity checks)
+function toggleHelp(){const h=document.getElementById('cmdhelp');h.style.display=(h.style.display==='none')?'block':'none';}
 function runCmd(){
  const raw=document.getElementById('cmdin').value.trim();if(!raw)return;
  const t=raw.split(/\s+/);let c=(t[0]||'').toLowerCase();const a=t.slice(1);
