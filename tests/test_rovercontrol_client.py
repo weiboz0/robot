@@ -99,6 +99,24 @@ class RovercontrolClientTest(unittest.TestCase):
         rc.set_speed(9)
         self.assertIn("cap=0.5", self.last())
 
+    def test_nudge_posts_move_endpoint(self):
+        rc.nudge("forward", 300)
+        m, url = self.calls[-1]
+        self.assertEqual(m, "POST")
+        self.assertIn("/move_forward?", url)
+        self.assertIn("ms=300", url)
+
+    def test_nudge_clamps_ms_and_validates_dir(self):
+        rc.nudge("left", 99999)
+        self.assertIn("ms=5000", self.last())
+        with self.assertRaises(ValueError):
+            rc.nudge("sideways", 100)
+
+    def test_camera_nudge(self):
+        rc.camera_nudge("up", 10)
+        self.assertIn("/camera_up?", self.last())
+        self.assertIn("deg=10", self.last())
+
 
 class FakeJSONResp:
     def __init__(self, body): self._b = body.encode()
@@ -124,6 +142,14 @@ class RovercontrolGetTest(unittest.TestCase):
         rc.urllib.request.urlopen = lambda url, timeout=None: FakeJSONResp(
             '{"photos":["rover_b.jpg","rover_a.jpg"]}')
         self.assertEqual(rc.list_photos(), ["rover_b.jpg", "rover_a.jpg"])
+
+    def test_snapshot_returns_name(self):
+        rc.urllib.request.urlopen = lambda req, timeout=None: FakeJSONResp('{"ok":true,"name":"rover_z.jpg"}')
+        self.assertEqual(rc.snapshot(), "rover_z.jpg")
+
+    def test_get_photo_returns_bytes(self):
+        rc.urllib.request.urlopen = lambda url, timeout=None: FakeJSONResp("BINARYJPEG")
+        self.assertEqual(rc.get_photo("rover_z.jpg"), b"BINARYJPEG")
 
 
 if __name__ == "__main__":
