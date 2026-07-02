@@ -241,6 +241,54 @@ class StatusAndExtrasTest(unittest.TestCase):
         self.assertIsNone(st["serial"]["up"])
 
 
+class ParityBackendTest(unittest.TestCase):
+    """Plan 019: nudge + light_channel route correctly per backend."""
+
+    def test_rovercontrol_nudge_uses_server_endpoint(self):
+        rcc = rover_backend.rovercontrol_client
+        calls = []
+        with mock.patch.object(rcc, "set_host", lambda h: None), \
+             mock.patch.object(rcc, "nudge", side_effect=lambda d, ms: calls.append((d, ms))):
+            r = rover_backend.RoverCtl("rovercontrol", http_host="1.1.1.1")
+            r.nudge("forward", 300)
+            r.nudge("left", 99999)                    # clamps
+        self.assertEqual(calls, [("forward", 300), ("left", 5000)])
+
+    def test_serial_nudge_emulates_full_cap_drive(self):
+        fake = fake_rover_direct()
+        sys.modules["rover_direct"] = fake
+        try:
+            r = rover_backend.RoverCtl("serial", port="/dev/x")
+            r.nudge("forward", 500)                   # cap 0.5 → _scale(0.5)=0.5 (full cap)
+            with self.assertRaises(ValueError):
+                r.nudge("sideways", 100)
+        finally:
+            sys.modules.pop("rover_direct", None)
+        self.assertIn(("drive_for", 0.5, 0.5, 0.5), fake._rover.calls)   # full-cap, ms→s
+
+    def test_rovercontrol_light_channel_native(self):
+        rcc = rover_backend.rovercontrol_client
+        calls = []
+        with mock.patch.object(rcc, "set_host", lambda h: None), \
+             mock.patch.object(rcc, "light_channel",
+                               side_effect=lambda w, on=None: calls.append((w, on)) or True):
+            r = rover_backend.RoverCtl("rovercontrol", http_host="1.1.1.1")
+            self.assertTrue(r.light_channel("head", True))
+            r.light_channel("base")                   # toggle passes None through
+        self.assertEqual(calls, [("head", True), ("base", None)])
+
+    def test_serial_light_channel_tracks_and_preserves(self):
+        fake = fake_rover_direct()
+        sys.modules["rover_direct"] = fake
+        try:
+            r = rover_backend.RoverCtl("serial", port="/dev/x")
+            r.lights(255, 0)                          # head on via the both-channel call
+            r.light_channel("base", True)             # must PRESERVE head (Opus B1)
+        finally:
+            sys.modules.pop("rover_direct", None)
+        self.assertIn(("lights", 255, 255), fake._rover.calls)   # head stayed on
+
+
 class ImportSmokeTest(unittest.TestCase):
     def test_core_modules_import(self):
         import importlib

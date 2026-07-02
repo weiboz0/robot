@@ -97,6 +97,20 @@ def servo_torque(lock: bool, servo_id: int = 255) -> None:
     _post("/gimbal_lock" if lock else "/gimbal_relax")
 
 
+def light_channel(which: str, on: "bool | None" = None) -> bool:
+    """Set or toggle ONE light natively on the controller (it owns the state, so
+    this can't drift when the gamepad/web UI also change lights). which is
+    'head'|'base'; on=None toggles. Returns the resulting state."""
+    if which not in ("head", "base"):
+        raise ValueError("which must be 'head' or 'base'")
+    url = _base() + "/light_" + which
+    if on is not None:
+        url += "?on=" + ("1" if on else "0")
+    req = urllib.request.Request(url, method="POST")
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
+        return bool(json.loads(r.read().decode()).get("on"))
+
+
 def snapshot(timeout: float | None = None) -> str:
     """POST /snapshot → the saved frame's filename (from the response). Returning
     the exact name avoids racing list_photos()[0] against a concurrent gamepad

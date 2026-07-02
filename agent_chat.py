@@ -42,11 +42,24 @@ def strip_think(text: str) -> str:
 
 
 # ----------------------------------------------------- rover $-command parser
+# Website-vocabulary aliases (plan 019 parity): each maps to the chatbot-native
+# command it behaves as. drive/fwd/back are deliberately NOT remapped — the same
+# words have different units on the website (see docs/reference).
+CMD_ALIASES = {
+    "camera_up": "up", "camera_down": "down",
+    "camera_left": "left", "camera_right": "right",
+    "camera_aim": "cam", "camera_center": "center",
+    "snapshot": "photo", "snap": "photo",
+    "gimbal_relax": "relax", "gimbal_lock": "lock",
+}
+
+
 def rover_command(r: RoverCtl, line: str) -> str:
     parts = line.split()
     if not parts:
         return ""
     c, args = parts[0].lower(), parts[1:]
+    c = CMD_ALIASES.get(c, c)
     try:
         if c in ("up", "down", "left", "right"):
             step = float(args[0]) if args else 15.0
@@ -99,6 +112,22 @@ def rover_command(r: RoverCtl, line: str) -> str:
         if c == "photos":
             ps = r.list_photos()
             return f"{len(ps)} photo(s): {', '.join(ps[:20])}" if ps else "no photos yet"
+        if c in ("move_forward", "move_back", "move_left", "move_right"):
+            ms = float(args[0]) if args else 400
+            r.nudge(c[5:], ms)
+            return f"nudged {c[5:]} ({int(min(5000, max(0, ms)))} ms)"
+        if c in ("light_head", "light_base"):
+            on = None                       # no arg = toggle
+            if args:
+                s = args[0].lower()
+                if s in ("on", "1", "true"):
+                    on = True
+                elif s in ("off", "0", "false"):
+                    on = False
+                else:
+                    return f"{c} arg must be on|off"
+            state = r.light_channel(c[6:], on)
+            return f"{c[6:]} light {'on' if state else 'off'}"
         return f"?? unknown rover command '{c}'"
     except (IndexError, ValueError):
         return "bad args"
@@ -347,6 +376,9 @@ def main():
                           "rover motors: drive L R [s], move L R, fwd/back/spinl/spinr [s], stop, estop\n"
                           "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear, demo, photo\n"
                           "rover meta:   speed [CAP 0..0.5], status, photos\n"
+                          "website names also work: camera_up/..., camera_aim, camera_center, snapshot,\n"
+                          "  gimbal_relax/lock, light_head|light_base [on|off], move_forward/back/left/right [MS]\n"
+                          "  (note: drive/fwd/back keep CHATBOT units here — seconds, speeds -0.5..0.5)\n"
                           "autonomous:   find <object> / screwdriver  (drives itself; needs "
                           "ROVER_FIND_ENABLE=1 + vision key — camera-only safety)\n"
                           "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")

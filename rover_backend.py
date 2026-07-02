@@ -118,6 +118,44 @@ class RoverCtl:
             return self._http.get_speed()
         return self._cap
 
+    # ±0.5 = "full" on the chatbot scale → _scale() yields exactly the cap, which
+    # mirrors the controller's nudge (it drives at ±1 × its cap). Using a gentler
+    # value here would make the SAME command ~40% slower on serial than rovercontrol.
+    _NUDGE_LR = {"forward": (0.5, 0.5), "back": (-0.5, -0.5),
+                 "left": (-0.5, 0.5), "right": (0.5, -0.5)}
+
+    def nudge(self, direction, ms=400):
+        """Bounded wheel nudge (website `move_*` parity). rovercontrol → the
+        controller's /move_* (server-side auto-stop, cap-scaled); serial/http →
+        emulate with drive() for ms/1000 at full-cap speed (same magnitude as the
+        server nudge; drive() applies the cap via _scale)."""
+        if direction not in self._NUDGE_LR:
+            raise ValueError(f"nudge direction must be one of {sorted(self._NUDGE_LR)}")
+        ms = int(_clamp(float(ms), 0, 5000))
+        if self.backend == "rovercontrol":
+            self._http.nudge(direction, ms)
+        else:
+            l, r = self._NUDGE_LR[direction]
+            self.drive(l, r, ms / 1000.0)
+
+    def light_channel(self, which, on=None):
+        """Set/toggle ONE light (website `light_head`/`light_base` parity).
+        which='head'|'base'; on=None toggles. rovercontrol → the controller's
+        native /light_* (server owns the state — no drift when the gamepad/web UI
+        also switch lights). serial/http → local per-channel tracking (may drift
+        if another process changes the lights; documented). Returns the state."""
+        if which not in ("head", "base"):
+            raise ValueError("which must be 'head' or 'base'")
+        if self.backend == "rovercontrol":
+            return self._http.light_channel(which, on)
+        cur = getattr(self, "_light_" + which, False)
+        new = (not cur) if on is None else bool(on)
+        setattr(self, "_light_" + which, new)
+        head = getattr(self, "_light_head", False)
+        base = getattr(self, "_light_base", False)
+        self.lights(255 if head else 0, 255 if base else 0)
+        return new
+
     def stop(self):
         if self.backend == "serial":
             self._r.stop()
@@ -133,6 +171,9 @@ class RoverCtl:
     def lights(self, front=0, base=0):
         front = int(_clamp(float(front), 0, 255))
         base = int(_clamp(float(base), 0, 255))
+        # Record per-channel state so light_channel() on serial/http never acts
+        # on stale values after a both-channel `light F B` call.
+        self._light_head, self._light_base = front > 0, base > 0
         if self.backend == "serial":
             self._r.lights(front, base)
         else:

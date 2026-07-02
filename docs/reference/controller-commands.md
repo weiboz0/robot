@@ -176,6 +176,31 @@ no server watchdog — `$move` stays human-only), and photo *delete*/byte-fetch
 on rovercontrol it is **shared with the gamepad**, so it isn't exclusively the
 chatbot's.
 
+### Name parity (plan 019) — both surfaces accept both vocabularies
+
+| Command | Chatbot `$` | Website box | Note |
+|---|---|---|---|
+| `up/down/left/right [DEG]` = `camera_up/...` | ✅ both | ✅ both | camera nudge (bare `left/right` = CAMERA everywhere; wheels = `spinl/spinr`/`move_*`) |
+| `cam P T` = `camera_aim P T` | ✅ both | ✅ both | |
+| `center` = `camera_center` | ✅ both | ✅ both | |
+| `photo` = `snapshot`/`snap` | ✅ both | ✅ both | |
+| `relax`/`lock` = `gimbal_relax`/`gimbal_lock` | ✅ both | ✅ both | |
+| `light_head`/`light_base [on\|off]` | ✅ both | ✅ both | single channel; no arg = toggle |
+| `light F B` | ✅ (PWM 0-255) | ✅ (degrades: >0 = on) | |
+| `move_forward/back/left/right [MS]` | ✅ both | ✅ both | bounded nudge; serial emulates at full-cap for MS |
+| `spinl/spinr [S]` | ✅ (gentle 0.2) | ✅ (→ `move_*`, **at the cap** — brisker) | duration matches; magnitude differs |
+| `speed CAP` / `stop` / `estop` | ✅ both | ✅ both | |
+
+**Same word, DIFFERENT meaning (deliberately not remapped):**
+- `drive` — chatbot: `L R [seconds]`, speeds −0.5..0.5, auto-stop after seconds;
+  website: `l r` normalized −1..1, ONE ~0.5 s watchdog pulse.
+- `fwd`/`back` — chatbot: drive straight for **seconds**; website: alias of
+  `move_forward/move_back` in **ms**.
+- `move` — chatbot: **continuous** until `stop`; website: alias of `drive` = one pulse.
+
+**Chatbot-only** (no controller endpoint / Python-only): `oled`, `oledclear`,
+`demo`, `status`, `photos`, `find <obj>`/`screwdriver`, `dobot`.
+
 ## Notes
 - One process owns the serial port **and** the camera, so the stock ugv_rpi
   `app.py` must not run alongside it (its `@reboot` autostart is disabled).
