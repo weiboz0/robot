@@ -1959,7 +1959,10 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
   <tr><td onclick="pick('speed 0.15')">speed CAP</td><td>set the speed cap, 0..0.5 (max wheel magnitude)</td></tr>
   <tr><td onclick="pick('snapshot')">snapshot</td><td>take a photo</td></tr>
  </table>
- <small>aliases: relax=gimbal_relax · lock=gimbal_lock · snap=snapshot · fwd=move_forward · back=move_back</small>
+ <small>aliases: relax=gimbal_relax · lock=gimbal_lock · snap=snapshot · fwd=move_forward · back=move_back</small><br>
+ <small>chatbot names also work: up/down/left/right = CAMERA nudge (wheels = spinl/spinr [S] or move_*) ·
+ cam P T · center · photo · light F B (&gt;0 = on) · move L R = ONE ~0.5s pulse, not continuous ·
+ note: spinl/spinr and move_* run at the speed cap here (the chatbot's spins are gentler)</small>
 </div>
 <div class="bar">
  <b>Program</b>
@@ -2008,7 +2011,11 @@ async function initCap(){try{const j=await(await fetch('/speed')).json();if(j.ca
 
 // ── direct command box: controller commands → existing HTTP endpoints ────────
 // Pure client mapping; the server keeps all clamps/watchdog/estop. No raw serial.
-const CMD_ALIAS={relax:'gimbal_relax',lock:'gimbal_lock',snap:'snapshot',fwd:'move_forward',back:'move_back'};
+const CMD_ALIAS={relax:'gimbal_relax',lock:'gimbal_lock',snap:'snapshot',fwd:'move_forward',back:'move_back',
+ // chatbot-vocabulary parity (plan 019): bare up/down/left/right = CAMERA (as in the chatbot);
+ // wheel turns are spinl/spinr or move_left/move_right. move = ONE ~0.5s pulse (not continuous).
+ up:'camera_up',down:'camera_down',left:'camera_left',right:'camera_right',
+ cam:'camera_aim',center:'camera_center',photo:'snapshot',move:'drive'};
 const CMD_REQ={drive:['l','r'],camera_aim:['pan','tilt'],speed:['cap']};       // required numeric args
 const CMD_OPT={move_forward:'ms',move_back:'ms',move_left:'ms',move_right:'ms', // one optional numeric arg
  camera_up:'deg',camera_down:'deg',camera_left:'deg',camera_right:'deg'};
@@ -2020,6 +2027,19 @@ function toggleHelp(){const h=document.getElementById('cmdhelp');h.style.display
 // parseCmd: raw text → {cmd,path} or {error}. Shared by the box and the program.
 function parseCmd(raw){
  const t=raw.trim().split(/\s+/);let c=(t[0]||'').toLowerCase();const a=t.slice(1);
+ // chatbot-vocabulary special cases (units converted; plan 019)
+ if(c==='spinl'||c==='spinr'){                       // chatbot: seconds → controller: ms
+  if(a.length>1)return {error:c+' takes at most one number (seconds)'};
+  let s=0.6;if(a.length===1){const v=cnum(a[0]);if(v===null)return {error:'not a number: '+a[0]};s=v;}
+  const ms=Math.max(0,Math.min(5000,Math.round(s*1000)));
+  return {cmd:c==='spinl'?'move_left':'move_right',
+          path:'/'+(c==='spinl'?'move_left':'move_right')+'?'+new URLSearchParams({ms:ms})};
+ }
+ if(c==='light'){                                    // chatbot: light F B (PWM) → on/off pair (>0 = on)
+  if(a.length!==2)return {error:'light needs 2 numbers: FRONT BASE (>0 = on)'};
+  const f=cnum(a[0]),b=cnum(a[1]);if(f===null||b===null)return {error:'light args must be numbers'};
+  return {cmd:'light',multi:['/light_head?on='+(f>0?1:0),'/light_base?on='+(b>0?1:0)]};
+ }
  c=CMD_ALIAS[c]||c;
  let qs=null;
  if(CMD_REQ[c]){const k=CMD_REQ[c];
@@ -2044,6 +2064,10 @@ function sendCommand(raw,signal){
  const p=parseCmd(raw);
  if(p.error){cout('✗ '+p.error);return Promise.resolve(false);}
  cout('… '+raw);
+ if(p.multi){                                        // e.g. 'light F B' = two channel sets
+  return Promise.all(p.multi.map(u=>fetch(u,{method:'POST',signal}).then(r=>r.ok).catch(()=>false)))
+   .then(oks=>{const ok=oks.every(Boolean);cout((ok?'✓ ':'✗ ')+raw);return ok;});
+ }
  return fetch(p.path,{method:'POST',signal}).then(r=>r.json().then(j=>({ok:r.ok,j})).catch(()=>({ok:r.ok,j:{}}))).then(function(res){
   if(res.ok){let extra='';const j=res.j||{};
    if(j.cap!==undefined){extra=' (cap '+j.cap+')';syncCap(j.cap);}
@@ -2081,10 +2105,16 @@ function sleepMs(ms){return new Promise(r=>setTimeout(r,ms));}
 // next step (non-overlap). Must mirror the server: /drive auto-stops after
 // watchdogTTL (500ms in rovercontrol.go — keep in sync); /move_* self-stops after
 // its ms arg (nudge default 400, clamped 0..5000). Camera/light/etc = 0.
-function motionMs(raw){const p=parseCmd(raw);if(p.error||!p.cmd)return 0;const c=p.cmd;
+function motionMs(raw){const p=parseCmd(raw);if(p.error||!p.cmd||!p.path)return 0;const c=p.cmd;
  if(c==='drive')return 500;
- if(c==='move_forward'||c==='move_back'||c==='move_left'||c==='move_right'){
-  const m=Number(raw.trim().split(/\s+/)[1]);return Number.isFinite(m)?Math.max(0,Math.min(5000,m)):400;}
+ if(c.indexOf('move_')===0){
+  // read ms from the PARSED path (spinl converts seconds→ms there; re-reading the
+  // raw token would treat 'spinl 2' as 2ms and under-wait the sequencer).
+  // Missing ms must fall back to the server default 400 — note Number(null)===0,
+  // so test for null explicitly or a bare move_forward would under-wait.
+  const q=new URLSearchParams(p.path.split('?')[1]||'').get('ms');
+  const m=(q===null)?NaN:Number(q);
+  return Number.isFinite(m)?Math.max(0,Math.min(5000,m)):400;}
  return 0;}
 async function runProgram(){
  if(running||!prog.length)return;                          // ignore while running: Stop, then Run to restart

@@ -31,6 +31,12 @@ func TestWebUIHasNewControls(t *testing.T) {
 		`runProgram(`,   // run the sequence
 		`id="program"`,  // the program list
 		`roverprog:`,    // save/load named programs
+		`up:'camera_up'`,      // plan 019: chatbot-name aliases
+		`photo:'snapshot'`,
+		`cam:'camera_aim'`,
+		`c==='spinl'`,         // seconds→ms special case
+		`c==='light'`,         // light F B special case (multi)
+		`chatbot names also work`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)

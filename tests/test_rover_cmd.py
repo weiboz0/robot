@@ -72,6 +72,13 @@ class FakeRover:
     def list_photos(self):
         return ["rover_b.jpg", "rover_a.jpg"]
 
+    def nudge(self, direction, ms=400):
+        self.calls.append(("nudge", direction, ms))
+
+    def light_channel(self, which, on=None):
+        self.calls.append(("light_channel", which, on))
+        return True if on is None else bool(on)
+
 
 class RoverCmdTest(unittest.TestCase):
     def test_nudge_default_and_explicit_degrees(self):
@@ -173,6 +180,56 @@ class RoverCmdTest(unittest.TestCase):
     def test_unknown_command(self):
         r = FakeRover()
         self.assertIn("unknown", agent_chat.rover_command(r, "bogus").lower())
+
+
+class ParityAliasTest(unittest.TestCase):
+    """Plan 019: website command names work in the chatbot."""
+
+    def test_camera_up_equals_up(self):
+        a, b = FakeRover(), FakeRover()
+        agent_chat.rover_command(a, "up 10")
+        agent_chat.rover_command(b, "camera_up 10")
+        self.assertEqual(a.calls, b.calls)
+
+    def test_camera_aim_center_snapshot(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "camera_aim 30 -10")
+        self.assertIn(("cam", 30.0, -10.0), r.calls)
+        agent_chat.rover_command(r, "camera_center")
+        self.assertIn(("center",), r.calls)
+        out = agent_chat.rover_command(r, "snapshot")
+        self.assertIn(("photo",), r.calls)
+        self.assertIn(".jpg", out)
+
+    def test_gimbal_aliases(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "gimbal_relax")
+        agent_chat.rover_command(r, "gimbal_lock")
+        self.assertIn(("torque", False), r.calls)
+        self.assertIn(("torque", True), r.calls)
+
+    def test_light_channel_set_and_toggle(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "light_head on")
+        self.assertIn(("light_channel", "head", True), r.calls)
+        agent_chat.rover_command(r, "light_base off")
+        self.assertIn(("light_channel", "base", False), r.calls)
+        agent_chat.rover_command(r, "light_head")          # no arg = toggle
+        self.assertIn(("light_channel", "head", None), r.calls)
+        self.assertIn("on|off", agent_chat.rover_command(r, "light_head maybe"))
+
+    def test_move_nudges(self):
+        r = FakeRover()
+        agent_chat.rover_command(r, "move_forward 300")
+        self.assertIn(("nudge", "forward", 300.0), r.calls)
+        agent_chat.rover_command(r, "move_left")           # default ms
+        self.assertIn(("nudge", "left", 400), r.calls)
+
+    def test_drive_keeps_chatbot_units(self):
+        # drive is deliberately NOT remapped: chatbot semantics (L R [seconds])
+        r = FakeRover()
+        agent_chat.rover_command(r, "drive 0.2 0.2 1")
+        self.assertIn(("drive", 0.2, 0.2, 1.0), r.calls)
 
 
 class RoverCmdErrorTest(unittest.TestCase):
