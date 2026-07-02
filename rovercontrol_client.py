@@ -97,8 +97,13 @@ def servo_torque(lock: bool, servo_id: int = 255) -> None:
     _post("/gimbal_lock" if lock else "/gimbal_relax")
 
 
-def snapshot() -> None:
-    _post("/snapshot")
+def snapshot(timeout: float | None = None) -> str:
+    """POST /snapshot → the saved frame's filename (from the response). Returning
+    the exact name avoids racing list_photos()[0] against a concurrent gamepad
+    snapshot."""
+    req = urllib.request.Request(_base() + "/snapshot", method="POST")
+    with urllib.request.urlopen(req, timeout=_TIMEOUT if timeout is None else timeout) as r:
+        return json.loads(r.read().decode()).get("name", "")
 
 
 def set_speed(cap: float) -> None:
@@ -118,6 +123,33 @@ def list_photos(timeout: float = 2.0) -> list:
     orders them)."""
     with urllib.request.urlopen(_base() + "/photos", timeout=timeout) as r:
         return list(json.loads(r.read().decode()).get("photos", []))
+
+
+_NUDGE_DIRS = ("forward", "back", "left", "right")
+_CAM_DIRS = ("up", "down", "left", "right")
+
+
+def nudge(direction: str, ms: int = 300, timeout: float | None = None) -> None:
+    """Bounded wheel nudge — POST /move_<direction>?ms=. The controller auto-stops
+    after ms (server-side timer, clamped 0..5000), so motion is bounded even if
+    this client dies. Used by the autonomous SafeDriver."""
+    if direction not in _NUDGE_DIRS:
+        raise ValueError(f"nudge direction must be one of {_NUDGE_DIRS}")
+    _post("/move_" + direction, {"ms": max(0, min(5000, int(ms)))}, timeout=timeout)
+
+
+def camera_nudge(direction: str, deg: float = 15.0, timeout: float | None = None) -> None:
+    """Nudge the camera gimbal — POST /camera_<direction>?deg=."""
+    if direction not in _CAM_DIRS:
+        raise ValueError(f"camera direction must be one of {_CAM_DIRS}")
+    _post("/camera_" + direction, {"deg": deg}, timeout=timeout)
+
+
+def get_photo(name: str, timeout: float = 5.0) -> bytes:
+    """Fetch a photo's JPEG bytes — GET /photos/<name> (for the vision model)."""
+    with urllib.request.urlopen(_base() + "/photos/" + urllib.parse.quote(name),
+                                timeout=timeout) as r:
+        return r.read()
 
 
 def healthz(timeout: float = 2.0) -> dict:

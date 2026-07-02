@@ -108,6 +108,40 @@ def rover_command(r: RoverCtl, line: str) -> str:
         return f"error: {e}"
 
 
+# ------------------------------------------------- autonomous vision-find ($find)
+def autonomous_find(rover, target):
+    """$find <obj> / $screwdriver: drive the rover autonomously to find `target`
+    and return a photo. Camera-only safety (no cliff sensor) — see docs/plans/017.
+    Gated: vision must be configured AND ROVER_FIND_ENABLE=1, checked BEFORE any
+    rover call, so an unset run is a pure no-op that never moves the rover."""
+    if os.environ.get("ROVER_FIND_ENABLE", "").strip().lower() not in ("1", "true", "yes"):
+        return ("autonomous find is DISABLED — it drives the rover on its own with "
+                "camera-only safety (NO cliff sensor). To allow it: set ROVER_FIND_ENABLE=1 "
+                "and run only on a flat, enclosed, ledge-free floor, ready to E-STOP.")
+    if rover is None or rover.backend != "rovercontrol":
+        return ("autonomous find needs the rovercontrol backend (run the Go controller "
+                "and let the chatbot drive it over :8080 — not the serial/app.py path).")
+    try:                                    # vision FIRST — no rover contact if unavailable
+        import vision as _vision
+        vm = _vision.VisionModel()
+    except Exception as e:
+        return f"vision not available: {e}"
+    import autodrive
+    import rovercontrol_client as client   # already pointed at the rover by RoverCtl
+    def capture():
+        n = client.snapshot()
+        return n, client.get_photo(n)
+    driver = autodrive.SafeDriver(client)
+    try:
+        shot = autodrive.find_object(driver, vm, target, capture=capture,
+                                     log=lambda m: print("   " + m))
+    except Exception as e:                  # rover is left stopped/safe (preflight refusal or cleanup)
+        return f"find aborted — rover stopped/safe: {e}"
+    if shot:
+        return f"found {target} → {shot}   ({rover.where}/photos/{shot})"
+    return f"did not find {target} within the budget — wheels stopped."
+
+
 # --------------------------------------------------------------------- tools
 def build_tools(rover, arm):
     tools = []
@@ -313,6 +347,8 @@ def main():
                           "rover motors: drive L R [s], move L R, fwd/back/spinl/spinr [s], stop, estop\n"
                           "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear, demo, photo\n"
                           "rover meta:   speed [CAP 0..0.5], status, photos\n"
+                          "autonomous:   find <object> / screwdriver  (drives itself; needs "
+                          "ROVER_FIND_ENABLE=1 + vision key — camera-only safety)\n"
                           "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
                 elif cmd.lower().startswith("dobot"):
                     raw = cmd[5:].strip()
@@ -324,6 +360,9 @@ def main():
                                   else arm.dashboard(raw))
                         except Exception as e:
                             print(f"  dobot error: {e}")
+                elif cmd.lower() == "screwdriver" or cmd.lower().startswith("find "):
+                    target = "a screwdriver" if cmd.lower() == "screwdriver" else cmd[5:].strip()
+                    print(" ", autonomous_find(rover, target))
                 elif rover is not None:
                     print(" ", rover_command(rover, cmd))
                 else:
