@@ -25,6 +25,12 @@ func TestWebUIHasNewControls(t *testing.T) {
 		`initCap(`,      // load-time speed read
 		`toggleHelp(`,   // commands help button + panel
 		`id="cmdhelp"`,  // the commands panel
+		`onsubmit="runCmd();return false"`, // Enter submits
+		`pick(`,         // click-a-command-to-load
+		`addStep(`,      // add to program
+		`runProgram(`,   // run the sequence
+		`id="program"`,  // the program list
+		`roverprog:`,    // save/load named programs
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)
