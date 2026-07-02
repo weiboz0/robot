@@ -1884,7 +1884,14 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  small{color:#999}
  .help{max-width:640px;margin:6px auto;background:#1c1c1c;border-radius:8px;padding:10px 12px;font-size:13px}
  .help td{padding:2px 10px 2px 0;vertical-align:top}
- .help td:first-child{font-family:monospace;color:#9cf;white-space:nowrap}
+ .help td:first-child{font-family:monospace;color:#9cf;white-space:nowrap;cursor:pointer;text-decoration:underline}
+ .help td:first-child:hover{color:#fff}
+ .prog{max-width:640px;margin:6px auto;padding:0 0 0 30px;color:#eee}
+ .prog li{background:#1c1c1c;margin:3px 0;padding:5px 8px;border-radius:6px;display:flex;gap:6px;
+   align-items:center;font-family:monospace;font-size:13px}
+ .prog li.run{outline:2px solid #2d6cdf}
+ .prog li span{flex:1;word-break:break-all}
+ .prog li button{padding:2px 7px;font-size:12px}
 </style></head><body>
 <header><h1>🤖 Rover controller</h1>
  <button class="warn" onclick="cmd('estop')">⛔ E-STOP</button>
@@ -1931,27 +1938,42 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
 <form class="bar" style="margin:0" onsubmit="runCmd();return false">
  <input id="cmdin" type="text" autocomplete="off" spellcheck="false"
   placeholder="command — e.g. drive 0.2 0.2 · camera_aim 30 0 · light_head on · speed 0.15 · relax · stop"
-  style="flex:1;min-width:220px;padding:8px;border-radius:6px;border:0">
+  style="flex:1;min-width:200px;padding:8px;border-radius:6px;border:0">
  <button type="submit">Send</button>
+ <button type="button" onclick="addStep()">＋ Add to program</button>
  <button type="button" onclick="toggleHelp()">❔ Commands</button>
- <small id="cmdout">type a command, Enter to send (drive is a ~0.5s pulse)</small>
+ <small id="cmdout">Enter sends · ＋ adds it to the program below</small>
 </form>
 <div id="cmdhelp" class="help" style="display:none">
+ <small>click a command to load it into the box, then edit the numbers:</small>
  <table>
-  <tr><td>drive L R</td><td>drive, −1..1 (scaled by speed cap; ~0.5s pulse, then auto-stops)</td></tr>
-  <tr><td>move_forward|back|left|right [MS]</td><td>nudge for MS ms (default 400)</td></tr>
-  <tr><td>stop</td><td>stop the wheels</td></tr>
-  <tr><td>estop</td><td>emergency stop (wheels + gimbal)</td></tr>
-  <tr><td>camera_aim PAN TILT</td><td>aim camera (pan −180..180, tilt −45..90, + is up)</td></tr>
-  <tr><td>camera_up|down|left|right [DEG]</td><td>nudge camera (default 15°)</td></tr>
-  <tr><td>camera_center</td><td>re-center the camera</td></tr>
-  <tr><td>light_head|light_base [on|off]</td><td>no arg = toggle; or set on / off</td></tr>
-  <tr><td>relax / lock</td><td>relax / lock the gimbal servos (hand-position the camera)</td></tr>
-  <tr><td>speed CAP</td><td>set the speed cap, 0..0.5 (max wheel magnitude)</td></tr>
-  <tr><td>snapshot</td><td>take a photo</td></tr>
+  <tr><td onclick="pick('drive 0.2 0.2')">drive L R</td><td>drive, −1..1 (scaled by speed cap; ~0.5s pulse, then auto-stops)</td></tr>
+  <tr><td onclick="pick('move_forward 400')">move_forward|back|left|right [MS]</td><td>nudge for MS ms (default 400)</td></tr>
+  <tr><td onclick="pick('stop')">stop</td><td>stop the wheels</td></tr>
+  <tr><td onclick="pick('estop')">estop</td><td>emergency stop (wheels + gimbal)</td></tr>
+  <tr><td onclick="pick('camera_aim 0 0')">camera_aim PAN TILT</td><td>aim camera (pan −180..180, tilt −45..90, + is up)</td></tr>
+  <tr><td onclick="pick('camera_up 15')">camera_up|down|left|right [DEG]</td><td>nudge camera (default 15°)</td></tr>
+  <tr><td onclick="pick('camera_center')">camera_center</td><td>re-center the camera</td></tr>
+  <tr><td onclick="pick('light_head on')">light_head|light_base [on|off]</td><td>no arg = toggle; or set on / off</td></tr>
+  <tr><td onclick="pick('relax')">relax / lock</td><td>relax / lock the gimbal servos (hand-position the camera)</td></tr>
+  <tr><td onclick="pick('speed 0.15')">speed CAP</td><td>set the speed cap, 0..0.5 (max wheel magnitude)</td></tr>
+  <tr><td onclick="pick('snapshot')">snapshot</td><td>take a photo</td></tr>
  </table>
  <small>aliases: relax=gimbal_relax · lock=gimbal_lock · snap=snapshot · fwd=move_forward · back=move_back</small>
 </div>
+<div class="bar">
+ <b>Program</b>
+ <button onclick="runProgram()">▶ Run</button>
+ <button class="warn" onclick="stopProgram()">■ Stop</button>
+ <label>repeat <input id="reps" type="number" min="1" max="1000" value="1" style="width:4em;padding:6px;border-radius:6px;border:0"></label>
+ <label>gap <input id="gap" type="number" min="0" max="10" step="0.1" value="0.6" style="width:4em;padding:6px;border-radius:6px;border:0">s</label>
+ <button onclick="clearProg()">clear</button>
+ <button onclick="saveProg()">💾 Save</button>
+ <select id="saved" onchange="loadProg(this.value)" style="padding:6px;border-radius:6px;border:0"><option value="">load…</option></select>
+ <span id="progstat"><small>empty — build a sequence with ＋ Add</small></span>
+</div>
+<ol id="program" class="prog"></ol>
+<div style="max-width:640px;margin:0 auto;padding:0 12px"><small>press ■ Stop to end a running program — E-STOP halts motion but the loop keeps going</small></div>
 <div class="bar"><button class="warn" onclick="clearAll()">🗑 Clear all photos</button></div>
 <div class="grid" id="gallery"></div>
 <script>
@@ -1995,43 +2017,122 @@ const CMD_NOARG=['stop','estop','camera_center','gimbal_relax','gimbal_lock','sn
 function cout(m){document.getElementById('cmdout').textContent=m;}             // textContent: no XSS
 function cnum(s){const v=Number(s);return Number.isFinite(v)?v:null;}          // rejects '10abc'/NaN/Inf (empty tokens are gated by the arity checks)
 function toggleHelp(){const h=document.getElementById('cmdhelp');h.style.display=(h.style.display==='none')?'block':'none';}
-function runCmd(){
- const raw=document.getElementById('cmdin').value.trim();if(!raw)return;
- const t=raw.split(/\s+/);let c=(t[0]||'').toLowerCase();const a=t.slice(1);
+// parseCmd: raw text → {cmd,path} or {error}. Shared by the box and the program.
+function parseCmd(raw){
+ const t=raw.trim().split(/\s+/);let c=(t[0]||'').toLowerCase();const a=t.slice(1);
  c=CMD_ALIAS[c]||c;
  let qs=null;
  if(CMD_REQ[c]){const k=CMD_REQ[c];
-  if(a.length!==k.length)return cout('✗ '+c+' needs '+k.length+' number(s): '+k.join(' '));
-  qs=new URLSearchParams();for(let i=0;i<k.length;i++){const v=cnum(a[i]);if(v===null)return cout('✗ not a number: '+a[i]);qs.set(k[i],v);}
+  if(a.length!==k.length)return {error:c+' needs '+k.length+' number(s): '+k.join(' ')};
+  qs=new URLSearchParams();for(let i=0;i<k.length;i++){const v=cnum(a[i]);if(v===null)return {error:'not a number: '+a[i]};qs.set(k[i],v);}
  }else if(CMD_OPT[c]){
-  if(a.length>1)return cout('✗ '+c+' takes at most one number');
-  if(a.length===1){const v=cnum(a[0]);if(v===null)return cout('✗ not a number: '+a[0]);qs=new URLSearchParams();qs.set(CMD_OPT[c],v);}
+  if(a.length>1)return {error:c+' takes at most one number'};
+  if(a.length===1){const v=cnum(a[0]);if(v===null)return {error:'not a number: '+a[0]};qs=new URLSearchParams();qs.set(CMD_OPT[c],v);}
  }else if(CMD_LIGHT.includes(c)){
-  if(a.length>1)return cout('✗ '+c+' takes on|off or nothing');
+  if(a.length>1)return {error:c+' takes on|off or nothing'};
   if(a.length===1){const s=a[0].toLowerCase();
    if(s==='on'||s==='1'||s==='true'){qs=new URLSearchParams();qs.set('on',1);}
    else if(s==='off'||s==='0'||s==='false'){qs=new URLSearchParams();qs.set('on',0);}
-   else return cout('✗ '+c+' arg must be on|off');}
+   else return {error:c+' arg must be on|off'};}
  }else if(CMD_NOARG.includes(c)){
-  if(a.length)return cout('✗ '+c+' takes no args');
- }else return cout('✗ unknown command: '+t[0]);
- const path='/'+c+(qs?'?'+qs.toString():'');
+  if(a.length)return {error:c+' takes no args'};
+ }else return {error:'unknown command: '+t[0]};
+ return {cmd:c,path:'/'+c+(qs?'?'+qs.toString():'')};
+}
+// sendCommand: run one command; returns a Promise<bool ok> (awaited by the program).
+function sendCommand(raw,signal){
+ const p=parseCmd(raw);
+ if(p.error){cout('✗ '+p.error);return Promise.resolve(false);}
  cout('… '+raw);
- fetch(path,{method:'POST'}).then(r=>r.json().then(j=>({ok:r.ok,j})).catch(()=>({ok:r.ok,j:{}}))).then(function(res){
+ return fetch(p.path,{method:'POST',signal}).then(r=>r.json().then(j=>({ok:r.ok,j})).catch(()=>({ok:r.ok,j:{}}))).then(function(res){
   if(res.ok){let extra='';const j=res.j||{};
    if(j.cap!==undefined){extra=' (cap '+j.cap+')';syncCap(j.cap);}
    else if(j.pan!==undefined){extra=' (pan '+j.pan+' tilt '+j.tilt+')';}
    else if(j.on!==undefined){extra=' ('+(j.on?'on':'off')+')';}
    cout('✓ '+raw+extra);
-   if(c==='snapshot'){seen='';load();}
-  }else cout('✗ '+raw+' → '+((res.j&&res.j.error)||'HTTP error'));
- }).catch(e=>cout('✗ '+e));
- document.getElementById('cmdin').value='';
+   if(p.cmd==='snapshot'){seen='';load();}
+   return true;
+  }
+  cout('✗ '+raw+' → '+((res.j&&res.j.error)||'HTTP error'));return false;
+ }).catch(e=>{if(!e||e.name!=='AbortError')cout('✗ '+e);return false;});
 }
+function runCmd(){const el=document.getElementById('cmdin');const raw=el.value.trim();if(!raw)return;sendCommand(raw);el.value='';}
+function pick(tpl){const el=document.getElementById('cmdin');el.value=tpl;el.focus();}
+
+// ── program: a saved 'scratch' stack of commands (build, reorder, run, repeat) ─
+let prog=[], running=false, runGen=0, runAbort=null;
+const MIN_STEP_MS=60;   // floor so repeat×0-gap of instant steps can't hammer the server
+function renderProg(){
+ const ol=document.getElementById('program');
+ ol.innerHTML=prog.map((s,i)=>'<li><span></span>'+
+  '<button onclick="mv('+i+',-1)">↑</button><button onclick="mv('+i+',1)">↓</button>'+
+  '<button class="warn" onclick="rm('+i+')">×</button></li>').join('');
+ [...ol.children].forEach((li,i)=>{li.querySelector('span').textContent=(i+1)+'. '+prog[i];});   // textContent: no XSS
+ if(!running)document.getElementById('progstat').innerHTML='<small>'+(prog.length?prog.length+' step(s)':'empty — build a sequence with ＋ Add')+'</small>';
+}
+function addStep(){const el=document.getElementById('cmdin');const raw=el.value.trim();if(!raw)return;
+ const p=parseCmd(raw);if(p.error){cout('✗ '+p.error);return;}
+ prog.push(raw);renderProg();el.value='';cout('added: '+raw);}
+function rm(i){prog.splice(i,1);renderProg();}
+function mv(i,d){const j=i+d;if(j<0||j>=prog.length)return;[prog[i],prog[j]]=[prog[j],prog[i]];renderProg();}
+function clearProg(){if(prog.length&&confirm('Clear the program?')){prog=[];renderProg();}}
+function sleepMs(ms){return new Promise(r=>setTimeout(r,ms));}
+// motionMs: how long a step keeps the wheels moving, so we wait it out before the
+// next step (non-overlap). Must mirror the server: /drive auto-stops after
+// watchdogTTL (500ms in rovercontrol.go — keep in sync); /move_* self-stops after
+// its ms arg (nudge default 400, clamped 0..5000). Camera/light/etc = 0.
+function motionMs(raw){const p=parseCmd(raw);if(p.error||!p.cmd)return 0;const c=p.cmd;
+ if(c==='drive')return 500;
+ if(c==='move_forward'||c==='move_back'||c==='move_left'||c==='move_right'){
+  const m=Number(raw.trim().split(/\s+/)[1]);return Number.isFinite(m)?Math.max(0,Math.min(5000,m)):400;}
+ return 0;}
+async function runProgram(){
+ if(running||!prog.length)return;                          // ignore while running: Stop, then Run to restart
+ const my=++runGen; running=true;
+ const ac=(typeof AbortController!=='undefined')?new AbortController():null; runAbort=ac;
+ const steps=prog.slice();                                 // snapshot: mid-run edits can't corrupt the loop
+ const reps=Math.max(1,Math.min(1000,parseInt(document.getElementById('reps').value)||1));
+ const gap=Math.max(0,Math.min(10,parseFloat(document.getElementById('gap').value)||0))*1000;
+ const ol=document.getElementById('program');
+ const ps=document.getElementById('progstat');
+ const clearHi=()=>[...ol.children].forEach(li=>li.classList.remove('run'));
+ try{
+  for(let r=0;r<reps;r++){
+   for(let i=0;i<steps.length;i++){
+    if(my!==runGen)return;                                 // superseded / stopped
+    clearHi();if(ol.children[i])ol.children[i].classList.add('run');
+    ps.innerHTML='<small>rep '+(r+1)+'/'+reps+' · step '+(i+1)+'/'+steps.length+'</small>';
+    const ok=await sendCommand(steps[i],ac&&ac.signal);
+    if(my!==runGen)return;
+    if(!ok){ps.innerHTML='<small>stopped: step '+(i+1)+' failed</small>';return;}   // a failed step aborts
+    await sleepMs(Math.max(gap,motionMs(steps[i]),MIN_STEP_MS));
+   }
+  }
+  ps.innerHTML='<small>done</small>';
+ }finally{
+  // ownership-guarded: only THIS run (if still current) clears state + stops the
+  // wheels — a superseded/stopped old run must not stomp a newer run or re-/stop.
+  if(my===runGen){running=false;clearHi();fetch('/stop',{method:'POST'});}
+ }
+}
+function stopProgram(){runGen++;running=false;
+ if(runAbort)try{runAbort.abort();}catch(e){}                 // cancel any in-flight step request
+ [...document.getElementById('program').children].forEach(li=>li.classList.remove('run'));
+ fetch('/stop',{method:'POST'});cout('program stopped');      // + server drive-watchdog stops any leaked pulse (≤500ms)
+ document.getElementById('progstat').innerHTML='<small>stopped</small>';}
+// named programs saved in the browser (localStorage)
+function refreshSaved(){const sel=document.getElementById('saved');
+ const names=Object.keys(localStorage).filter(k=>k.indexOf('roverprog:')===0).map(k=>k.slice(10)).sort();
+ sel.innerHTML='<option value="">load…</option>';
+ names.forEach(n=>{const o=document.createElement('option');o.textContent=n;sel.appendChild(o);});}
+function saveProg(){if(!prog.length)return;const n=(prompt('Save program as:')||'').trim();if(!n)return;
+ localStorage.setItem('roverprog:'+n,JSON.stringify(prog));refreshSaved();cout('saved "'+n+'"');}
+function loadProg(n){if(!n)return;try{const p=JSON.parse(localStorage.getItem('roverprog:'+n));
+ if(Array.isArray(p)){prog=p.filter(x=>typeof x==='string');renderProg();cout('loaded "'+n+'"');}}catch(e){}}
 async function health(){try{const h=await(await fetch('/healthz')).json();
  document.getElementById('health').innerHTML='<small>serial '+(h.serial.up?'✓':'✗')+
  ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad.up?'✓':'–')+'</small>';}catch(e){}}
-setInterval(()=>{load();health();},2000);load();health();initCap();
+setInterval(()=>{load();health();},2000);load();health();initCap();renderProg();refreshSaved();
 
 // ── Mac-side gamepad: Gamepad API → existing HTTP endpoints (no server change).
 // Drive is in-flight-guarded and refreshed continuously while deflected (feeds
