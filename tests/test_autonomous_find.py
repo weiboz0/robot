@@ -42,6 +42,17 @@ class GateTest(unittest.TestCase):
         self.assertIn("vision not available", out)
         self.assertEqual(self.calls, [])                         # vision-first: no cap change, no motion
 
+    def test_find_shortcuts_table(self):
+        # $screwdriver and $pen are one-word shortcuts for $find <target>
+        self.assertEqual(agent_chat.FIND_SHORTCUTS.get("screwdriver"), "a screwdriver")
+        self.assertEqual(agent_chat.FIND_SHORTCUTS.get("pen"), "a pen")
+
+    def test_pen_shortcut_respects_disabled_gate(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            out = agent_chat.autonomous_find(FakeRover(), agent_chat.FIND_SHORTCUTS["pen"])
+        self.assertIn("DISABLED", out)
+        self.assertEqual(self.calls, [])
+
     def test_wrong_backend_makes_no_rover_contact(self):
         class SerialRover:
             backend = "serial"
