@@ -138,6 +138,13 @@ def rover_command(r: RoverCtl, line: str) -> str:
 
 
 # ------------------------------------------------- autonomous vision-find ($find)
+# One-word test shortcuts for $find — stop-and-photograph when the target is seen.
+FIND_SHORTCUTS = {
+    "screwdriver": "a screwdriver",
+    "pen": "a pen",
+}
+
+
 def autonomous_find(rover, target):
     """$find <obj> / $screwdriver: drive the rover autonomously to find `target`
     and return a photo. Camera-only safety (no cliff sensor) — see docs/plans/017.
@@ -379,8 +386,8 @@ def main():
                           "website names also work: camera_up/..., camera_aim, camera_center, snapshot,\n"
                           "  gimbal_relax/lock, light_head|light_base [on|off], move_forward/back/left/right [MS]\n"
                           "  (note: drive/fwd/back keep CHATBOT units here — seconds, speeds -0.5..0.5)\n"
-                          "autonomous:   find <object> / screwdriver  (drives itself; needs "
-                          "ROVER_FIND_ENABLE=1 + vision key — camera-only safety)\n"
+                          "autonomous:   find <object> / screwdriver / pen  (drives itself, stops +\n"
+                          "  photographs when it sees the target; needs ROVER_FIND_ENABLE=1 + vision key)\n"
                           "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
                 elif cmd.lower().startswith("dobot"):
                     raw = cmd[5:].strip()
@@ -392,8 +399,8 @@ def main():
                                   else arm.dashboard(raw))
                         except Exception as e:
                             print(f"  dobot error: {e}")
-                elif cmd.lower() == "screwdriver" or cmd.lower().startswith("find "):
-                    target = "a screwdriver" if cmd.lower() == "screwdriver" else cmd[5:].strip()
+                elif cmd.lower() in FIND_SHORTCUTS or cmd.lower().startswith("find "):
+                    target = FIND_SHORTCUTS.get(cmd.lower()) or cmd[5:].strip()
                     print(" ", autonomous_find(rover, target))
                 elif rover is not None:
                     print(" ", rover_command(rover, cmd))
