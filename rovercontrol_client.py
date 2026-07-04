@@ -159,6 +159,17 @@ def camera_nudge(direction: str, deg: float = 15.0, timeout: float | None = None
     _post("/camera_" + direction, {"deg": deg}, timeout=timeout)
 
 
+def set_photo_meta(name: str, meta: dict, timeout: float = 5.0) -> None:
+    """Store outline metadata for a photo — POST /photo_meta/<name> with a JSON
+    body {target,color,bbox,confidence}. The gallery's ◻ toggle reads it back."""
+    req = urllib.request.Request(
+        _base() + "/photo_meta/" + urllib.parse.quote(name),
+        data=json.dumps(meta).encode(), method="POST",
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        r.read()
+
+
 def get_photo(name: str, timeout: float = 5.0) -> bytes:
     """Fetch a photo's JPEG bytes — GET /photos/<name> (for the vision model)."""
     with urllib.request.urlopen(_base() + "/photos/" + urllib.parse.quote(name),

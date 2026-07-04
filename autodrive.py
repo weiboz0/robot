@@ -206,11 +206,40 @@ class SafeDriver:
 
 FIND_PROMPT = (
     "You are the eyes of a small floor rover looking for: {target}. "
-    "Reply ONLY with JSON: {{\"seen\": bool, \"bearing\": \"left\"|\"center\"|\"right\", "
-    "\"close\": bool, \"confidence\": 0..1, \"reason\": string}}. "
-    "bearing = horizontal position of the target in the frame. close = target is "
-    "within about one rover-length. If you are not sure the {target} is visible, "
+    "Reply ONLY with JSON: {{\"seen\": bool, \"bbox\": [x1, y1, x2, y2] or null, "
+    "\"bearing\": \"left\"|\"center\"|\"right\", \"close\": bool, \"color\": string, "
+    "\"confidence\": 0..1, \"reason\": string}}. "
+    "bbox = the target's bounding box as FRACTIONS of image width/height (0..1), "
+    "null if not seen. bearing = horizontal position of the target. close = target "
+    "is within about one rover-length. Report the object's actual color in "
+    "\"color\". Only set seen=true if the object CLEARLY matches the description "
+    "\"{target}\" — including its color, if the description names one. If unsure, "
     "set seen=false.")
+
+# Approach tuning: a valid bbox overrides the model's coarse flags. The rover
+# keeps creeping (floor-gated) until the target is big in frame — a better view
+# for identification — instead of trusting a vague `close` bool.
+# "close" uses the LARGER bbox dimension: an elongated floor object (a pen lying
+# sideways) is wide but tiny in height, so height alone might never trigger.
+CLOSE_BBOX_DIM = 0.25   # larger bbox dimension fraction that counts as "close"
+BEAR_LEFT, BEAR_RIGHT = 0.35, 0.65   # bbox center-x thresholds
+MAX_APPROACHES = 6      # after this many centered approaches, shoot anyway
+                        # (don't burn the whole budget if the size metric stalls)
+
+
+def _sane_bbox(b):
+    """Validate a model bbox: 4 finite fractions 0..1 with x1<x2, y1<y2 — else None."""
+    if not isinstance(b, (list, tuple)) or len(b) != 4:
+        return None
+    try:
+        v = [float(x) for x in b]
+    except (TypeError, ValueError):
+        return None
+    if any(x != x or x < 0.0 or x > 1.0 for x in v):     # NaN or out of range
+        return None
+    if not (v[0] < v[2] and v[1] < v[3]):
+        return None
+    return v
 
 FLOOR_PROMPT = (
     "This camera is aimed forward and downward at the floor directly ahead of a "
@@ -254,14 +283,28 @@ def look_for(vision, img, target):
     v.setdefault("bearing", "center")
     if v.get("bearing") not in ("left", "center", "right"):
         v["bearing"] = "center"
+    # A valid bbox overrides the coarse flags: bearing from its center-x, close
+    # from its LARGER dimension (measurable "big enough for a good look"; height
+    # alone fails for elongated floor objects). Garbage bbox → fall back to the
+    # model's flags (full backward compatibility).
+    bbox = _sane_bbox(v.get("bbox"))
+    v["bbox"] = bbox
+    if bbox is not None:
+        cx = (bbox[0] + bbox[2]) / 2.0
+        v["bearing"] = "left" if cx < BEAR_LEFT else "right" if cx > BEAR_RIGHT else "center"
+        v["close"] = max(bbox[2] - bbox[0], bbox[3] - bbox[1]) >= CLOSE_BBOX_DIM
     return v
 
 
-def find_object(driver, vision, target, *, capture, log=lambda m: None):
+def find_object(driver, vision, target, *, capture, log=lambda m: None,
+                on_found=None):
     """Autonomous find loop. `capture()` -> (name, jpeg_bytes) of a fresh frame
     (a saved snapshot). Returns the saved photo name on success, else None.
-    Motion happens ONLY through `driver` (bounded, safety-gated). Never raises for
-    normal give-up; the driver context guarantees the wheels stop on exit."""
+    On success the returned photo is the exact frame the model analyzed (no
+    camera recenter — the old recenter-then-shoot could tilt the target half out
+    of frame), the wheels are halted explicitly, and `on_found(name, obs)` is
+    called (e.g. to store the bbox outline metadata). Motion happens ONLY through
+    `driver` (bounded, safety-gated); the context guarantees a stop on exit."""
     def clearance():                       # fresh, forward-pointing near-floor check
         try:
             _, img = capture()
@@ -273,6 +316,7 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None):
         return ok
 
     vision_errors = 0
+    approaches = 0     # centered forward nudges toward the target (see MAX_APPROACHES)
     with driver:
         while True:
             try:
@@ -296,12 +340,20 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None):
             else:
                 vision_errors = 0
 
-            if (obs.get("seen") and obs.get("close") and obs.get("bearing") == "center"
+            # Found = seen, centered, confident, and EITHER big-enough in frame OR
+            # we've already approached it MAX_APPROACHES times (size metric can
+            # stall on odd-shaped objects — don't burn the whole budget).
+            if (obs.get("seen") and obs.get("bearing") == "center"
+                    and (obs.get("close") or approaches >= MAX_APPROACHES)
                     and _num(obs.get("confidence")) >= FOUND_MIN_CONF):
-                driver.center_camera()
-                shot = capture()[0]        # clean centered photo of the target
-                log(f"FOUND {target} -> {shot}")
-                return shot
+                driver.halt()              # stop THE INSTANT it's found (explicit)
+                log(f"FOUND {target} -> {name} (color: {obs.get('color', '?')})")
+                if on_found is not None:
+                    try:
+                        on_found(name, obs)   # e.g. save the bbox outline metadata
+                    except Exception as e:
+                        log(f"  (meta save failed: {e})")
+                return name                # the exact frame the model analyzed
 
             try:
                 if obs.get("seen"):
@@ -310,10 +362,13 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None):
                         driver.turn_left()
                     elif b == "right":
                         driver.turn_right()
-                    elif not driver.forward(clearance):   # centered but far → advance if floor clear
+                    elif driver.forward(clearance):       # centered but far → advance if floor clear
+                        approaches += 1
+                    else:
                         log("  path blocked ahead — turning to look for a way")
                         driver.turn_left()
                 else:
+                    approaches = 0         # lost sight → reset the approach fallback
                     driver.turn_left()     # not seen → rotate to scan (bounded by caps)
             except SafetyLimit as e:
                 log(f"budget/precondition hit: {e}")
