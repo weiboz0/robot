@@ -21,7 +21,7 @@ func doJSON(t *testing.T, app *App, method, path, body string) *httptest.Respons
 // Plan 020: photo_meta sidecars power the gallery's toggleable outline.
 func TestPhotoMetaRoundtrip(t *testing.T) {
 	app, _ := testApp(t)
-	body := `{"target":"a green pen","color":"green","bbox":[0.1,0.2,0.5,0.6],"confidence":0.9}`
+	body := `{"target":"a green pen","label":"green pen","color":"green","bbox":[0.1,0.2,0.5,0.6],"confidence":0.9}`
 	if w := doJSON(t, app, "POST", "/photo_meta/rover_x.jpg", body); w.Code != 200 {
 		t.Fatalf("POST meta: %d %s", w.Code, w.Body.String())
 	}
@@ -31,13 +31,14 @@ func TestPhotoMetaRoundtrip(t *testing.T) {
 	}
 	var m struct {
 		Target string    `json:"target"`
+		Label  string    `json:"label"`
 		Color  string    `json:"color"`
 		BBox   []float64 `json:"bbox"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.Target != "a green pen" || m.Color != "green" || len(m.BBox) != 4 || m.BBox[2] != 0.5 {
+	if m.Target != "a green pen" || m.Label != "green pen" || m.Color != "green" || len(m.BBox) != 4 || m.BBox[2] != 0.5 {
 		t.Fatalf("meta content: %+v", m)
 	}
 	// sidecar lives next to the photo and is removed with it
@@ -80,7 +81,7 @@ func TestPhotoMetaValidation(t *testing.T) {
 func TestWebUIHasOutlineToggle(t *testing.T) {
 	app, _ := testApp(t)
 	body := do(t, app, "GET", "/").Body.String()
-	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta("} {
+	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel("} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)
 		}

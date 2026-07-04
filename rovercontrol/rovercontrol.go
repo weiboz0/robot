@@ -1730,6 +1730,7 @@ func (app *App) routes() http.Handler {
 		}
 		var in struct {
 			Target     string    `json:"target"`
+			Label      string    `json:"label"`
 			Color      string    `json:"color"`
 			BBox       []float64 `json:"bbox"`
 			Confidence float64   `json:"confidence"`
@@ -1755,7 +1756,8 @@ func (app *App) routes() http.Handler {
 			return s
 		}
 		out, _ := json.Marshal(map[string]any{
-			"target": trunc(in.Target, 100), "color": trunc(in.Color, 40),
+			"target": trunc(in.Target, 100), "label": trunc(in.Label, 32),
+			"color": trunc(in.Color, 40),
 			"bbox": in.BBox, "confidence": clamp(in.Confidence, 0, 1),
 		})
 		if err := os.WriteFile(filepath.Join(app.photoDir, name+".meta.json"), out, 0o644); err != nil {
@@ -1944,6 +1946,8 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  figure a{position:relative;display:block}
  figure img{width:100%;display:block;aspect-ratio:4/3;object-fit:cover}
  .obox{position:absolute;border:1px solid rgba(90,255,90,.95);pointer-events:none}
+ .obox span{position:absolute;right:-1px;top:100%;background:rgba(0,0,0,.6);color:#9f9;
+   font-size:10px;line-height:1.4;padding:0 3px;white-space:nowrap;border-radius:0 0 3px 3px}
  .lb{position:fixed;inset:0;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;z-index:10}
  .lbwrap{position:relative;display:inline-block}
  .lbwrap img{max-width:92vw;max-height:88vh;display:block}
@@ -2069,6 +2073,12 @@ async function fetchMeta(n){
  try{const r=await fetch('/photo_meta/'+encodeURIComponent(n));if(r.ok)return await r.json();}catch(e){}
  return null;
 }
+// small label at the outline's bottom-right (e.g. "green pen"); textContent: no XSS
+function boxLabel(d,m){
+ const txt=(m&&(m.label||m.target))||'';
+ if(!txt)return;
+ const s=document.createElement('span');s.textContent=txt;d.appendChild(s);
+}
 // click a photo → zoomed lightbox with the outline + its toggle (plan 021 UX).
 // The wrapper hugs the displayed image exactly, so bbox fractions map straight
 // to % — no cover-crop math needed here. Esc / background click closes.
@@ -2086,6 +2096,7 @@ async function lightbox(n){
   d.style.left=(b[0]*100)+'%';d.style.top=(b[1]*100)+'%';
   d.style.width=((b[2]-b[0])*100)+'%';d.style.height=((b[3]-b[1])*100)+'%';
   if(m.target||m.color)d.title=(m.target||'')+(m.color?' ('+m.color+')':'');
+  boxLabel(d,m);
   wrap.appendChild(d);
   const t=document.createElement('button');t.textContent='◼ outline';
   t.onclick=()=>{const on=d.style.display!=='none';d.style.display=on?'none':'block';
@@ -2126,6 +2137,7 @@ async function outline(btn,n){
  d.style.left=(p[0]*100)+'%';d.style.top=(p[1]*100)+'%';
  d.style.width=(p[2]*100)+'%';d.style.height=(p[3]*100)+'%';
  if(m.target||m.color)d.title=(m.target||'')+(m.color?' ('+m.color+')':'');  // title property: no HTML
+ boxLabel(d,m);
  a.appendChild(d);btn.textContent='◼';
 }
 async function del(n){await fetch('/delete_photo/'+encodeURIComponent(n),{method:'POST'});seen='';load();}
