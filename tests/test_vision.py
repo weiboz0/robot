@@ -40,6 +40,20 @@ class VisionConfigTest(unittest.TestCase):
             vm = vision.VisionModel(client=FakeClient("{}"))
             self.assertEqual(vm.provider, "openrouter")
 
+    def test_autodetect_uses_opencode_chat_key(self):
+        # The chatbot's own zen key serves vision (qwen3.6-plus) — no extra key needed.
+        with mock.patch.dict(os.environ, {"OPENCODE_API_KEY": "x", "ARK_API_KEY": "y"}, clear=True):
+            vm = vision.VisionModel(client=FakeClient("{}"))
+        self.assertEqual(vm.provider, "opencode")
+        self.assertEqual(vm.model, "qwen3.6-plus")
+        self.assertIn("opencode.ai", vm.base_url)
+
+    def test_opencode_honors_custom_base_url(self):
+        env = {"OPENCODE_API_KEY": "x", "OPENCODE_BASE_URL": "https://my.gateway/v1"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            vm = vision.VisionModel(client=FakeClient("{}"))
+        self.assertEqual(vm.base_url, "https://my.gateway/v1")
+
 
 class VisionCallTest(unittest.TestCase):
     def test_describe_sends_image_and_returns_text(self):
