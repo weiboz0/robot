@@ -167,25 +167,29 @@ def autonomous_find(rover, target):
     def capture():
         n = client.snapshot()
         return n, client.get_photo(n)
+    import detector as _detector
+    label = _detector.label_for_target(target)   # e.g. "green pen" — shown at the outline
     found_obs = {}
     def on_found(name, obs):                # store the bbox so the gallery can outline it
         found_obs.update(obs)
         if obs.get("bbox"):
             client.set_photo_meta(name, {
-                "target": target, "color": str(obs.get("color") or ""),
+                "target": target, "label": label,
+                "color": str(obs.get("color") or ""),
                 "bbox": obs["bbox"], "confidence": float(obs.get("confidence") or 0)})
     # Target detection: local CV when the target names a color and OpenCV is
     # available (milliseconds, no gateway); otherwise the vision LLM. The
     # floor-safety gate always stays with the LLM (fail-closed) either way.
+    # The shape prior comes from the object word (pen=elongated, cup=compact).
     look = None
     det_kind = "llm"
     try:
-        import detector as _detector
         color = _detector.color_for_target(target)
+        shape = _detector.shape_for_target(target)
         if color and _detector.available():
             look = lambda name, img: autodrive.obs_from_detection(
-                _detector.detect_color_object(img, color), color)
-            det_kind = f"cv:{color}"
+                _detector.detect_color_object(img, color, shape), color)
+            det_kind = f"cv:{color}:{shape}"
     except Exception:
         pass
     print(f"   detector: {det_kind}")

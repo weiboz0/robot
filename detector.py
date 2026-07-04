@@ -57,12 +57,39 @@ def color_for_target(target: str) -> "str | None":
     return None
 
 
-def detect_color_object(jpeg_bytes: bytes, color: str) -> "dict | None":
+# Shape priors by object word: elongated things score by elongation (a pen lying
+# sideways), compact things by squareness. Unknown objects get a neutral factor.
+SHAPE_WORDS = {
+    "elongated": ("pen", "pencil", "marker", "screwdriver", "stick", "ruler",
+                  "spoon", "fork", "knife", "brush", "cable", "wrench"),
+    "compact": ("ball", "cup", "mug", "box", "book", "note", "block", "cube",
+                "toy", "sock", "shoe", "eraser", "coaster", "lid"),
+}
+
+
+def shape_for_target(target: str) -> str:
+    """'elongated' | 'compact' | 'any' from the object word in the target."""
+    words = (target or "").lower().replace(",", " ").split()
+    for shape, nouns in SHAPE_WORDS.items():
+        if any(w.rstrip("s") in nouns for w in words):
+            return shape
+    return "any"
+
+
+def label_for_target(target: str) -> str:
+    """A short display label: the target minus articles (e.g. 'green pen')."""
+    words = [w for w in (target or "").split() if w.lower() not in ("a", "an", "the")]
+    return " ".join(words)[:32]
+
+
+def detect_color_object(jpeg_bytes: bytes, color: str, shape: str = "elongated") -> "dict | None":
     """Best <color> object candidate in the frame.
 
-    Returns {"bbox": [x1,y1,x2,y2] fractions, "score": 0..1-ish, "elong": float,
-    "mean_sat": int} or None. Raises ValueError for an unknown color and
-    ImportError if cv2/numpy are unavailable (callers check available()).
+    `shape` tunes the prior: "elongated" (pen-like — the original tuning),
+    "compact" (cup/note-like), or "any" (neutral). Returns {"bbox": [x1,y1,x2,y2]
+    fractions, "score": 0..1-ish, "elong": float, "mean_sat": int} or None.
+    Raises ValueError for an unknown color and ImportError if cv2/numpy are
+    unavailable (callers check available()).
     """
     import cv2
     import numpy as np
@@ -103,7 +130,13 @@ def detect_color_object(jpeg_bytes: bytes, color: str) -> "dict | None":
             continue
         elong = max(rw, rh) / max(1.0, min(rw, rh))
         fill = area / max(1.0, rw * rh)
-        score = (min(1.0, frac * 1500) * min(elong / 3.0, 1.0)
+        if shape == "elongated":
+            shape_f = min(elong / 3.0, 1.0)      # long+thin scores best
+        elif shape == "compact":
+            shape_f = min(2.5 / elong, 1.0)      # squarish scores best
+        else:
+            shape_f = 0.75                        # neutral prior
+        score = (min(1.0, frac * 1500) * shape_f
                  * max(fill, 0.3) * min(mean_sat / SAT_NORM, 1.0))
         cand = {"bbox": [round(v, 4) for v in b], "score": round(score, 3),
                 "elong": round(elong, 2), "mean_sat": int(mean_sat)}

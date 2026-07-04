@@ -78,7 +78,35 @@ class DetectorTest(unittest.TestCase):
             detector.detect_color_object(b"xx", "chartreuse")
 
 
+@unittest.skipUnless(cv2 is not None, "opencv not installed")
+class ShapeTest(unittest.TestCase):
+    def test_compact_shape_prefers_square(self):
+        # a square note vs an elongated strip: compact prior picks the square
+        def draw(im):
+            cv2.rectangle(im, (150, 290), (200, 340), (40, 170, 25), -1)   # square (note)
+            cv2.rectangle(im, (400, 300), (520, 315), (40, 170, 25), -1)   # long strip
+        d = detector.detect_color_object(frame(draw), "green", "compact")
+        self.assertLess((d["bbox"][0] + d["bbox"][2]) / 2, 0.5)            # square wins
+        d2 = detector.detect_color_object(frame(draw), "green", "elongated")
+        self.assertGreater((d2["bbox"][0] + d2["bbox"][2]) / 2, 0.5)       # strip wins
+
+    def test_default_shape_is_elongated(self):
+        # backward compatible: the pen tuning is the default
+        jpg = frame(lambda im: cv2.rectangle(im, (300, 300), (390, 318), (40, 160, 30), -1))
+        self.assertIsNotNone(detector.detect_color_object(jpg, "green"))
+
+
 class TargetColorTest(unittest.TestCase):
+    def test_shape_for_target(self):
+        self.assertEqual(detector.shape_for_target("a green pen"), "elongated")
+        self.assertEqual(detector.shape_for_target("the yellow note"), "compact")
+        self.assertEqual(detector.shape_for_target("a red cup"), "compact")
+        self.assertEqual(detector.shape_for_target("a blue thing"), "any")
+
+    def test_label_for_target(self):
+        self.assertEqual(detector.label_for_target("a green pen"), "green pen")
+        self.assertEqual(detector.label_for_target("the yellow note"), "yellow note")
+
     def test_color_for_target(self):
         self.assertEqual(detector.color_for_target("a green pen"), "green")
         self.assertEqual(detector.color_for_target("the RED cup"), "red")
