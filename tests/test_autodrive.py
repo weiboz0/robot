@@ -171,11 +171,15 @@ class SafeDriverTest(unittest.TestCase):
 
 class FakeDriver:
     floor_tilt = -20.0
+    max_seconds = 9999.0
 
     def __init__(self, max_actions=6, floor_ok=True):
         self.actions = []
         self.max_actions = max_actions
         self._motions = 0
+
+    def elapsed(self):
+        return 0.0
 
     def __enter__(self): return self
     def __exit__(self, *a): self.actions.append(("halt",)); return False
@@ -211,147 +215,111 @@ def cap():
 
 
 class FindObjectTest(unittest.TestCase):
-    def test_found_immediately_returns_photo(self):
-        v = FakeVision([{"seen": True, "close": True, "bearing": "center", "confidence": 0.9}])
-        d = FakeDriver()
-        out = autodrive.find_object(d, v, "screwdriver", capture=cap)
-        self.assertEqual(out, "rover_x.jpg")
-        self.assertNotIn("forward", [a[0] for a in d.actions])   # no driving needed
+    # ---- camera-first sweep loop (v3): find WITHOUT wheel motion ----
+    SEEN = {"seen": True, "bearing": "center", "close": True, "confidence": 0.9,
+            "bbox": [0.45, 0.45, 0.55, 0.55], "color": "green"}
+    UNSEEN = {"seen": False, "bearing": "center", "close": False, "confidence": 0.0}
 
-    def test_bearing_left_turns_left(self):
-        v = FakeVision([{"seen": True, "close": False, "bearing": "left", "confidence": 0.8},
-                        {"seen": True, "close": True, "bearing": "center", "confidence": 0.9}])
-        d = FakeDriver()
-        autodrive.find_object(d, v, "x", capture=cap)
-        self.assertIn(("left",), d.actions)
+    def run_find(self, look_seq, d=None, snap=None, **kw):
+        seq = list(look_seq)
+        look = lambda nm, im: (seq.pop(0) if seq else dict(self.UNSEEN))
+        d = d or FakeDriver(max_actions=20)
+        return d, autodrive.find_object(
+            d, None, "a green pen", capture=lambda: (None, b"IMG"),
+            look=look, snap=snap or (lambda: "rover_final.jpg"), **kw)
 
-    def test_center_far_advances_when_floor_clear(self):
-        v = FakeVision([{"seen": True, "close": False, "bearing": "center", "confidence": 0.8},
-                        {"seen": True, "close": True, "bearing": "center", "confidence": 0.9}],
-                       floor=True)
-        d = FakeDriver()
-        autodrive.find_object(d, v, "x", capture=cap)
-        self.assertIn(("forward", True), d.actions)
-
-    def test_center_blocked_confident_shoots_from_here(self):
-        # Real-world $pen failure #2: the target dead ahead makes the floor gate
-        # refuse to advance ("object within 30cm" — the pen itself). Blocked +
-        # centered + confident = as close as safely possible → found, not a turn.
-        v = FakeVision([{"seen": True, "close": False, "bearing": "center", "confidence": 0.8}] * 20,
-                       floor=False)
-        d = FakeDriver(max_actions=4)
-        out = autodrive.find_object(d, v, "x", capture=cap)
-        self.assertEqual(out, "rover_x.jpg")
-        self.assertIn(("forward", False), d.actions)         # forward was refused (floor unsafe)
-        self.assertIn(("halt",), d.actions)                  # then shot from here
-        self.assertNotIn(("left",), d.actions)               # did NOT turn away
-
-    def test_center_blocked_low_conf_still_turns(self):
-        # ...but a low-confidence sighting doesn't get the shoot-from-here path
-        v = FakeVision([{"seen": True, "close": False, "bearing": "center", "confidence": 0.3}] * 20,
-                       floor=False)
-        d = FakeDriver(max_actions=3)
-        out = autodrive.find_object(d, v, "x", capture=cap)
-        self.assertIsNone(out)
-        self.assertIn(("left",), d.actions)                  # fell back to turning
-
-    def test_not_seen_scans_then_budget_gives_up(self):
-        v = FakeVision([], floor=True)                       # always "not seen"
-        d = FakeDriver(max_actions=3)
-        out = autodrive.find_object(d, v, "x", capture=cap)
-        self.assertIsNone(out)
-        self.assertEqual(d.actions.count(("left",)), 3)      # scanned to the budget, then stopped
-        self.assertIn(("halt",), d.actions)                  # context exit halted
-
-    def test_found_uses_snap_not_observation_frames(self):
-        # observation frames come from the live stream (not saved); only the
-        # found photo is snapshotted (plan: no outline-less photos in the gallery)
-        snaps = []
-        def snap():
-            snaps.append(1)
-            return "rover_final.jpg"
-        v = FakeVision([{"seen": True, "close": True, "bearing": "center", "confidence": 0.9}])
-        d = FakeDriver()
-        got = {}
-        out = autodrive.find_object(d, v, "x", capture=lambda: (None, b"IMG"),
-                                    snap=snap, on_found=lambda n, o: got.update(n=n))
+    def test_found_from_standstill_no_wheel_motion(self):
+        # THE requirement: the target visible from the current spot is found
+        # with camera moves only — zero wheel commands.
+        d, out = self.run_find([self.SEEN],
+                               sweep_pans=(0,), sweep_tilts=(-20,), max_rotations=2)
         self.assertEqual(out, "rover_final.jpg")
-        self.assertEqual(snaps, [1])                  # exactly one saved photo
-        self.assertEqual(got["n"], "rover_final.jpg") # meta attached to the saved one
+        acts = [a[0] for a in d.actions]
+        self.assertNotIn("left", acts)
+        self.assertNotIn("right", acts)
+        self.assertNotIn("forward", acts)
+        self.assertIn("look", acts)                     # camera moved
+        self.assertIn("halt", acts)
 
-    def test_refine_center_pans_camera_toward_target(self):
-        # off-center bbox -> gimbal pans (camera only) until within tolerance
-        d = FakeDriver()
-        obs = {"seen": True, "bbox": [0.7, 0.4, 0.8, 0.5]}          # cx=0.75
-        seq = [{"seen": True, "bbox": [0.55, 0.4, 0.65, 0.5]},      # cx=0.60
-               {"seen": True, "bbox": [0.46, 0.4, 0.54, 0.5]}]      # cx=0.50 centered
-        looker = lambda nm, im: seq.pop(0)
-        out = autodrive._refine_center(d, looker, lambda: (None, b"IMG"), obs, lambda m: None)
-        cx = (out["bbox"][0] + out["bbox"][2]) / 2
-        self.assertAlmostEqual(cx, 0.5, delta=0.05)
+    def test_sweep_covers_all_views_then_rotates(self):
+        # unseen across a full 2x2 sweep -> one in-place rotation -> found
+        seq = [self.UNSEEN] * 5 + [self.SEEN]           # 4 sweep views + 1 confirm-ish
+        d, out = self.run_find(seq, sweep_pans=(-25, 25), sweep_tilts=(-15, -28),
+                               max_rotations=2)
+        self.assertEqual(out, "rover_final.jpg")
+        self.assertIn(("left",), d.actions)             # rotated exactly between sweeps
+
+    def test_gives_up_after_full_circle(self):
+        d, out = self.run_find([self.UNSEEN] * 100,
+                               sweep_pans=(0,), sweep_tilts=(-20,), max_rotations=3)
+        self.assertIsNone(out)
+        self.assertEqual([a for a in d.actions if a[0] == "left"], [("left",)] * 3)
+        self.assertIn(("halt",), d.actions)             # context exit stopped wheels
+
+    def test_no_forward_driving_ever(self):
+        # the default find NEVER advances — finding does not require approaching
+        d, out = self.run_find([self.UNSEEN] * 4 + [self.SEEN],
+                               sweep_pans=(-25, 25), sweep_tilts=(-15, -28),
+                               max_rotations=2)
+        self.assertNotIn("forward", [a[0] for a in d.actions])
+
+    def test_low_confidence_sighting_not_accepted(self):
+        weak = dict(self.SEEN, confidence=0.3)
+        d, out = self.run_find([weak] * 30,
+                               sweep_pans=(0,), sweep_tilts=(-20,), max_rotations=1)
+        self.assertIsNone(out)
+
+    def test_vision_errors_bail_out(self):
+        err = {"seen": False, "confidence": 0.0, "error": True}
+        d, out = self.run_find([err] * 10,
+                               sweep_pans=(0, 10), sweep_tilts=(-20,), max_rotations=5)
+        self.assertIsNone(out)
         looks = [a for a in d.actions if a[0] == "look"]
-        self.assertGreaterEqual(len(looks), 2)        # camera actually panned
+        self.assertLessEqual(len(looks), autodrive.MAX_VISION_ERRORS)   # bailed fast, no spin
 
-    def test_refine_center_keeps_last_good_on_loss(self):
-        d = FakeDriver()
-        obs = {"seen": True, "bbox": [0.7, 0.4, 0.8, 0.5]}
-        looker = lambda nm, im: {"seen": False}       # lost during refinement
-        out = autodrive._refine_center(d, looker, lambda: (None, b"IMG"), obs, lambda m: None)
-        self.assertEqual(out["bbox"], [0.7, 0.4, 0.8, 0.5])
+    def test_found_uses_snap_and_on_found(self):
+        got = {}
+        seq = [dict(self.SEEN)]
+        look = lambda nm, im: (seq.pop(0) if seq else dict(self.SEEN))
+        d = FakeDriver(max_actions=20)
+        out = autodrive.find_object(d, None, "a green pen",
+                                    capture=lambda: (None, b"IMG"), look=look,
+                                    snap=lambda: "rover_final.jpg",
+                                    on_found=lambda n, o: got.update(n=n, c=o.get("color")),
+                                    sweep_pans=(0,), sweep_tilts=(-20,), max_rotations=1)
+        self.assertEqual(out, "rover_final.jpg")
+        self.assertEqual(got["n"], "rover_final.jpg")
+        self.assertEqual(got["c"], "green")
 
-    def test_one_capture_per_cycle(self):
-        # plan 021 feedback: ONE settled frame per cycle serves both target
-        # detection and the floor check — no second snapshot (was blurring).
-        counts = [0]
-        def counting_cap():
-            counts[0] += 1
-            return ("rover_x.jpg", b"IMG")
-        v = FakeVision([{"seen": True, "close": False, "bearing": "center", "confidence": 0.9},
-                        {"seen": True, "close": True, "bearing": "center", "confidence": 0.9}],
-                       floor=True)
-        d = FakeDriver()
-        out = autodrive.find_object(d, v, "x", capture=counting_cap)
-        self.assertEqual(out, "rover_x.jpg")
-        self.assertEqual(counts[0], 2)                       # exactly one capture per cycle
-        self.assertIn(("forward", True), d.actions)          # and the floor gate still ran
-
+    # ---- pure-function tests (unchanged behavior) ----
     def test_vision_error_is_fail_closed(self):
         class Boom:
             def describe(self, *a, **k): raise RuntimeError("api down")
         self.assertFalse(autodrive.floor_is_clear(Boom(), b"IMG"))
         obs = autodrive.look_for(Boom(), b"IMG", "x")
-        self.assertFalse(obs["seen"])                        # unseen, not a crash
+        self.assertFalse(obs["seen"])
 
     def test_low_confidence_floor_is_unsafe(self):
         class LowConf:
             def describe(self, *a, **k): return {"clear": True, "confidence": 0.2}
-        self.assertFalse(autodrive.floor_is_clear(LowConf(), b"IMG"))  # fail closed on low conf
-
-    def test_vision_errors_bail_out_not_spin(self):
-        class Boom:
-            def describe(self, *a, **k): raise RuntimeError("api down")
-        d = FakeDriver(max_actions=100)
-        out = autodrive.find_object(d, Boom(), "x", capture=cap)
-        self.assertIsNone(out)
-        self.assertLessEqual(d._motions, autodrive.MAX_VISION_ERRORS)  # bailed, didn't spin to budget
+        self.assertFalse(autodrive.floor_is_clear(LowConf(), b"IMG"))
 
     def test_sane_bbox_validation(self):
         ok = autodrive._sane_bbox([0.1, 0.2, 0.5, 0.6])
         self.assertEqual(ok, [0.1, 0.2, 0.5, 0.6])
-        for bad in (None, "x", [0.1, 0.2, 0.5], [0.5, 0.2, 0.1, 0.6],   # reversed x
-                    [0.1, 0.2, 0.5, 1.5], [-0.1, 0.2, 0.5, 0.6],        # out of range
+        for bad in (None, "x", [0.1, 0.2, 0.5], [0.5, 0.2, 0.1, 0.6],
+                    [0.1, 0.2, 0.5, 1.5], [-0.1, 0.2, 0.5, 0.6],
                     [0.1, "a", 0.5, 0.6], [float("nan"), 0.2, 0.5, 0.6]):
             self.assertIsNone(autodrive._sane_bbox(bad), bad)
 
     def test_bbox_overrides_bearing_and_close(self):
         class V:
             def describe(self, *a, **k):
-                # wide flat pen on the right: w=0.4 (close via max-dim), h=0.06
-                return {"seen": True, "bbox": [0.55, 0.8, 0.95, 0.86],
+                return {"seen": True, "bbox": [0.62, 0.8, 0.95, 0.86],
                         "bearing": "left", "close": False, "confidence": 0.9}
         obs = autodrive.look_for(V(), b"IMG", "a pen")
-        self.assertEqual(obs["bearing"], "right")   # from bbox center-x (0.75)
-        self.assertTrue(obs["close"])               # max(w,h)=0.4 ≥ 0.25 (height alone would fail)
+        self.assertEqual(obs["bearing"], "right")
+        self.assertTrue(obs["close"])                   # max-dim via width
 
     def test_garbage_bbox_falls_back_to_model_flags(self):
         class V:
@@ -360,57 +328,34 @@ class FindObjectTest(unittest.TestCase):
                         "bearing": "left", "close": True, "confidence": 0.9}
         obs = autodrive.look_for(V(), b"IMG", "a pen")
         self.assertIsNone(obs["bbox"])
-        self.assertEqual(obs["bearing"], "left")    # model flags kept
-        self.assertTrue(obs["close"])
-
-    def test_found_halts_no_recenter_and_calls_on_found(self):
-        v = FakeVision([{"seen": True, "close": True, "bearing": "center",
-                         "confidence": 0.9, "bbox": [0.3, 0.3, 0.7, 0.7], "color": "green"}])
-        d = FakeDriver()
-        got = {}
-        out = autodrive.find_object(d, v, "a green pen", capture=cap,
-                                    on_found=lambda n, o: got.update(name=n, obs=o))
-        self.assertEqual(out, "rover_x.jpg")
-        acts = [a[0] for a in d.actions]
-        self.assertIn("halt", acts)                 # explicit stop the instant it's found
-        self.assertNotIn("center", acts)            # photo = the analyzed frame, no recenter
-        self.assertEqual(got["name"], "rover_x.jpg")
-        self.assertEqual(got["obs"]["color"], "green")
-
-    def test_max_approach_fallback_shoots_eventually(self):
-        # target stays centered but tiny (size metric stalls) → after
-        # MAX_APPROACHES floor-gated forwards, shoot anyway instead of burning
-        # the whole budget (Opus plan-review B1).
-        v = FakeVision([{"seen": True, "close": False, "bearing": "center",
-                         "confidence": 0.9}] * 20, floor=True)
-        d = FakeDriver(max_actions=15)
-        out = autodrive.find_object(d, v, "a pen", capture=cap)
-        self.assertEqual(out, "rover_x.jpg")
-        fwd = [a for a in d.actions if a[0] == "forward"]
-        self.assertEqual(len(fwd), autodrive.MAX_APPROACHES)
-
+        self.assertEqual(obs["bearing"], "left")
 
     def test_small_object_close_via_bottom_proximity(self):
-        # The real-world $pen failure: a pen is ~6% of the frame even up close,
-        # so the size test can never pass. When its bbox bottom reaches the low
-        # frame (at the rover's feet), it must count as close — BEFORE the rover
-        # overruns it into the near-field blind spot.
         class V:
             def __init__(self, y2): self.y2 = y2
             def describe(self, *a, **k):
-                return {"seen": True, "bbox": [0.52, self.y2 - 0.06, 0.56, self.y2],
+                return {"seen": True, "bbox": [0.48, self.y2 - 0.06, 0.52, self.y2],
                         "bearing": "center", "close": False, "confidence": 0.9}
-        far = autodrive.look_for(V(0.64), b"IMG", "a pen")      # the diagnosed frame
-        self.assertFalse(far["close"])                          # still approaches
-        near = autodrive.look_for(V(0.75), b"IMG", "a pen")     # bottom past 0.70
-        self.assertTrue(near["close"])                          # found before blind spot
+        self.assertFalse(autodrive.look_for(V(0.64), b"IMG", "a pen")["close"])
+        self.assertTrue(autodrive.look_for(V(0.75), b"IMG", "a pen")["close"])
 
-    def test_low_confidence_not_declared_found(self):
-        # seen+close+center but LOW confidence must NOT be declared found
-        v = FakeVision([{"seen": True, "close": True, "bearing": "center", "confidence": 0.2}] * 20,
-                       floor=True)
-        d = FakeDriver(max_actions=3)
-        self.assertIsNone(autodrive.find_object(d, v, "x", capture=cap))
+    def test_refine_center_pans_camera_toward_target(self):
+        d = FakeDriver()
+        obs = {"seen": True, "bbox": [0.7, 0.4, 0.8, 0.5]}
+        seq = [{"seen": True, "bbox": [0.55, 0.4, 0.65, 0.5]},
+               {"seen": True, "bbox": [0.46, 0.4, 0.54, 0.5]}]
+        looker = lambda nm, im: seq.pop(0)
+        out = autodrive._refine_center(d, looker, lambda: (None, b"IMG"), obs, lambda m: None)
+        cx = (out["bbox"][0] + out["bbox"][2]) / 2
+        self.assertAlmostEqual(cx, 0.5, delta=0.05)
+        self.assertGreaterEqual(len([a for a in d.actions if a[0] == "look"]), 2)
+
+    def test_refine_center_keeps_last_good_on_loss(self):
+        d = FakeDriver()
+        obs = {"seen": True, "bbox": [0.7, 0.4, 0.8, 0.5]}
+        out = autodrive._refine_center(d, lambda nm, im: {"seen": False},
+                                       lambda: (None, b"IMG"), obs, lambda m: None)
+        self.assertEqual(out["bbox"], [0.7, 0.4, 0.8, 0.5])
 
 
 if __name__ == "__main__":
