@@ -170,6 +170,8 @@ class SafeDriverTest(unittest.TestCase):
 # ───────────────────────── find_object loop logic ──────────────────────────
 
 class FakeDriver:
+    floor_tilt = -20.0
+
     def __init__(self, max_actions=6, floor_ok=True):
         self.actions = []
         self.max_actions = max_actions
@@ -260,6 +262,22 @@ class FindObjectTest(unittest.TestCase):
         self.assertIsNone(out)
         self.assertEqual(d.actions.count(("left",)), 3)      # scanned to the budget, then stopped
         self.assertIn(("halt",), d.actions)                  # context exit halted
+
+    def test_one_capture_per_cycle(self):
+        # plan 021 feedback: ONE settled frame per cycle serves both target
+        # detection and the floor check — no second snapshot (was blurring).
+        counts = [0]
+        def counting_cap():
+            counts[0] += 1
+            return ("rover_x.jpg", b"IMG")
+        v = FakeVision([{"seen": True, "close": False, "bearing": "center", "confidence": 0.9},
+                        {"seen": True, "close": True, "bearing": "center", "confidence": 0.9}],
+                       floor=True)
+        d = FakeDriver()
+        out = autodrive.find_object(d, v, "x", capture=counting_cap)
+        self.assertEqual(out, "rover_x.jpg")
+        self.assertEqual(counts[0], 2)                       # exactly one capture per cycle
+        self.assertIn(("forward", True), d.actions)          # and the floor gate still ran
 
     def test_vision_error_is_fail_closed(self):
         class Boom:

@@ -1943,7 +1943,11 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  figure{margin:0;background:#1c1c1c;border-radius:8px;overflow:hidden}
  figure a{position:relative;display:block}
  figure img{width:100%;display:block;aspect-ratio:4/3;object-fit:cover}
- .obox{position:absolute;border:2px solid #4f4;box-shadow:0 0 0 1px #000;pointer-events:none}
+ .obox{position:absolute;border:1px solid rgba(90,255,90,.95);pointer-events:none}
+ .lb{position:fixed;inset:0;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;z-index:10}
+ .lbwrap{position:relative;display:inline-block}
+ .lbwrap img{max-width:92vw;max-height:88vh;display:block}
+ .lbbar{position:fixed;top:10px;right:14px;display:flex;gap:8px;z-index:11}
  figcaption{font-size:10px;padding:5px;display:flex;justify-content:space-between;gap:5px;word-break:break-all}
  small{color:#999}
  .help{max-width:640px;margin:6px auto;background:#1c1c1c;border-radius:8px;padding:10px 12px;font-size:13px}
@@ -2057,9 +2061,43 @@ async function load(){
  if(key===seen)return; seen=key;
  const p=await(await fetch('/photos')).json();
  document.getElementById('gallery').innerHTML=(p.photos||[]).map(n=>
-  '<figure><a href="/photos/'+n+'" target="_blank"><img loading="lazy" src="/photos/'+n+'"></a>'+
+  '<figure><a href="/photos/'+n+'" onclick="lightbox(\''+n+'\');return false"><img loading="lazy" src="/photos/'+n+'"></a>'+
   '<figcaption><span>'+n+'</span><button onclick="outline(this,\''+n+'\')" title="toggle found-object outline">◻</button>'+
   '<button class="warn" onclick="del(\''+n+'\')">del</button></figcaption></figure>').join('');
+}
+async function fetchMeta(n){
+ try{const r=await fetch('/photo_meta/'+encodeURIComponent(n));if(r.ok)return await r.json();}catch(e){}
+ return null;
+}
+// click a photo → zoomed lightbox with the outline + its toggle (plan 021 UX).
+// The wrapper hugs the displayed image exactly, so bbox fractions map straight
+// to % — no cover-crop math needed here. Esc / background click closes.
+async function lightbox(n){
+ const m=await fetchMeta(n);
+ const lb=document.createElement('div');lb.className='lb';
+ lb.onclick=e=>{if(e.target===lb)lb.remove();};
+ const wrap=document.createElement('div');wrap.className='lbwrap';
+ const img=document.createElement('img');img.src='/photos/'+encodeURIComponent(n);
+ wrap.appendChild(img);
+ const bar=document.createElement('div');bar.className='lbbar';
+ const b=m&&m.bbox;
+ if(b&&b.length===4){
+  const d=document.createElement('div');d.className='obox';
+  d.style.left=(b[0]*100)+'%';d.style.top=(b[1]*100)+'%';
+  d.style.width=((b[2]-b[0])*100)+'%';d.style.height=((b[3]-b[1])*100)+'%';
+  if(m.target||m.color)d.title=(m.target||'')+(m.color?' ('+m.color+')':'');
+  wrap.appendChild(d);
+  const t=document.createElement('button');t.textContent='◼ outline';
+  t.onclick=()=>{const on=d.style.display!=='none';d.style.display=on?'none':'block';
+   t.textContent=(on?'◻':'◼')+' outline';};
+  bar.appendChild(t);
+ }
+ const x=document.createElement('button');x.textContent='✕ close';x.onclick=()=>lb.remove();
+ bar.appendChild(x);
+ lb.appendChild(wrap);lb.appendChild(bar);
+ document.body.appendChild(lb);
+ document.addEventListener('keydown',function esc(e){
+  if(e.key==='Escape'){lb.remove();document.removeEventListener('keydown',esc);}});
 }
 // toggleable found-object outline (plan 020): lazy-fetch /photo_meta/{name} once,
 // overlay a CSS box from the bbox fractions. The JPEG itself is untouched.
