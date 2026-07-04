@@ -291,10 +291,14 @@ def look_for(vision, img, target):
     v.setdefault("bearing", "center")
     if v.get("bearing") not in ("left", "center", "right"):
         v["bearing"] = "center"
-    # A valid bbox overrides the coarse flags: bearing from its center-x, close
-    # from its LARGER dimension (measurable "big enough for a good look"; height
-    # alone fails for elongated floor objects). Garbage bbox → fall back to the
-    # model's flags (full backward compatibility).
+    return _apply_bbox(v)
+
+
+def _apply_bbox(v):
+    """A valid bbox overrides the coarse flags: bearing from its center-x, close
+    from its LARGER dimension (height alone fails for elongated floor objects)
+    or bottom-proximity. Garbage bbox → keep the flags (backward compatible).
+    Shared by the LLM (look_for) and CV (obs_from_detection) paths."""
     bbox = _sane_bbox(v.get("bbox"))
     v["bbox"] = bbox
     if bbox is not None:
@@ -305,8 +309,22 @@ def look_for(vision, img, target):
     return v
 
 
+def obs_from_detection(det, color):
+    """Map a detector.detect_color_object result to the loop's obs shape, so the
+    CV detector is a drop-in `look` (plan 021 — no LLM in the detect path)."""
+    if not det:
+        return {"seen": False, "bearing": "center", "close": False, "bbox": None,
+                "confidence": 0.0, "color": color, "reason": "no colored object detected"}
+    # Detections already passed the size/region/edge filters; score adds margin.
+    conf = round(min(1.0, 0.5 + float(det.get("score") or 0)), 2)
+    v = {"seen": True, "bbox": det.get("bbox"), "bearing": "center", "close": False,
+         "confidence": conf, "color": color,
+         "reason": f"cv blob score={det.get('score')} elong={det.get('elong')}"}
+    return _apply_bbox(v)
+
+
 def find_object(driver, vision, target, *, capture, log=lambda m: None,
-                on_found=None):
+                on_found=None, look=None):
     """Autonomous find loop. `capture()` -> (name, jpeg_bytes) of a fresh frame
     (a saved snapshot). Returns the saved photo name on success, else None.
     On success the returned photo is the exact frame the model analyzed (no
@@ -336,7 +354,9 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
             except Exception as e:
                 log(f"capture failed ({e}); stopping")
                 return None
-            obs = look_for(vision, img, target)
+            # `look` (e.g. the local CV detector) replaces the LLM for TARGET
+            # detection only; the floor-safety clearance() stays LLM, fail-closed.
+            obs = look(name, img) if look is not None else look_for(vision, img, target)
             log(f"observe: seen={obs.get('seen')} bearing={obs.get('bearing')} "
                 f"close={obs.get('close')} conf={obs.get('confidence')} "
                 f"({obs.get('reason','')[:50]})")

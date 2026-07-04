@@ -141,7 +141,7 @@ def rover_command(r: RoverCtl, line: str) -> str:
 # One-word test shortcuts for $find — stop-and-photograph when the target is seen.
 FIND_SHORTCUTS = {
     "screwdriver": "a screwdriver",
-    "pen": "a pen",
+    "pen": "a green pen",   # color named → the local CV detector handles it (plan 021)
 }
 
 
@@ -174,10 +174,26 @@ def autonomous_find(rover, target):
             client.set_photo_meta(name, {
                 "target": target, "color": str(obs.get("color") or ""),
                 "bbox": obs["bbox"], "confidence": float(obs.get("confidence") or 0)})
+    # Target detection: local CV when the target names a color and OpenCV is
+    # available (milliseconds, no gateway); otherwise the vision LLM. The
+    # floor-safety gate always stays with the LLM (fail-closed) either way.
+    look = None
+    det_kind = "llm"
+    try:
+        import detector as _detector
+        color = _detector.color_for_target(target)
+        if color and _detector.available():
+            look = lambda name, img: autodrive.obs_from_detection(
+                _detector.detect_color_object(img, color), color)
+            det_kind = f"cv:{color}"
+    except Exception:
+        pass
+    print(f"   detector: {det_kind}")
     driver = autodrive.SafeDriver(client)
     try:
         shot = autodrive.find_object(driver, vm, target, capture=capture,
-                                     log=lambda m: print("   " + m), on_found=on_found)
+                                     log=lambda m: print("   " + m),
+                                     on_found=on_found, look=look)
     except Exception as e:                  # rover is left stopped/safe (preflight refusal or cleanup)
         return f"find aborted — rover stopped/safe: {e}"
     if shot:
