@@ -80,7 +80,7 @@ func TestPhotoMetaValidation(t *testing.T) {
 func TestWebUIHasOutlineToggle(t *testing.T) {
 	app, _ := testApp(t)
 	body := do(t, app, "GET", "/").Body.String()
-	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'"} {
+	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta("} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)
 		}

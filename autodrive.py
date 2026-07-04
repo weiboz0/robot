@@ -28,8 +28,11 @@ import time
 CRAWL_CAP = 0.12
 FORWARD_MS = 250          # tiny forward pulse — server auto-stops after this
 TURN_MS = 220
-FLOOR_TILT = -25.0        # aim down at the near floor for the clearance check
-SETTLE_S = 0.5            # let the gimbal settle before capturing
+FLOOR_TILT = -20.0        # forward+down view — used for BOTH observing the target
+                          # and the near-floor clearance check (one frame per cycle)
+SETTLE_S = 1.2            # gimbal settle before capturing — CV detection made the
+                          # loop fast enough that 0.5s captured mid-swing (blurry
+                          # frames = boxes in the wrong place)
 FORWARD_COOLDOWN_S = 0.8  # min gap between forward nudges (no effectively-continuous motion)
 HTTP_TIMEOUT = 3.0        # short, so a hung controller call can't block forever
 MAX_STEPS = 40
@@ -72,6 +75,7 @@ class SafeDriver:
         self._last_forward = -1e9
         self._wd = None
         self._entered = False
+        self._aim = None      # gimbal (pan, tilt) cache — look() skips redundant aims
 
     # ---- lifecycle (context manager) ----
     def __enter__(self):
@@ -164,8 +168,16 @@ class SafeDriver:
 
     # ---- motion (all bounded) ----
     def look(self, pan, tilt):
-        """Aim the camera and wait for the gimbal to settle before any capture."""
+        """Aim the camera and wait for the gimbal to settle before any capture.
+        A no-op when already aimed there (skips the redundant move AND the
+        settle sleep) — this is what keeps the loop to one aim per cycle. Base
+        turns/nudges do NOT invalidate the cache: pan/tilt are rover-relative,
+        so the gimbal is still physically at the cached aim after a base move
+        (post-move scene settle is handled by _nudge_and_settle)."""
+        if self._aim == (pan, tilt):
+            return
         self.c.set_camera(pan, tilt)
+        self._aim = (pan, tilt)
         self._sleep(self.settle_s)
 
     def center_camera(self):
@@ -183,18 +195,25 @@ class SafeDriver:
         gap = self._clock() - self._last_forward
         if gap < self.forward_cooldown_s:
             self._sleep(self.forward_cooldown_s - gap)
-        self.c.nudge("forward", self.forward_ms)
+        self._nudge_and_settle("forward", self.forward_ms)
         self._last_forward = self._clock()
         return True
+
+    def _nudge_and_settle(self, direction, ms):
+        """Issue a bounded nudge, then wait out the motion + rock — the next
+        capture must never happen while the BASE is still moving (blurry frames
+        put detection boxes in the wrong place)."""
+        self.c.nudge(direction, ms)
+        self._sleep(ms / 1000.0 + 0.4)
 
     def turn_left(self, ms=None):
         """Bounded in-place turn; ms overrides the default (clamped ≤600)."""
         self._tick()
-        self.c.nudge("left", min(600, max(0, int(ms or self.turn_ms))))
+        self._nudge_and_settle("left", min(600, max(0, int(ms or self.turn_ms))))
 
     def turn_right(self, ms=None):
         self._tick()
-        self.c.nudge("right", min(600, max(0, int(ms or self.turn_ms))))
+        self._nudge_and_settle("right", min(600, max(0, int(ms or self.turn_ms))))
 
     # No back(): the camera can't see behind, so reversing can never be
     # look-where-you-drive safe. Turns are near-in-place on a differential rover
@@ -332,11 +351,17 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
     of frame), the wheels are halted explicitly, and `on_found(name, obs)` is
     called (e.g. to store the bbox outline metadata). Motion happens ONLY through
     `driver` (bounded, safety-gated); the context guarantees a stop on exit."""
-    def clearance():                       # fresh, forward-pointing near-floor check
-        try:
-            _, img = capture()
-        except Exception as e:
-            log(f"clearance capture failed ({e}) — treating as unsafe")
+    # ONE frame per cycle: the observe view IS the forward+down clearance view
+    # (driver.floor_tilt), so the same settled frame serves target detection AND
+    # the floor-safety check — no second snapshot, no second gimbal move (which
+    # used to capture mid-swing and blur the frame). The frame is always fresh
+    # this cycle and aimed where the wheels would go.
+    cycle_img = [None]
+
+    def clearance():
+        img = cycle_img[0]
+        if img is None:
+            log("no frame this cycle — treating as unsafe")
             return False
         ok = floor_is_clear(vision, img)
         log(f"  floor clear: {ok}")
@@ -347,8 +372,9 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
     with driver:
         while True:
             try:
-                driver.look(0.0, -10.0)    # neutral forward-ish view to observe
+                driver.look(0.0, driver.floor_tilt)   # forward+down; no-op if already aimed
                 name, img = capture()
+                cycle_img[0] = img
             except SafetyLimit:
                 raise
             except Exception as e:
