@@ -217,11 +217,17 @@ FIND_PROMPT = (
     "set seen=false.")
 
 # Approach tuning: a valid bbox overrides the model's coarse flags. The rover
-# keeps creeping (floor-gated) until the target is big in frame — a better view
-# for identification — instead of trusting a vague `close` bool.
-# "close" uses the LARGER bbox dimension: an elongated floor object (a pen lying
-# sideways) is wide but tiny in height, so height alone might never trigger.
-CLOSE_BBOX_DIM = 0.25   # larger bbox dimension fraction that counts as "close"
+# keeps creeping (floor-gated) until the target is "close", judged two ways:
+# 1. SIZE — the LARGER bbox dimension fills CLOSE_BBOX_DIM of the frame (an
+#    elongated pen lying sideways is wide but tiny in height, so height alone
+#    would never trigger). Right for hand-sized-and-bigger objects.
+# 2. PROXIMITY — the bbox BOTTOM is low in the frame. With the camera tilted
+#    down, "near the bottom edge" = "at my feet". Small objects (a pen is ~6%
+#    of the frame even up close) can NEVER pass the size test; without this
+#    they get overrun into the near-field blind spot, sight is lost, and the
+#    search spirals (the real-world $pen failure).
+CLOSE_BBOX_DIM = 0.25     # larger bbox dimension fraction that counts as "close"
+CLOSE_BBOX_BOTTOM = 0.70  # bbox bottom edge (y2) below this fraction = at my feet
 BEAR_LEFT, BEAR_RIGHT = 0.35, 0.65   # bbox center-x thresholds
 MAX_APPROACHES = 6      # after this many centered approaches, shoot anyway
                         # (don't burn the whole budget if the size metric stalls)
@@ -292,7 +298,8 @@ def look_for(vision, img, target):
     if bbox is not None:
         cx = (bbox[0] + bbox[2]) / 2.0
         v["bearing"] = "left" if cx < BEAR_LEFT else "right" if cx > BEAR_RIGHT else "center"
-        v["close"] = max(bbox[2] - bbox[0], bbox[3] - bbox[1]) >= CLOSE_BBOX_DIM
+        v["close"] = (max(bbox[2] - bbox[0], bbox[3] - bbox[1]) >= CLOSE_BBOX_DIM
+                      or bbox[3] >= CLOSE_BBOX_BOTTOM)
     return v
 
 

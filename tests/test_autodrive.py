@@ -322,6 +322,22 @@ class FindObjectTest(unittest.TestCase):
         fwd = [a for a in d.actions if a[0] == "forward"]
         self.assertEqual(len(fwd), autodrive.MAX_APPROACHES)
 
+
+    def test_small_object_close_via_bottom_proximity(self):
+        # The real-world $pen failure: a pen is ~6% of the frame even up close,
+        # so the size test can never pass. When its bbox bottom reaches the low
+        # frame (at the rover's feet), it must count as close — BEFORE the rover
+        # overruns it into the near-field blind spot.
+        class V:
+            def __init__(self, y2): self.y2 = y2
+            def describe(self, *a, **k):
+                return {"seen": True, "bbox": [0.52, self.y2 - 0.06, 0.56, self.y2],
+                        "bearing": "center", "close": False, "confidence": 0.9}
+        far = autodrive.look_for(V(0.64), b"IMG", "a pen")      # the diagnosed frame
+        self.assertFalse(far["close"])                          # still approaches
+        near = autodrive.look_for(V(0.75), b"IMG", "a pen")     # bottom past 0.70
+        self.assertTrue(near["close"])                          # found before blind spot
+
     def test_low_confidence_not_declared_found(self):
         # seen+close+center but LOW confidence must NOT be declared found
         v = FakeVision([{"seen": True, "close": True, "bearing": "center", "confidence": 0.2}] * 20,
