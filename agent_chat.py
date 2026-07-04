@@ -167,14 +167,25 @@ def autonomous_find(rover, target):
     def capture():
         n = client.snapshot()
         return n, client.get_photo(n)
+    found_obs = {}
+    def on_found(name, obs):                # store the bbox so the gallery can outline it
+        found_obs.update(obs)
+        if obs.get("bbox"):
+            client.set_photo_meta(name, {
+                "target": target, "color": str(obs.get("color") or ""),
+                "bbox": obs["bbox"], "confidence": float(obs.get("confidence") or 0)})
     driver = autodrive.SafeDriver(client)
     try:
         shot = autodrive.find_object(driver, vm, target, capture=capture,
-                                     log=lambda m: print("   " + m))
+                                     log=lambda m: print("   " + m), on_found=on_found)
     except Exception as e:                  # rover is left stopped/safe (preflight refusal or cleanup)
         return f"find aborted — rover stopped/safe: {e}"
     if shot:
-        return f"found {target} → {shot}   ({rover.where}/photos/{shot})"
+        color = found_obs.get("color") or "?"
+        hint = ("outline: press ◻ on the photo in the gallery"
+                if found_obs.get("bbox") else "no outline data (model gave no bbox)")
+        return (f"found {target} (color: {color}) → {shot}   "
+                f"({rover.where}/photos/{shot} — {hint})")
     return f"did not find {target} within the budget — wheels stopped."
 
 

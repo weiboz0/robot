@@ -154,3 +154,23 @@ class RovercontrolGetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhotoMetaClientTest(unittest.TestCase):
+    def test_set_photo_meta_posts_json(self):
+        captured = {}
+
+        def fake(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["body"] = req.data.decode()
+            captured["ct"] = req.get_header("Content-type")
+            return FakeResp()
+        orig = rc.urllib.request.urlopen
+        rc.urllib.request.urlopen = fake
+        try:
+            rc.set_photo_meta("rover_x.jpg", {"target": "a pen", "bbox": [0.1, 0.2, 0.5, 0.6]})
+        finally:
+            rc.urllib.request.urlopen = orig
+        self.assertIn("/photo_meta/rover_x.jpg", captured["url"])
+        self.assertIn('"bbox": [0.1, 0.2, 0.5, 0.6]', captured["body"])
+        self.assertEqual(captured["ct"], "application/json")

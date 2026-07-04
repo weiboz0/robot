@@ -1714,7 +1714,69 @@ func (app *App) routes() http.Handler {
 			return
 		}
 		os.Remove(filepath.Join(app.photoDir, name))
+		os.Remove(filepath.Join(app.photoDir, name+".meta.json")) // outline sidecar, if any
 		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+
+	// photo metadata sidecars (plan 020): the autonomous find loop stores the
+	// found object's bounding box so the gallery can draw a toggleable outline.
+	// The name is safePhotoName-validated; the body is re-marshalled from
+	// sanitized fields only, so arbitrary client JSON is never stored verbatim.
+	mux.HandleFunc("POST /photo_meta/", func(w http.ResponseWriter, r *http.Request) {
+		name, ok := photoName(r.URL.Path, "/photo_meta/")
+		if !ok {
+			errJSON(w, http.StatusBadRequest, "bad photo name")
+			return
+		}
+		var in struct {
+			Target     string    `json:"target"`
+			Color      string    `json:"color"`
+			BBox       []float64 `json:"bbox"`
+			Confidence float64   `json:"confidence"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&in); err != nil {
+			errJSON(w, http.StatusBadRequest, "bad meta body")
+			return
+		}
+		if len(in.BBox) != 4 || in.BBox[0] >= in.BBox[2] || in.BBox[1] >= in.BBox[3] {
+			errJSON(w, http.StatusBadRequest, "bbox must be [x1,y1,x2,y2] fractions")
+			return
+		}
+		for _, v := range in.BBox {
+			if math.IsNaN(v) || v < 0 || v > 1 {
+				errJSON(w, http.StatusBadRequest, "bbox values must be 0..1")
+				return
+			}
+		}
+		trunc := func(s string, n int) string {
+			if len(s) > n {
+				return s[:n]
+			}
+			return s
+		}
+		out, _ := json.Marshal(map[string]any{
+			"target": trunc(in.Target, 100), "color": trunc(in.Color, 40),
+			"bbox": in.BBox, "confidence": clamp(in.Confidence, 0, 1),
+		})
+		if err := os.WriteFile(filepath.Join(app.photoDir, name+".meta.json"), out, 0o644); err != nil {
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("GET /photo_meta/", func(w http.ResponseWriter, r *http.Request) {
+		name, ok := photoName(r.URL.Path, "/photo_meta/")
+		if !ok {
+			errJSON(w, http.StatusBadRequest, "bad photo name")
+			return
+		}
+		b, err := os.ReadFile(filepath.Join(app.photoDir, name+".meta.json"))
+		if err != nil {
+			errJSON(w, http.StatusNotFound, "no meta")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b)
 	})
 
 	// meta
@@ -1879,7 +1941,9 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  .bar{display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap;padding:8px}
  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;padding:12px}
  figure{margin:0;background:#1c1c1c;border-radius:8px;overflow:hidden}
+ figure a{position:relative;display:block}
  figure img{width:100%;display:block;aspect-ratio:4/3;object-fit:cover}
+ .obox{position:absolute;border:2px solid #4f4;box-shadow:0 0 0 1px #000;pointer-events:none}
  figcaption{font-size:10px;padding:5px;display:flex;justify-content:space-between;gap:5px;word-break:break-all}
  small{color:#999}
  .help{max-width:640px;margin:6px auto;background:#1c1c1c;border-radius:8px;padding:10px 12px;font-size:13px}
@@ -1994,7 +2058,37 @@ async function load(){
  const p=await(await fetch('/photos')).json();
  document.getElementById('gallery').innerHTML=(p.photos||[]).map(n=>
   '<figure><a href="/photos/'+n+'" target="_blank"><img loading="lazy" src="/photos/'+n+'"></a>'+
-  '<figcaption><span>'+n+'</span><button class="warn" onclick="del(\''+n+'\')">del</button></figcaption></figure>').join('');
+  '<figcaption><span>'+n+'</span><button onclick="outline(this,\''+n+'\')" title="toggle found-object outline">◻</button>'+
+  '<button class="warn" onclick="del(\''+n+'\')">del</button></figcaption></figure>').join('');
+}
+// toggleable found-object outline (plan 020): lazy-fetch /photo_meta/{name} once,
+// overlay a CSS box from the bbox fractions. The JPEG itself is untouched.
+// coverPct maps image-fraction bbox -> container fractions accounting for the
+// object-fit:cover crop, so the overlay aligns for ANY capture aspect (not just
+// the default 4:3). Resize-safe: the container keeps its aspect, so % holds.
+function coverPct(img,b){
+ const cw=img.clientWidth,ch=img.clientHeight,iw=img.naturalWidth,ih=img.naturalHeight;
+ if(!cw||!ch||!iw||!ih)return null;
+ const s=Math.max(cw/iw,ch/ih),dw=iw*s,dh=ih*s,ox=(cw-dw)/2,oy=(ch-dh)/2;
+ return [(ox+b[0]*dw)/cw,(oy+b[1]*dh)/ch,(b[2]-b[0])*dw/cw,(b[3]-b[1])*dh/ch];
+}
+async function outline(btn,n){
+ const a=btn.closest('figure').querySelector('a');
+ const old=a.querySelector('.obox');
+ if(old){const on=(old.style.display==='none');old.style.display=on?'block':'none';
+  btn.textContent=on?'◼':'◻';return;}
+ let m=null;
+ try{const r=await fetch('/photo_meta/'+encodeURIComponent(n));if(r.ok)m=await r.json();}catch(e){}
+ const b=m&&m.bbox;
+ if(!b||b.length!==4){btn.textContent='∅';btn.title='no outline data for this photo';return;}
+ const img=a.querySelector('img');
+ if(img&&!img.complete){try{await img.decode();}catch(e){}}
+ const p=(img&&coverPct(img,b))||[b[0],b[1],b[2]-b[0],b[3]-b[1]];  // fallback: naive %
+ const d=document.createElement('div');d.className='obox';
+ d.style.left=(p[0]*100)+'%';d.style.top=(p[1]*100)+'%';
+ d.style.width=(p[2]*100)+'%';d.style.height=(p[3]*100)+'%';
+ if(m.target||m.color)d.title=(m.target||'')+(m.color?' ('+m.color+')':'');  // title property: no HTML
+ a.appendChild(d);btn.textContent='◼';
 }
 async function del(n){await fetch('/delete_photo/'+encodeURIComponent(n),{method:'POST'});seen='';load();}
 async function clearAll(){const p=await(await fetch('/photos')).json();const ns=p.photos||[];
