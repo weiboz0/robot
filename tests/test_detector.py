@@ -138,41 +138,36 @@ class LookInjectionTest(unittest.TestCase):
         from tests.test_autodrive import FakeDriver
         calls = []
         def look(name, img):
-            calls.append(name)
+            calls.append(1)
             return {"seen": True, "bearing": "center", "close": True,
                     "confidence": 0.9, "bbox": [0.4, 0.6, 0.6, 0.8], "color": "green"}
         class NoLLM:                                        # detect path must not touch the LLM
             def describe(self, *a, **k): raise AssertionError("LLM used for detection")
         d = FakeDriver()
         out = autodrive.find_object(d, NoLLM(), "a green pen",
-                                    capture=lambda: ("rover_x.jpg", b"IMG"), look=look)
+                                    capture=lambda: (None, b"IMG"), look=look,
+                                    snap=lambda: "rover_x.jpg",
+                                    sweep_pans=(0,), sweep_tilts=(-20,), max_rotations=1)
         self.assertEqual(out, "rover_x.jpg")
-        self.assertEqual(calls, ["rover_x.jpg"])
+        self.assertTrue(calls)
 
 
-class CVFloorGateTest(unittest.TestCase):
-    def test_cv_mode_still_llm_gates_forward(self):
-        # THE safety seam: in CV mode the LLM floor gate must still be consulted
-        # before any forward advance (Opus review nit #2).
+class CVSweepTest(unittest.TestCase):
+    def test_cv_look_drives_the_sweep_without_llm(self):
+        # camera-first find with a CV look: found with zero wheel motion and the
+        # LLM never consulted (vision=None works end-to-end).
         from tests.test_autodrive import FakeDriver
-        floor_calls = []
-
-        class FloorLLM:
-            def describe(self, img, prompt, json_out=False, max_tokens=None):
-                floor_calls.append(prompt[:20])
-                return {"clear": True, "confidence": 0.9, "hazard": ""}
-
-        seq = [{"seen": True, "bearing": "center", "close": False, "confidence": 0.9,
-                "bbox": [0.45, 0.4, 0.55, 0.45]},
-               {"seen": True, "bearing": "center", "close": True, "confidence": 0.9,
-                "bbox": [0.4, 0.6, 0.6, 0.8]}]
-        look = lambda name, img: seq.pop(0)
-        d = FakeDriver()
-        out = autodrive.find_object(d, FloorLLM(), "a green pen",
-                                    capture=lambda: ("rover_x.jpg", b"IMG"), look=look)
+        det = {"bbox": [0.45, 0.45, 0.55, 0.55], "score": 0.4, "elong": 4.0, "mean_sat": 150}
+        look = lambda nm, im: autodrive.obs_from_detection(det, "green")
+        d = FakeDriver(max_actions=20)
+        out = autodrive.find_object(d, None, "a green pen",
+                                    capture=lambda: (None, b"IMG"), look=look,
+                                    snap=lambda: "rover_x.jpg",
+                                    sweep_pans=(0,), sweep_tilts=(-20,), max_rotations=1)
         self.assertEqual(out, "rover_x.jpg")
-        self.assertIn(("forward", True), d.actions)   # it advanced...
-        self.assertTrue(floor_calls)                  # ...and the LLM floor gate WAS consulted
+        acts = [a[0] for a in d.actions]
+        self.assertNotIn("forward", acts)
+        self.assertNotIn("left", acts)
 
 
 if __name__ == "__main__":

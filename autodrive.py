@@ -253,8 +253,6 @@ BEAR_LEFT, BEAR_RIGHT = 0.40, 0.60   # bbox center-x thresholds (tightened: bett
 CENTER_TOL = 0.08         # final-photo camera centering tolerance (bbox cx from 0.5)
 CAM_DEG_PER_FRAC = 70.0   # gimbal deg per frame-fraction of offset (wide lens ≈133;
                           # conservative gain converges in 2-3 refinement steps)
-MAX_APPROACHES = 6      # after this many centered approaches, shoot anyway
-                        # (don't burn the whole budget if the size metric stalls)
 
 
 def _sane_bbox(b):
@@ -372,29 +370,35 @@ def _refine_center(driver, looker, capture, obs, log, max_iters=3):
     return obs
 
 
+# Camera-first search plan (v3): sweep the GIMBAL across the room from where the
+# rover stands — the wide lens covers most of a room from one spot, so the target
+# is usually findable with ZERO wheel motion (the real-world failure mode was
+# staring forward and body-turning blindly). Wheels only rotate in place between
+# sweeps; forward driving is out of the default entirely (it caused the
+# floor-gate-vs-target conflicts and the near-field blind-spot losses).
+SWEEP_PANS = (-50, -25, 0, 25, 50)
+SWEEP_TILTS = (-15, -28)
+MAX_ROTATIONS = 5          # in-place ~60° rotations between sweeps (covers 360°)
+ROTATE_MS = 550
+EARLY_ACCEPT_CONF = 0.85   # stop sweeping immediately on a very strong sighting
+
+
 def find_object(driver, vision, target, *, capture, log=lambda m: None,
-                on_found=None, look=None, snap=None):
-    """Autonomous find loop. `capture()` -> (name|None, jpeg_bytes) of a fresh
-    frame — typically a NON-SAVING live-stream grab. On found: wheels halt, the
-    camera centers on the target (gimbal only), `snap()` saves the ONE photo of
-    the run, and `on_found(photo_name, obs)` stores its outline meta (the scene
-    is static from the analyzed frame to the snap, so the bbox corresponds).
-    Returns the saved photo name, else None. Motion happens ONLY through
-    `driver` (bounded, safety-gated); the context guarantees a stop on exit."""
-    # ONE frame per cycle: the observe view IS the forward+down clearance view
-    # (driver.floor_tilt), so the same settled frame serves target detection AND
-    # the floor-safety check — no second snapshot, no second gimbal move (which
-    # used to capture mid-swing and blur the frame). The frame is always fresh
-    # this cycle and aimed where the wheels would go.
-    # `capture` may be a NON-SAVING stream grab; `snap` saves the ONE real photo
-    # on found (so a run doesn't litter the gallery with outline-less frames).
-    cycle_img = [None]
+                on_found=None, look=None, snap=None,
+                sweep_pans=SWEEP_PANS, sweep_tilts=SWEEP_TILTS,
+                max_rotations=MAX_ROTATIONS):
+    """Camera-first autonomous find. From the current spot, sweep the gimbal
+    over `sweep_pans` x `sweep_tilts` looking for the target; if a full sweep
+    sees nothing, rotate the base in place (~60°, bounded) and sweep again — up
+    to `max_rotations` times (≈ full circle). On the best sighting: halt, center
+    the camera on it (gimbal only), `snap()` the ONE photo, store outline meta
+    via `on_found(photo_name, obs)`. NO forward driving — finding does not
+    require approaching, and staying put removes the cliff/obstacle risk of the
+    old approach phase. Returns the saved photo name, else None."""
     looker = look if look is not None else (lambda nm, im: look_for(vision, im, target))
 
-    def finish(obs, name):
-        """Found: stop, center the camera on the target (gimbal only), take THE
-        photo, store its outline meta. Returns the saved photo name."""
-        driver.halt()                      # wheels stop the instant it's found
+    def finish(obs):
+        driver.halt()                      # wheels stop (belt: they weren't moving)
         obs = _refine_center(driver, looker, capture, obs, log)
         shot = None
         if snap is not None:
@@ -402,8 +406,6 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
                 shot = snap()              # the one saved photo of the run
             except Exception as e:
                 log(f"  (snapshot failed: {e})")
-        if not shot:
-            shot = name                    # legacy path: observation frames were saved
         log(f"FOUND {target} -> {shot} (color: {obs.get('color', '?')})")
         if shot and on_found is not None:
             try:
@@ -412,82 +414,63 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
                 log(f"  (meta save failed: {e})")
         return shot
 
-    def clearance():
-        img = cycle_img[0]
-        if img is None:
-            log("no frame this cycle — treating as unsafe")
-            return False
-        ok = floor_is_clear(vision, img)
-        log(f"  floor clear: {ok}")
-        return ok
-
     vision_errors = 0
-    approaches = 0     # centered forward nudges toward the target (see MAX_APPROACHES)
     with driver:
-        while True:
-            try:
-                driver.look(0.0, driver.floor_tilt)   # forward+down; no-op if already aimed
-                name, img = capture()
-                cycle_img[0] = img
-            except SafetyLimit:
-                raise
-            except Exception as e:
-                log(f"capture failed ({e}); stopping")
-                return None
-            # `look` (e.g. the local CV detector) replaces the LLM for TARGET
-            # detection only; the floor-safety clearance() stays LLM, fail-closed.
-            obs = look(name, img) if look is not None else look_for(vision, img, target)
-            log(f"observe: seen={obs.get('seen')} bearing={obs.get('bearing')} "
-                f"close={obs.get('close')} conf={obs.get('confidence')} "
-                f"({obs.get('reason','')[:50]})")
-
-            if obs.get("error"):           # don't spin forever on a dead vision API
-                vision_errors += 1
-                if vision_errors >= MAX_VISION_ERRORS:
-                    log(f"vision failing ({vision_errors}x) — giving up")
-                    return None
-            else:
-                vision_errors = 0
-
-            # Found = seen, centered, confident, and EITHER big-enough in frame OR
-            # we've already approached it MAX_APPROACHES times (size metric can
-            # stall on odd-shaped objects — don't burn the whole budget).
-            if (obs.get("seen") and obs.get("bearing") == "center"
-                    and (obs.get("close") or approaches >= MAX_APPROACHES)
-                    and _num(obs.get("confidence")) >= FOUND_MIN_CONF):
-                return finish(obs, name)
-
-            try:
-                if obs.get("seen"):
-                    b = obs.get("bearing")
-                    # Proportional centering: each vision look costs 20-45s, so
-                    # make off-center turns count — scale duration by how far the
-                    # bbox center is from mid-frame (fixed tiny turns needed many
-                    # cycles and burned the clock in the real-world $pen run).
-                    turn_ms = None
-                    if obs.get("bbox"):
-                        cx = (obs["bbox"][0] + obs["bbox"][2]) / 2.0
-                        turn_ms = int(200 + 900 * abs(cx - 0.5))
-                    if b == "left":
-                        driver.turn_left(turn_ms)
-                    elif b == "right":
-                        driver.turn_right(turn_ms)
-                    elif driver.forward(clearance):       # centered but far → advance if floor clear
-                        approaches += 1
-                    elif _num(obs.get("confidence")) >= FOUND_MIN_CONF:
-                        # The floor gate refuses to advance while the target sits
-                        # centered dead ahead — the "obstacle" is (most likely)
-                        # the target itself, or we can't get closer safely either
-                        # way. This IS "as close as safely possible": stop and
-                        # shoot from here instead of turning away and losing it.
-                        log("  path blocked with target centered — shooting from here")
-                        return finish(obs, name)
-                    else:
-                        log("  path blocked ahead — turning to look for a way")
-                        driver.turn_left()
+        for rot in range(max_rotations + 1):
+            best = None
+            for tilt in sweep_tilts:
+                for pan in sweep_pans:
+                    if driver.elapsed() >= driver.max_seconds:
+                        log("time cap reached — stopping the search")
+                        return None
+                    driver.look(pan, tilt)
+                    try:
+                        _, img = capture()
+                    except Exception as e:
+                        log(f"capture failed ({e}); stopping")
+                        return None
+                    obs = looker(None, img)
+                    if obs.get("error"):
+                        vision_errors += 1
+                        if vision_errors >= MAX_VISION_ERRORS:
+                            log(f"vision failing ({vision_errors}x) — giving up")
+                            return None
+                        continue
+                    vision_errors = 0
+                    conf = _num(obs.get("confidence"))
+                    if obs.get("seen") and obs.get("bbox") and conf >= FOUND_MIN_CONF:
+                        log(f"  spotted at pan={pan} tilt={tilt} conf={conf:.2f} "
+                            f"({str(obs.get('reason', ''))[:40]})")
+                        cand = (conf, obs, pan, tilt)
+                        if best is None or conf > best[0]:
+                            best = cand
+                        if conf >= EARLY_ACCEPT_CONF:
+                            break
                 else:
-                    approaches = 0         # lost sight → reset the approach fallback
-                    driver.turn_left()     # not seen → rotate to scan (bounded by caps)
-            except SafetyLimit as e:
-                log(f"budget/precondition hit: {e}")
-                return None
+                    continue
+                break                       # early accept: fall through both loops
+
+            if best:
+                _, obs, pan, tilt = best
+                driver.look(pan, tilt)      # re-aim at the winning view (no-op if there)
+                try:                        # fresh confirm at that aim (scene static)
+                    _, img = capture()
+                    o2 = looker(None, img)
+                    if o2.get("seen") and o2.get("bbox"):
+                        obs = o2
+                except Exception:
+                    pass
+                return finish(obs)
+
+            if rot < max_rotations:
+                log(f"not visible from this viewpoint (sweep {rot + 1}) — rotating to look around")
+                try:
+                    driver.turn_left(ROTATE_MS)   # in-place, bounded, step-capped
+                except SafetyLimit as e:
+                    log(f"budget/precondition hit: {e}")
+                    return None
+
+        log("swept a full circle at two camera heights without seeing it — it may "
+            "be occluded or out of view; move it into the open or say roughly "
+            "where it is and I'll look again")
+        return None

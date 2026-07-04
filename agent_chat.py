@@ -146,44 +146,26 @@ FIND_SHORTCUTS = {
 
 
 def autonomous_find(rover, target):
-    """$find <obj> / $screwdriver: drive the rover autonomously to find `target`
-    and return a photo. Camera-only safety (no cliff sensor) — see docs/plans/017.
+    """$find <obj> / $screwdriver: autonomously find `target` (camera sweep +
+    in-place rotation only — no forward driving) and return an outlined photo.
     Gated: vision must be configured AND ROVER_FIND_ENABLE=1, checked BEFORE any
     rover call, so an unset run is a pure no-op that never moves the rover."""
     if os.environ.get("ROVER_FIND_ENABLE", "").strip().lower() not in ("1", "true", "yes"):
-        return ("autonomous find is DISABLED — it drives the rover on its own with "
-                "camera-only safety (NO cliff sensor). To allow it: set ROVER_FIND_ENABLE=1 "
-                "and run only on a flat, enclosed, ledge-free floor, ready to E-STOP.")
+        return ("autonomous find is DISABLED — it moves the camera and rotates the rover "
+                "in place on its own. To allow it: set ROVER_FIND_ENABLE=1.")
     if rover is None or rover.backend != "rovercontrol":
         return ("autonomous find needs the rovercontrol backend (run the Go controller "
                 "and let the chatbot drive it over :8080 — not the serial/app.py path).")
-    try:                                    # vision FIRST — no rover contact if unavailable
-        import vision as _vision
-        vm = _vision.VisionModel(timeout=45)   # zen gateway can be slow; fail one call, not the run
-    except Exception as e:
-        return f"vision not available: {e}"
     import autodrive
     import rovercontrol_client as client   # already pointed at the rover by RoverCtl
-    def capture():
-        # observe from the live stream — nothing saved; only the found photo is
-        # snapshotted (finish/snap), so runs don't fill the gallery
-        return None, client.get_stream_frame()
     import detector as _detector
-    label = _detector.label_for_target(target)   # e.g. "green pen" — shown at the outline
-    found_obs = {}
-    def on_found(name, obs):                # store the bbox so the gallery can outline it
-        found_obs.update(obs)
-        if obs.get("bbox"):
-            client.set_photo_meta(name, {
-                "target": target, "label": label,
-                "color": str(obs.get("color") or ""),
-                "bbox": obs["bbox"], "confidence": float(obs.get("confidence") or 0)})
     # Target detection: local CV when the target names a color and OpenCV is
-    # available (milliseconds, no gateway); otherwise the vision LLM. The
-    # floor-safety gate always stays with the LLM (fail-closed) either way.
+    # available (milliseconds, no gateway, no key needed). Colorless targets fall
+    # back to the vision LLM with a smaller sweep (each look costs 20-45s).
     # The shape prior comes from the object word (pen=elongated, cup=compact).
     look = None
     det_kind = "llm"
+    sweep = {}
     try:
         color = _detector.color_for_target(target)
         shape = _detector.shape_for_target(target)
@@ -193,13 +175,35 @@ def autonomous_find(rover, target):
             det_kind = f"cv:{color}:{shape}"
     except Exception:
         pass
+    vm = None
+    if look is None:                       # LLM path: vision FIRST — no rover contact if unavailable
+        try:
+            import vision as _vision
+            vm = _vision.VisionModel(timeout=45)
+        except Exception as e:
+            return (f"vision not available for a colorless target ({e}) — name the "
+                    "object's color (e.g. 'a green pen') to use local detection.")
+        sweep = {"sweep_pans": (-30, 0, 30), "sweep_tilts": (-20,), "max_rotations": 1}
+    def capture():
+        # observe from the live stream — nothing saved; only the found photo is
+        # snapshotted (finish/snap), so runs don't fill the gallery
+        return None, client.get_stream_frame()
+    label = _detector.label_for_target(target)   # e.g. "green pen" — shown at the outline
+    found_obs = {}
+    def on_found(name, obs):                # store the bbox so the gallery can outline it
+        found_obs.update(obs)
+        if obs.get("bbox"):
+            client.set_photo_meta(name, {
+                "target": target, "label": label,
+                "color": str(obs.get("color") or ""),
+                "bbox": obs["bbox"], "confidence": float(obs.get("confidence") or 0)})
     print(f"   detector: {det_kind}")
     driver = autodrive.SafeDriver(client)
     try:
         shot = autodrive.find_object(driver, vm, target, capture=capture,
                                      log=lambda m: print("   " + m),
                                      on_found=on_found, look=look,
-                                     snap=client.snapshot)
+                                     snap=client.snapshot, **sweep)
     except Exception as e:                  # rover is left stopped/safe (preflight refusal or cleanup)
         return f"find aborted — rover stopped/safe: {e}"
     if shot:
