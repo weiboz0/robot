@@ -249,7 +249,10 @@ FIND_PROMPT = (
 #    search spirals (the real-world $pen failure).
 CLOSE_BBOX_DIM = 0.25     # larger bbox dimension fraction that counts as "close"
 CLOSE_BBOX_BOTTOM = 0.70  # bbox bottom edge (y2) below this fraction = at my feet
-BEAR_LEFT, BEAR_RIGHT = 0.35, 0.65   # bbox center-x thresholds
+BEAR_LEFT, BEAR_RIGHT = 0.40, 0.60   # bbox center-x thresholds (tightened: better-centered shots)
+CENTER_TOL = 0.08         # final-photo camera centering tolerance (bbox cx from 0.5)
+CAM_DEG_PER_FRAC = 70.0   # gimbal deg per frame-fraction of offset (wide lens ≈133;
+                          # conservative gain converges in 2-3 refinement steps)
 MAX_APPROACHES = 6      # after this many centered approaches, shoot anyway
                         # (don't burn the whole budget if the size metric stalls)
 
@@ -342,21 +345,72 @@ def obs_from_detection(det, color):
     return _apply_bbox(v)
 
 
+def _refine_center(driver, looker, capture, obs, log, max_iters=3):
+    """Camera-only final centering: pan the gimbal so the target's bbox sits
+    near mid-frame before the found photo (wheels untouched). Keeps the last
+    good observation if the target slips out of a refinement frame."""
+    for _ in range(max_iters):
+        b = obs.get("bbox")
+        if not b:
+            break
+        cx = (b[0] + b[2]) / 2.0
+        if abs(cx - 0.5) <= CENTER_TOL:
+            break
+        pan, tilt = getattr(driver, "_aim", None) or (0.0, driver.floor_tilt)
+        pan = max(-90.0, min(90.0, pan + (cx - 0.5) * CAM_DEG_PER_FRAC))
+        driver.look(pan, tilt)
+        try:
+            _, img = capture()
+        except Exception as e:
+            log(f"  centering capture failed ({e})")
+            break
+        o2 = looker(None, img)
+        if not (isinstance(o2, dict) and o2.get("seen") and o2.get("bbox")):
+            break                          # lost it — keep the previous good obs
+        obs = o2
+        log(f"  centering: cx={((o2['bbox'][0]+o2['bbox'][2])/2):.2f}")
+    return obs
+
+
 def find_object(driver, vision, target, *, capture, log=lambda m: None,
-                on_found=None, look=None):
-    """Autonomous find loop. `capture()` -> (name, jpeg_bytes) of a fresh frame
-    (a saved snapshot). Returns the saved photo name on success, else None.
-    On success the returned photo is the exact frame the model analyzed (no
-    camera recenter — the old recenter-then-shoot could tilt the target half out
-    of frame), the wheels are halted explicitly, and `on_found(name, obs)` is
-    called (e.g. to store the bbox outline metadata). Motion happens ONLY through
+                on_found=None, look=None, snap=None):
+    """Autonomous find loop. `capture()` -> (name|None, jpeg_bytes) of a fresh
+    frame — typically a NON-SAVING live-stream grab. On found: wheels halt, the
+    camera centers on the target (gimbal only), `snap()` saves the ONE photo of
+    the run, and `on_found(photo_name, obs)` stores its outline meta (the scene
+    is static from the analyzed frame to the snap, so the bbox corresponds).
+    Returns the saved photo name, else None. Motion happens ONLY through
     `driver` (bounded, safety-gated); the context guarantees a stop on exit."""
     # ONE frame per cycle: the observe view IS the forward+down clearance view
     # (driver.floor_tilt), so the same settled frame serves target detection AND
     # the floor-safety check — no second snapshot, no second gimbal move (which
     # used to capture mid-swing and blur the frame). The frame is always fresh
     # this cycle and aimed where the wheels would go.
+    # `capture` may be a NON-SAVING stream grab; `snap` saves the ONE real photo
+    # on found (so a run doesn't litter the gallery with outline-less frames).
     cycle_img = [None]
+    looker = look if look is not None else (lambda nm, im: look_for(vision, im, target))
+
+    def finish(obs, name):
+        """Found: stop, center the camera on the target (gimbal only), take THE
+        photo, store its outline meta. Returns the saved photo name."""
+        driver.halt()                      # wheels stop the instant it's found
+        obs = _refine_center(driver, looker, capture, obs, log)
+        shot = None
+        if snap is not None:
+            try:
+                shot = snap()              # the one saved photo of the run
+            except Exception as e:
+                log(f"  (snapshot failed: {e})")
+        if not shot:
+            shot = name                    # legacy path: observation frames were saved
+        log(f"FOUND {target} -> {shot} (color: {obs.get('color', '?')})")
+        if shot and on_found is not None:
+            try:
+                on_found(shot, obs)        # bbox matches: scene static since capture
+            except Exception as e:
+                log(f"  (meta save failed: {e})")
+        return shot
 
     def clearance():
         img = cycle_img[0]
@@ -401,14 +455,7 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
             if (obs.get("seen") and obs.get("bearing") == "center"
                     and (obs.get("close") or approaches >= MAX_APPROACHES)
                     and _num(obs.get("confidence")) >= FOUND_MIN_CONF):
-                driver.halt()              # stop THE INSTANT it's found (explicit)
-                log(f"FOUND {target} -> {name} (color: {obs.get('color', '?')})")
-                if on_found is not None:
-                    try:
-                        on_found(name, obs)   # e.g. save the bbox outline metadata
-                    except Exception as e:
-                        log(f"  (meta save failed: {e})")
-                return name                # the exact frame the model analyzed
+                return finish(obs, name)
 
             try:
                 if obs.get("seen"):
@@ -433,15 +480,8 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
                         # the target itself, or we can't get closer safely either
                         # way. This IS "as close as safely possible": stop and
                         # shoot from here instead of turning away and losing it.
-                        driver.halt()
-                        log(f"FOUND {target} (path-blocked = at target) -> {name} "
-                            f"(color: {obs.get('color', '?')})")
-                        if on_found is not None:
-                            try:
-                                on_found(name, obs)
-                            except Exception as e:
-                                log(f"  (meta save failed: {e})")
-                        return name
+                        log("  path blocked with target centered — shooting from here")
+                        return finish(obs, name)
                     else:
                         log("  path blocked ahead — turning to look for a way")
                         driver.turn_left()

@@ -263,6 +263,42 @@ class FindObjectTest(unittest.TestCase):
         self.assertEqual(d.actions.count(("left",)), 3)      # scanned to the budget, then stopped
         self.assertIn(("halt",), d.actions)                  # context exit halted
 
+    def test_found_uses_snap_not_observation_frames(self):
+        # observation frames come from the live stream (not saved); only the
+        # found photo is snapshotted (plan: no outline-less photos in the gallery)
+        snaps = []
+        def snap():
+            snaps.append(1)
+            return "rover_final.jpg"
+        v = FakeVision([{"seen": True, "close": True, "bearing": "center", "confidence": 0.9}])
+        d = FakeDriver()
+        got = {}
+        out = autodrive.find_object(d, v, "x", capture=lambda: (None, b"IMG"),
+                                    snap=snap, on_found=lambda n, o: got.update(n=n))
+        self.assertEqual(out, "rover_final.jpg")
+        self.assertEqual(snaps, [1])                  # exactly one saved photo
+        self.assertEqual(got["n"], "rover_final.jpg") # meta attached to the saved one
+
+    def test_refine_center_pans_camera_toward_target(self):
+        # off-center bbox -> gimbal pans (camera only) until within tolerance
+        d = FakeDriver()
+        obs = {"seen": True, "bbox": [0.7, 0.4, 0.8, 0.5]}          # cx=0.75
+        seq = [{"seen": True, "bbox": [0.55, 0.4, 0.65, 0.5]},      # cx=0.60
+               {"seen": True, "bbox": [0.46, 0.4, 0.54, 0.5]}]      # cx=0.50 centered
+        looker = lambda nm, im: seq.pop(0)
+        out = autodrive._refine_center(d, looker, lambda: (None, b"IMG"), obs, lambda m: None)
+        cx = (out["bbox"][0] + out["bbox"][2]) / 2
+        self.assertAlmostEqual(cx, 0.5, delta=0.05)
+        looks = [a for a in d.actions if a[0] == "look"]
+        self.assertGreaterEqual(len(looks), 2)        # camera actually panned
+
+    def test_refine_center_keeps_last_good_on_loss(self):
+        d = FakeDriver()
+        obs = {"seen": True, "bbox": [0.7, 0.4, 0.8, 0.5]}
+        looker = lambda nm, im: {"seen": False}       # lost during refinement
+        out = autodrive._refine_center(d, looker, lambda: (None, b"IMG"), obs, lambda m: None)
+        self.assertEqual(out["bbox"], [0.7, 0.4, 0.8, 0.5])
+
     def test_one_capture_per_cycle(self):
         # plan 021 feedback: ONE settled frame per cycle serves both target
         # detection and the floor check — no second snapshot (was blurring).

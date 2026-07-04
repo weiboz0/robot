@@ -165,8 +165,9 @@ def autonomous_find(rover, target):
     import autodrive
     import rovercontrol_client as client   # already pointed at the rover by RoverCtl
     def capture():
-        n = client.snapshot()
-        return n, client.get_photo(n)
+        # observe from the live stream — nothing saved; only the found photo is
+        # snapshotted (finish/snap), so runs don't fill the gallery
+        return None, client.get_stream_frame()
     import detector as _detector
     label = _detector.label_for_target(target)   # e.g. "green pen" — shown at the outline
     found_obs = {}
@@ -197,7 +198,8 @@ def autonomous_find(rover, target):
     try:
         shot = autodrive.find_object(driver, vm, target, capture=capture,
                                      log=lambda m: print("   " + m),
-                                     on_found=on_found, look=look)
+                                     on_found=on_found, look=look,
+                                     snap=client.snapshot)
     except Exception as e:                  # rover is left stopped/safe (preflight refusal or cleanup)
         return f"find aborted — rover stopped/safe: {e}"
     if shot:
@@ -258,6 +260,15 @@ def build_tools(rover, arm):
             {"name": "rover_list_photos",
              "description": "List photo filenames taken by the rover camera, newest first.",
              "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_find_object",
+             "description": "Physically search for an object: the rover autonomously scans, "
+                            "drives toward it in small safe steps, stops when found, and returns "
+                            "a photo with the object outlined. Describe the object with its COLOR "
+                            "(e.g. 'a green pen', 'a yellow note') — color-named targets use fast "
+                            "local detection. Requires ROVER_FIND_ENABLE=1; refuses safely otherwise. "
+                            "Use ONLY when the user asks to find/look for/locate a physical object.",
+             "parameters": {"type": "object", "properties": {
+                 "target": {"type": "string"}}, "required": ["target"]}},
         ]
     if arm is not None:
         tools += [
@@ -313,6 +324,11 @@ def run_tool(rover, arm, name, a):
         if name == "rover_list_photos":
             ps = rover.list_photos()
             return f"{len(ps)} photo(s): {', '.join(ps[:20])}" if ps else "no photos yet"
+        if name == "rover_find_object":
+            t = (a.get("target") or "").strip()
+            if not t:
+                return "rover_find_object needs a target description"
+            return autonomous_find(rover, t)
         if name == "dobot_get_pose":
             return arm.pose()
         if name == "dobot_get_mode":
@@ -337,7 +353,10 @@ SYSTEM = (
     "you can take a photo with the camera, list photos, center the camera, and "
     "lock/relax the gimbal. The speed cap (rover_set_speed, 0..0.5) is the safe "
     "way to slow all driving; on the Go controller it is shared with the gamepad. "
-    "Use rover_get_status to check what is connected. "
+    "Use rover_get_status to check what is connected. When the user asks you to "
+    "find/look for a physical object, use rover_find_object with a color in the "
+    "description (e.g. 'a green pen') — it drives itself and returns an outlined "
+    "photo; report the result including the photo name. "
     "Dobot: coordinates are mm (x,y,z) and degrees (r); move "
     "conservatively and enable the arm before moving. After acting, briefly say what "
     "you did. Be concise."

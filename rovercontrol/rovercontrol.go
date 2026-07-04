@@ -900,6 +900,22 @@ func (app *App) listPhotos() []string {
 	return names
 }
 
+// outlinedPhotos returns the photo names that have an outline sidecar, so the
+// gallery only offers the ◻ toggle where there is something to show.
+func (app *App) outlinedPhotos() []string {
+	entries, err := os.ReadDir(app.photoDir)
+	if err != nil {
+		return nil
+	}
+	names := []string{}
+	for _, e := range entries {
+		if n, ok := strings.CutSuffix(e.Name(), ".meta.json"); ok && safePhotoName(n) {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
 // placeholderFrame is a tiny valid JPEG served as the live frame when the camera
 // is unavailable, so the UI <img> shows "no signal" instead of hanging.
 var placeholderFrame = buildPlaceholder()
@@ -1694,10 +1710,12 @@ func (app *App) routes() http.Handler {
 		if len(photos) > 0 {
 			latest = &photos[0]
 		}
-		writeJSON(w, 200, map[string]any{"count": len(photos), "latest": latest})
+		writeJSON(w, 200, map[string]any{"count": len(photos), "latest": latest,
+			"outlined": len(app.outlinedPhotos())})
 	})
 	mux.HandleFunc("GET /photos", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"photos": app.listPhotos()})
+		writeJSON(w, 200, map[string]any{"photos": app.listPhotos(),
+			"outlined": app.outlinedPhotos()})
 	})
 	mux.HandleFunc("GET /photos/", func(w http.ResponseWriter, r *http.Request) {
 		name, ok := photoName(r.URL.Path, "/photos/")
@@ -2061,12 +2079,14 @@ async function snap(){await cmd('snapshot');load();}
 let seen='';
 async function load(){
  const j=await(await fetch('/latest')).json();
- const key=j.count+':'+(j.latest||'');
+ const key=j.count+':'+(j.latest||'')+':'+(j.outlined||0);   // re-render when an outline arrives
  if(key===seen)return; seen=key;
  const p=await(await fetch('/photos')).json();
+ const outlined=new Set(p.outlined||[]);            // ◻ only where there IS an outline
  document.getElementById('gallery').innerHTML=(p.photos||[]).map(n=>
   '<figure><a href="/photos/'+n+'" onclick="lightbox(\''+n+'\');return false"><img loading="lazy" src="/photos/'+n+'"></a>'+
-  '<figcaption><span>'+n+'</span><button onclick="outline(this,\''+n+'\')" title="toggle found-object outline">◻</button>'+
+  '<figcaption><span>'+n+'</span>'+
+  (outlined.has(n)?'<button onclick="outline(this,\''+n+'\')" title="toggle found-object outline">◻</button>':'')+
   '<button class="warn" onclick="del(\''+n+'\')">del</button></figcaption></figure>').join('');
 }
 async function fetchMeta(n){
