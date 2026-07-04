@@ -82,7 +82,11 @@ class VisionModel:
             self._client = client
         else:
             from openai import OpenAI
-            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=timeout)
+            # max_retries=1 (not the SDK's default 2): a slow/timing-out gateway
+            # otherwise burns ~3x the timeout per call, silently eating the
+            # autonomous run's wall-clock budget.
+            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url,
+                                  timeout=timeout, max_retries=1)
 
     def describe(self, image_bytes: bytes, prompt: str, *, json_out: bool = False,
                  max_tokens: int = 400) -> "str | dict":

@@ -187,8 +187,8 @@ class FakeDriver:
     def center_camera(self): self.actions.append(("center",))
     def forward(self, clearance):
         self._tick(); ok = clearance(); self.actions.append(("forward", ok)); return ok
-    def turn_left(self): self._tick(); self.actions.append(("left",))
-    def turn_right(self): self._tick(); self.actions.append(("right",))
+    def turn_left(self, ms=None): self._tick(); self.actions.append(("left",))
+    def turn_right(self, ms=None): self._tick(); self.actions.append(("right",))
     def halt(self): self.actions.append(("halt",))
 
 
@@ -231,13 +231,26 @@ class FindObjectTest(unittest.TestCase):
         autodrive.find_object(d, v, "x", capture=cap)
         self.assertIn(("forward", True), d.actions)
 
-    def test_center_far_blocked_turns_when_floor_not_clear(self):
+    def test_center_blocked_confident_shoots_from_here(self):
+        # Real-world $pen failure #2: the target dead ahead makes the floor gate
+        # refuse to advance ("object within 30cm" — the pen itself). Blocked +
+        # centered + confident = as close as safely possible → found, not a turn.
         v = FakeVision([{"seen": True, "close": False, "bearing": "center", "confidence": 0.8}] * 20,
                        floor=False)
         d = FakeDriver(max_actions=4)
         out = autodrive.find_object(d, v, "x", capture=cap)
-        self.assertIsNone(out)                               # never advances → gives up
+        self.assertEqual(out, "rover_x.jpg")
         self.assertIn(("forward", False), d.actions)         # forward was refused (floor unsafe)
+        self.assertIn(("halt",), d.actions)                  # then shot from here
+        self.assertNotIn(("left",), d.actions)               # did NOT turn away
+
+    def test_center_blocked_low_conf_still_turns(self):
+        # ...but a low-confidence sighting doesn't get the shoot-from-here path
+        v = FakeVision([{"seen": True, "close": False, "bearing": "center", "confidence": 0.3}] * 20,
+                       floor=False)
+        d = FakeDriver(max_actions=3)
+        out = autodrive.find_object(d, v, "x", capture=cap)
+        self.assertIsNone(out)
         self.assertIn(("left",), d.actions)                  # fell back to turning
 
     def test_not_seen_scans_then_budget_gives_up(self):

@@ -159,7 +159,7 @@ def autonomous_find(rover, target):
                 "and let the chatbot drive it over :8080 — not the serial/app.py path).")
     try:                                    # vision FIRST — no rover contact if unavailable
         import vision as _vision
-        vm = _vision.VisionModel()
+        vm = _vision.VisionModel(timeout=45)   # zen gateway can be slow; fail one call, not the run
     except Exception as e:
         return f"vision not available: {e}"
     import autodrive

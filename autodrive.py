@@ -33,7 +33,8 @@ SETTLE_S = 0.5            # let the gimbal settle before capturing
 FORWARD_COOLDOWN_S = 0.8  # min gap between forward nudges (no effectively-continuous motion)
 HTTP_TIMEOUT = 3.0        # short, so a hung controller call can't block forever
 MAX_STEPS = 40
-MAX_SECONDS = 180.0
+MAX_SECONDS = 240.0   # wall-clock incl. vision latency (a slow gateway night can
+                      # cost 20-45s per look; motion is separately step-capped)
 WATCHDOG_MARGIN_S = 15.0
 FOUND_MIN_CONF = 0.5      # don't declare "found" on a low-confidence guess
 MAX_VISION_ERRORS = 4     # give up if the vision API keeps failing (don't spin)
@@ -186,13 +187,14 @@ class SafeDriver:
         self._last_forward = self._clock()
         return True
 
-    def turn_left(self):
+    def turn_left(self, ms=None):
+        """Bounded in-place turn; ms overrides the default (clamped ≤600)."""
         self._tick()
-        self.c.nudge("left", self.turn_ms)
+        self.c.nudge("left", min(600, max(0, int(ms or self.turn_ms))))
 
-    def turn_right(self):
+    def turn_right(self, ms=None):
         self._tick()
-        self.c.nudge("right", self.turn_ms)
+        self.c.nudge("right", min(600, max(0, int(ms or self.turn_ms))))
 
     # No back(): the camera can't see behind, so reversing can never be
     # look-where-you-drive safe. Turns are near-in-place on a differential rover
@@ -365,12 +367,35 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
             try:
                 if obs.get("seen"):
                     b = obs.get("bearing")
+                    # Proportional centering: each vision look costs 20-45s, so
+                    # make off-center turns count — scale duration by how far the
+                    # bbox center is from mid-frame (fixed tiny turns needed many
+                    # cycles and burned the clock in the real-world $pen run).
+                    turn_ms = None
+                    if obs.get("bbox"):
+                        cx = (obs["bbox"][0] + obs["bbox"][2]) / 2.0
+                        turn_ms = int(200 + 900 * abs(cx - 0.5))
                     if b == "left":
-                        driver.turn_left()
+                        driver.turn_left(turn_ms)
                     elif b == "right":
-                        driver.turn_right()
+                        driver.turn_right(turn_ms)
                     elif driver.forward(clearance):       # centered but far → advance if floor clear
                         approaches += 1
+                    elif _num(obs.get("confidence")) >= FOUND_MIN_CONF:
+                        # The floor gate refuses to advance while the target sits
+                        # centered dead ahead — the "obstacle" is (most likely)
+                        # the target itself, or we can't get closer safely either
+                        # way. This IS "as close as safely possible": stop and
+                        # shoot from here instead of turning away and losing it.
+                        driver.halt()
+                        log(f"FOUND {target} (path-blocked = at target) -> {name} "
+                            f"(color: {obs.get('color', '?')})")
+                        if on_found is not None:
+                            try:
+                                on_found(name, obs)
+                            except Exception as e:
+                                log(f"  (meta save failed: {e})")
+                        return name
                     else:
                         log("  path blocked ahead — turning to look for a way")
                         driver.turn_left()
