@@ -27,14 +27,19 @@ PRESETS = {
                    "model": "google/gemini-2.0-flash-exp:free"},
     "gemini": {"base": "https://generativelanguage.googleapis.com/v1beta/openai",
                "key_env": "GEMINI_API_KEY", "model": "gemini-2.0-flash"},
+    # The chatbot's own opencode zen key serves vision too — qwen3.6-plus passed
+    # the live structured-JSON find/floor tests on real rover frames (plan 017).
+    "opencode": {"base": "https://opencode.ai/zen/go/v1", "key_env": "OPENCODE_API_KEY",
+                 "model": "qwen3.6-plus"},
     "dashscope": {"base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
                   "key_env": "DASHSCOPE_CODING_KEY", "model": "qwen-vl-max"},
     "ark": {"base": "https://ark.cn-beijing.volces.com/api/v3", "key_env": "ARK_API_KEY",
             "model": "doubao-1-5-vision-pro-32k-250115"},
 }
-# Auto-detect order: prefer providers that offer free/working vision. ARK is last
-# (it needs per-model console activation, so it's the most likely to be blocked).
-_AUTO_ORDER = ("openrouter", "gemini", "dashscope", "ark")
+# Auto-detect order: explicit vision keys first, then the chatbot's opencode key
+# (verified working), then dashscope/ark (ark needs per-model console activation,
+# so it's the most likely to be blocked).
+_AUTO_ORDER = ("openrouter", "gemini", "opencode", "dashscope", "ark")
 
 
 class VisionUnavailable(RuntimeError):
@@ -56,11 +61,15 @@ class VisionModel:
         provider = (provider or os.environ.get("VISION_PROVIDER", "")).strip().lower() or _autodetect()
         if not provider:
             raise VisionUnavailable(
-                "no vision model configured — set OPENROUTER_API_KEY (free at "
-                "openrouter.ai) or VISION_PROVIDER + VISION_API_KEY. See docs/plans/017.")
+                "no vision model configured — the chatbot's OPENCODE_API_KEY works "
+                "(auto-detected), or set OPENROUTER_API_KEY / VISION_PROVIDER + "
+                "VISION_API_KEY. See docs/plans/017.")
         preset = PRESETS.get(provider, {})
         self.provider = provider
         self.base_url = base_url or os.environ.get("VISION_BASE_URL", "").strip() or preset.get("base")
+        if provider == "opencode":          # honor a custom zen gateway if configured
+            self.base_url = (base_url or os.environ.get("VISION_BASE_URL", "").strip()
+                             or os.environ.get("OPENCODE_BASE_URL", "").strip() or preset.get("base"))
         self.api_key = (api_key or os.environ.get("VISION_API_KEY", "").strip()
                         or os.environ.get(preset.get("key_env", ""), "").strip())
         self.model = model or os.environ.get("VISION_MODEL", "").strip() or preset.get("model")
