@@ -283,7 +283,7 @@ class ToolSurfaceTest(unittest.TestCase):
         tools = agent_chat.build_tools(FakeRover(), None)
         names = {t["function"]["name"] for t in tools}
         for n in ("rover_set_speed", "rover_get_status", "rover_center_camera",
-                  "rover_gimbal_torque", "rover_list_photos"):
+                  "rover_gimbal_torque", "rover_list_photos", "rover_find_object"):
             self.assertIn(n, names)
 
     def test_run_tool_dispatches_new_tools(self):

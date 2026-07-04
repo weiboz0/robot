@@ -147,6 +147,18 @@ class RovercontrolGetTest(unittest.TestCase):
         rc.urllib.request.urlopen = lambda req, timeout=None: FakeJSONResp('{"ok":true,"name":"rover_z.jpg"}')
         self.assertEqual(rc.snapshot(), "rover_z.jpg")
 
+    def test_get_stream_frame_extracts_jpeg(self):
+        mjpeg = b"--rovercamframe\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8JPEGDATA\xff\xd9\r\n--rovercamframe"
+        class StreamResp:
+            def __init__(self): self._sent = False
+            def read(self, n):
+                if self._sent: return b""
+                self._sent = True; return mjpeg
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        rc.urllib.request.urlopen = lambda url, timeout=None: StreamResp()
+        self.assertEqual(rc.get_stream_frame(), b"\xff\xd8JPEGDATA\xff\xd9")
+
     def test_get_photo_returns_bytes(self):
         rc.urllib.request.urlopen = lambda url, timeout=None: FakeJSONResp("BINARYJPEG")
         self.assertEqual(rc.get_photo("rover_z.jpg"), b"BINARYJPEG")

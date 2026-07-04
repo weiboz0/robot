@@ -46,6 +46,17 @@ func TestPhotoMetaRoundtrip(t *testing.T) {
 	if _, err := os.Stat(side); err != nil {
 		t.Fatalf("sidecar missing: %v", err)
 	}
+	// /photos reports which names have outlines (the gallery gates its toggle on it)
+	lw := do(t, app, "GET", "/photos")
+	var lst struct {
+		Outlined []string `json:"outlined"`
+	}
+	if err := json.Unmarshal(lw.Body.Bytes(), &lst); err != nil {
+		t.Fatal(err)
+	}
+	if len(lst.Outlined) != 1 || lst.Outlined[0] != "rover_x.jpg" {
+		t.Fatalf("outlined list: %v", lst.Outlined)
+	}
 	do(t, app, "POST", "/delete_photo/rover_x.jpg")
 	if _, err := os.Stat(side); !os.IsNotExist(err) {
 		t.Fatal("sidecar not removed with the photo")

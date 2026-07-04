@@ -115,7 +115,7 @@ class TargetColorTest(unittest.TestCase):
 
 class ObsFromDetectionTest(unittest.TestCase):
     def test_detection_maps_to_obs(self):
-        det = {"bbox": [0.55, 0.42, 0.66, 0.50], "score": 0.39, "elong": 4.5, "mean_sat": 158}
+        det = {"bbox": [0.45, 0.42, 0.56, 0.50], "score": 0.39, "elong": 4.5, "mean_sat": 158}
         obs = autodrive.obs_from_detection(det, "green")
         self.assertTrue(obs["seen"])
         self.assertEqual(obs["color"], "green")

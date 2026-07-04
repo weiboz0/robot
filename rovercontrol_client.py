@@ -159,6 +159,25 @@ def camera_nudge(direction: str, deg: float = 15.0, timeout: float | None = None
     _post("/camera_" + direction, {"deg": deg}, timeout=timeout)
 
 
+def get_stream_frame(timeout: float = 6.0) -> bytes:
+    """One JPEG frame from the live MJPEG stream — NOTHING is saved on the
+    rover (unlike /snapshot). The autonomous find loop observes with this so a
+    run doesn't litter the gallery; only the found photo is snapshotted."""
+    deadline = time.monotonic() + timeout
+    with urllib.request.urlopen(_base() + "/video_feed", timeout=timeout) as r:
+        buf = b""
+        while time.monotonic() < deadline:
+            chunk = r.read(8192)
+            if not chunk:
+                break
+            buf += chunk
+            s = buf.find(b"\xff\xd8")                 # JPEG SOI
+            e = buf.find(b"\xff\xd9", s + 2)          # JPEG EOI
+            if s != -1 and e != -1:
+                return buf[s:e + 2]
+    raise OSError("no frame from the camera stream")
+
+
 def set_photo_meta(name: str, meta: dict, timeout: float = 5.0) -> None:
     """Store outline metadata for a photo — POST /photo_meta/<name> with a JSON
     body {target,color,bbox,confidence}. The gallery's ◻ toggle reads it back."""
