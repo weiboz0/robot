@@ -45,7 +45,7 @@ class GateTest(unittest.TestCase):
     def test_find_shortcuts_table(self):
         # $screwdriver and $pen are one-word shortcuts for $find <target>
         self.assertEqual(agent_chat.FIND_SHORTCUTS.get("screwdriver"), "a screwdriver")
-        self.assertEqual(agent_chat.FIND_SHORTCUTS.get("pen"), "a pen")
+        self.assertEqual(agent_chat.FIND_SHORTCUTS.get("pen"), "a green pen")
 
     def test_pen_shortcut_respects_disabled_gate(self):
         with mock.patch.dict(os.environ, {}, clear=True):
