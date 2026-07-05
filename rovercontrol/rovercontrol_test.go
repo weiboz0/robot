@@ -529,7 +529,7 @@ func TestBuildCameraCmd(t *testing.T) {
 	}
 	// the low-latency defaults wire through to a real framerate cap on v4l2.
 	got = buildCameraCmd(ctx, "v4l2", "/dev/video0", defaultCamWidth, defaultCamHeight, defaultCamFPS).Args
-	if strings.Join(got, " ") != "v4l2-ctl -d /dev/video0 --set-fmt-video=width=640,height=480,pixelformat=MJPG --set-parm=15 --stream-mmap --stream-count=0 --stream-to=-" {
+	if strings.Join(got, " ") != "v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=MJPG --set-parm=15 --stream-mmap --stream-count=0 --stream-to=-" {
 		t.Fatalf("v4l2 default args: %v", got)
 	}
 	got = buildCameraCmd(ctx, "rpicam", "", 1280, 720, 30).Args

@@ -94,6 +94,23 @@ def scan_frames(client, *, pans=SCAN_PANS, tilts=(SCAN_TILT, UPPER_TILT),
     return frames
 
 
+def _shrink(jpeg, max_w=800):
+    """Downscale a frame for VISION calls (payload sanity at high capture res);
+    stitching keeps the full-res originals. Passthrough without OpenCV."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return jpeg
+    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    if img is None or img.shape[1] <= max_w:
+        return jpeg
+    h = int(img.shape[0] * max_w / img.shape[1])
+    ok, buf = cv2.imencode(".jpg", cv2.resize(img, (max_w, h), interpolation=cv2.INTER_AREA),
+                           [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    return buf.tobytes() if ok else jpeg
+
+
 def _describe_chunk(vision, chunk, log):
     """One multi-image call for ≤DESCRIBE_CHUNK frames; per-frame fallback."""
     labels = [f"View {i + 1} — facing {view_label(p, t)}"
@@ -101,7 +118,7 @@ def _describe_chunk(vision, chunk, log):
     prompt = SCENE_PROMPT.format(n=len(chunk))
     try:
         out = vision.describe_many(
-            [(lab, img) for lab, (_, _, img) in zip(labels, chunk)],
+            [(lab, _shrink(img)) for lab, (_, _, img) in zip(labels, chunk)],
             prompt, json_out=True, max_tokens=3200)
         if isinstance(out, dict) and out.get("views"):
             return out
@@ -115,7 +132,7 @@ def _describe_chunk(vision, chunk, log):
                "\"objects\": [{\"name\": str, \"color\": str, \"details\": str}], "
                "\"summary\": str}. Be specific about colors, including parts like lids.")
         try:
-            views.append(vision.describe(img, one, json_out=True, max_tokens=900))
+            views.append(vision.describe(_shrink(img), one, json_out=True, max_tokens=900))
         except Exception as e:
             views.append({"direction": lab, "objects": [],
                           "summary": f"(view failed: {e})"})
@@ -158,17 +175,18 @@ def render_inventory(inv) -> str:
     return "\n".join(out) or "(empty scene)"
 
 
-def build_panorama(frames, max_width=2400):
-    """Stitch the ring frames (eye-level + upper; the ceiling frame's geometry
-    doesn't overlap usefully) into one 360° panorama — the scan's "3D space".
-    Returns JPEG bytes, or None if OpenCV is missing or stitching fails."""
+def build_panorama(frames, max_width=4096):
+    """Stitch ALL frames (both rings + ceiling — live-tested: the stitcher
+    places the ceiling and extends top coverage) into one 360° panorama — the
+    scan's "3D space". Returns JPEG bytes, or None if OpenCV is missing or
+    stitching fails."""
     try:
         import cv2
         import numpy as np
     except ImportError:
         return None
     imgs = [cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
-            for pan, tilt, img in frames if tier_label(tilt) != "ceiling"]
+            for pan, tilt, img in frames]
     imgs = [i for i in imgs if i is not None]
     if len(imgs) < 3:
         return None

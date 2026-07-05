@@ -164,8 +164,23 @@ class PanoramaTest(unittest.TestCase):
         blank = cv2.imencode(".jpg", np.zeros((200, 300, 3), np.uint8))[1].tobytes()
         self.assertIsNone(scene.build_panorama([(0, -5, blank)] * 4))
 
-    def test_ceiling_frame_excluded_and_few_frames_none(self):
+    def test_few_frames_returns_none(self):
         self.assertIsNone(scene.build_panorama([(0, 80, b"x"), (0, 80, b"y")]))
+
+    def test_shrink_passthrough_small(self):
+        # a small frame passes through untouched (vision-call payload helper)
+        import cv2
+        import numpy as np
+        small = cv2.imencode(".jpg", np.zeros((100, 200, 3), np.uint8))[1].tobytes()
+        self.assertEqual(scene._shrink(small, max_w=800), small)
+
+    def test_shrink_downscales_large(self):
+        import cv2
+        import numpy as np
+        big = cv2.imencode(".jpg", np.zeros((1080, 1920, 3), np.uint8))[1].tobytes()
+        out = scene._shrink(big, max_w=800)
+        img = cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(img.shape[1], 800)
 
     def test_save_scene_writes_panorama(self):
         inv = {"views": [], "overall": ""}

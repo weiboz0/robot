@@ -106,10 +106,31 @@ func TestPanoramaEndpoints(t *testing.T) {
 	}
 }
 
+func TestPanoStatusEndpoints(t *testing.T) {
+	app, _ := testApp(t)
+	if w := doJSON(t, app, "POST", "/pano_status?state=stitching", ""); w.Code != 200 {
+		t.Fatalf("POST status = %d", w.Code)
+	}
+	if w := doJSON(t, app, "POST", "/pano_status?state=hacked", ""); w.Code != 400 {
+		t.Fatalf("bad state = %d (want 400)", w.Code)
+	}
+	w := do(t, app, "GET", "/pano_status")
+	var st struct {
+		State string  `json:"state"`
+		Age   float64 `json:"age_s"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.State != "stitching" || st.Age < 0 {
+		t.Fatalf("status: %+v", st)
+	}
+}
+
 func TestWebUIHasOutlineToggle(t *testing.T) {
 	app, _ := testApp(t)
 	body := do(t, app, "GET", "/").Body.String()
-	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel(", "pano3d(", "3D view", "/panorama"} {
+	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel(", "pano3d(", "3D view", "/panorama", "pano_status", "downBg", "panostat"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)
 		}
