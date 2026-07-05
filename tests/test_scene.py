@@ -158,11 +158,14 @@ class PanoramaTest(unittest.TestCase):
         self.assertIsNotNone(pano)
         self.assertEqual(pano[:2], b"\xff\xd8")            # JPEG out
 
-    def test_stitch_failure_returns_none(self):
+    def test_stitch_failure_falls_back_to_known_pose(self):
+        # featureless frames can't feature-stitch; the known-pose compositor
+        # takes over and still returns a complete panorama
         import cv2
         import numpy as np
         blank = cv2.imencode(".jpg", np.zeros((200, 300, 3), np.uint8))[1].tobytes()
-        self.assertIsNone(scene.build_panorama([(0, -5, blank)] * 4))
+        pano = scene.build_panorama([(p, -5, blank) for p in (-120, -60, 0, 60)])
+        self.assertIsNotNone(pano)
 
     def test_few_frames_returns_none(self):
         self.assertIsNone(scene.build_panorama([(0, 80, b"x"), (0, 80, b"y")]))
@@ -181,6 +184,20 @@ class PanoramaTest(unittest.TestCase):
         out = scene._shrink(big, max_w=800)
         img = cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual(img.shape[1], 800)
+
+    def test_known_pose_fallback_complete(self):
+        # feature-poor frames (solid colors) can't feature-stitch; the known-pose
+        # compositor must still return a COMPLETE 360° band (~no black)
+        import cv2
+        import numpy as np
+        frames = []
+        for i, pan in enumerate((-120, -60, 0, 60, 120, 180)):
+            img = np.full((240, 320, 3), 40 * (i + 1) % 255, np.uint8)
+            frames.append((pan, -5, cv2.imencode(".jpg", img)[1].tobytes()))
+        pano = scene.build_panorama(frames)
+        self.assertIsNotNone(pano)
+        dec = cv2.imdecode(np.frombuffer(pano, np.uint8), cv2.IMREAD_COLOR)
+        self.assertLess(scene._black_fraction(dec), 0.05)
 
     def test_save_scene_writes_panorama(self):
         inv = {"views": [], "overall": ""}

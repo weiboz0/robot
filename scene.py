@@ -175,6 +175,56 @@ def render_inventory(inv) -> str:
     return "\n".join(out) or "(empty scene)"
 
 
+def _compose_known_pose(frames, out_w=4096):
+    """Deterministic fallback panorama: place each ring frame at its KNOWN pan
+    angle on a cylindrical strip (central ~60° crop of the ~130° lens, hard
+    seams, upper ring stacked above eye ring). Always complete — used when
+    feature-based stitching fails or comes back mostly black (feature-poor
+    scenes, e.g. the rover parked against furniture)."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    rings = {}
+    for pan, tilt, img in frames:
+        if tier_label(tilt) == "ceiling":
+            continue
+        rings.setdefault(round(float(tilt), 1), []).append((pan, img))
+    bands = []
+    for tilt in sorted(rings, reverse=True):           # upper band on top
+        seg_w = out_w * 60 // 360
+        band = None
+        for pan, jb in sorted(rings[tilt]):
+            im = cv2.imdecode(np.frombuffer(jb, np.uint8), cv2.IMREAD_COLOR)
+            if im is None:
+                continue
+            h, w = im.shape[:2]
+            crop_w = max(1, int(w * 60.0 / 130.0))     # central 60° of the FOV
+            x0 = (w - crop_w) // 2
+            crop = im[:, x0:x0 + crop_w]
+            seg_h = int(crop.shape[0] * seg_w / crop.shape[1])
+            seg = cv2.resize(crop, (seg_w, seg_h), interpolation=cv2.INTER_AREA)
+            if band is None:
+                band = np.zeros((seg_h, out_w, 3), np.uint8)
+            x = int((((pan + 180.0) % 360.0) / 360.0) * out_w)   # lon-aligned for the viewer
+            for i in range(seg_w):
+                band[:, (x + i) % out_w] = seg[:band.shape[0], i]
+        if band is not None:
+            bands.append(band)
+    if not bands:
+        return None
+    pano = np.vstack(bands)
+    ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    return buf.tobytes() if ok else None
+
+
+def _black_fraction(pano_bgr):
+    import cv2
+    g = cv2.cvtColor(pano_bgr, cv2.COLOR_BGR2GRAY)
+    return float((g < 8).mean())
+
+
 def build_panorama(frames, max_width=4096):
     """Stitch ALL frames (both rings + ceiling — live-tested: the stitcher
     places the ceiling and extends top coverage) into one 360° panorama — the
@@ -196,7 +246,9 @@ def build_panorama(frames, max_width=4096):
     except cv2.error:                      # stitcher can throw, not just non-OK
         return None
     if status != cv2.Stitcher_OK or pano is None:
-        return None
+        return _compose_known_pose(frames, out_w=max_width)
+    if _black_fraction(pano) > 0.28:       # "succeeded" but mostly void → partial
+        return _compose_known_pose(frames, out_w=max_width)
     h, w = pano.shape[:2]
     if w > max_width:
         pano = cv2.resize(pano, (max_width, int(h * max_width / w)),
