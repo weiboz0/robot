@@ -175,46 +175,98 @@ def render_inventory(inv) -> str:
     return "\n".join(out) or "(empty scene)"
 
 
-def _compose_known_pose(frames, out_w=4096):
-    """Deterministic fallback panorama: place each ring frame at its KNOWN pan
-    angle on a cylindrical strip (central ~60° crop of the ~130° lens, hard
-    seams, upper ring stacked above eye ring). Always complete — used when
-    feature-based stitching fails or comes back mostly black (feature-poor
-    scenes, e.g. the rover parked against furniture)."""
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
+def _ring_shift_px(imgs, step_deg=60):
+    """Measured horizontal pixel shift for one pan step: the left edge of the
+    NEXT frame appears somewhere in the PREVIOUS frame — template-match it.
+    Returns the median across pairs (px per step), or None if unmeasurable."""
+    import cv2
+    import numpy as np
+    shifts = []
+    for a, b in zip(imgs, imgs[1:]):
+        h, w = a.shape[:2]
+        strip = slice(int(h * 0.30), int(h * 0.70))
+        tmpl = b[strip, 0:w // 4]
+        res = cv2.matchTemplate(a[strip, :], tmpl, cv2.TM_CCOEFF_NORMED)
+        _, conf, _, loc = cv2.minMaxLoc(res)
+        if conf > 0.5 and 0.15 * w < loc[0] < 0.95 * w:
+            shifts.append(loc[0])
+    if not shifts:
         return None
+    shifts.sort()
+    return float(shifts[len(shifts) // 2])
+
+
+def _compose_known_pose(frames, out_w=4096):
+    """Deterministic fallback panorama (used when feature-stitching fails or
+    gates out): frames are placed at their KNOWN pan angles, scaled by the
+    MEASURED degrees-per-pixel (template-matched overlap between adjacent
+    frames), and feather-BLENDED — no duplicated content at seams. The two
+    rings are blended vertically by their tilt offset."""
+    import cv2
+    import numpy as np
     rings = {}
     for pan, tilt, img in frames:
         if tier_label(tilt) == "ceiling":
             continue
-        rings.setdefault(round(float(tilt), 1), []).append((pan, img))
-    bands = []
-    for tilt in sorted(rings, reverse=True):           # upper band on top
-        seg_w = out_w * 60 // 360
-        band = None
-        for pan, jb in sorted(rings[tilt]):
-            im = cv2.imdecode(np.frombuffer(jb, np.uint8), cv2.IMREAD_COLOR)
-            if im is None:
-                continue
-            h, w = im.shape[:2]
-            crop_w = max(1, int(w * 60.0 / 130.0))     # central 60° of the FOV
-            x0 = (w - crop_w) // 2
-            crop = im[:, x0:x0 + crop_w]
-            seg_h = int(crop.shape[0] * seg_w / crop.shape[1])
-            seg = cv2.resize(crop, (seg_w, seg_h), interpolation=cv2.INTER_AREA)
-            if band is None:
-                band = np.zeros((seg_h, out_w, 3), np.uint8)
-            x = int((((pan + 180.0) % 360.0) / 360.0) * out_w)   # lon-aligned for the viewer
-            for i in range(seg_w):
-                band[:, (x + i) % out_w] = seg[:band.shape[0], i]
-        if band is not None:
-            bands.append(band)
-    if not bands:
+        im = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+        if im is not None:
+            rings.setdefault(round(float(tilt), 1), []).append((pan, im))
+    if not rings:
         return None
-    pano = np.vstack(bands)
+
+    def build_band(ring, step_deg):
+        ring = sorted(ring)
+        imgs = [im for _, im in ring]
+        h, w = imgs[0].shape[:2]
+        shift = _ring_shift_px(imgs, step_deg) or w * step_deg / 130.0
+        scale = (out_w * step_deg / 360.0) / shift    # measured px/deg → output px/deg
+        sw, sh = int(w * scale), int(h * scale)
+        # Keep only each frame's central share (its 60° + a thin blend margin):
+        # blending across the lens's huge distorted overlaps causes ghosting —
+        # thin, near-aligned slivers blend cleanly.
+        step_px = int(out_w * step_deg / 360.0)
+        keep_w = min(sw, int(step_px * 1.30))
+        m = max(1, (keep_w - step_px) // 2 + 2)            # feather = the extra margin
+        acc = np.zeros((sh, out_w, 3), np.float64)
+        wgt = np.zeros((1, out_w, 1), np.float64) + 1e-6
+        ramp = np.ones(keep_w, np.float64)
+        ramp[:m] = np.linspace(0.02, 1, m)
+        ramp[-m:] = np.linspace(1, 0.02, m)
+        for pan, im in ring:
+            seg = cv2.resize(im, (sw, sh), interpolation=cv2.INTER_AREA)
+            c0 = (sw - keep_w) // 2
+            seg = seg[:, c0:c0 + keep_w]
+            xc = ((pan + 180.0) % 360.0) / 360.0 * out_w   # lon-aligned for the viewer
+            x0 = int(xc - keep_w / 2)
+            idx = (np.arange(keep_w) + x0) % out_w
+            acc[:, idx] += seg * ramp[None, :, None]
+            wgt[0, idx, 0] += ramp
+        return (acc / wgt).astype(np.uint8), scale
+
+    step = 60
+    bands = []
+    for tilt in sorted(rings, reverse=True):              # upper band first (top)
+        band, scale = build_band(rings[tilt], step)
+        bands.append((tilt, band, scale))
+    if len(bands) == 1:
+        pano = bands[0][1]
+    else:
+        # vertical placement from tilt difference at the measured px/deg
+        px_per_deg = out_w / 360.0
+        (t_hi, b_hi, _), (t_lo, b_lo, _) = bands[0], bands[1]
+        vshift = int(abs(t_hi - t_lo) * px_per_deg)
+        H = vshift + b_lo.shape[0]
+        acc = np.zeros((H, out_w, 3), np.float64)
+        wgt = np.zeros((H, 1, 1), np.float64) + 1e-6
+        for y0, band in ((0, b_hi), (vshift, b_lo)):
+            h = band.shape[0]
+            r = np.ones(h, np.float64)
+            fm = max(1, int(h * 0.15))
+            r[:fm] = np.linspace(0.02, 1, fm)
+            r[-fm:] = np.linspace(1, 0.02, fm)
+            acc[y0:y0 + h] += band * r[:, None, None]
+            wgt[y0:y0 + h, 0, 0] += r
+        pano = (acc / wgt).astype(np.uint8)
     ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     return buf.tobytes() if ok else None
 
