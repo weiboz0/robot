@@ -5,3 +5,4 @@ photos/
 .DS_Store
 rovercontrol-arm64
 rovercontrol/rovercontrol
+scenes/
