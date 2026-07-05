@@ -130,48 +130,38 @@ class RenderAndPersistTest(unittest.TestCase):
             self.assertEqual(scene.load_latest_scene(scenes_dir=d), (None, None))
 
 
-@unittest.skipUnless(scene and __import__("importlib").util.find_spec("cv2"), "opencv not installed")
+@unittest.skipUnless(__import__("importlib").util.find_spec("cv2"), "opencv not installed")
 class PanoramaTest(unittest.TestCase):
-    def _ring(self):
-        # synthetic overlapping ring: crops sliding across one textured image
+    def _frames(self):
         import cv2
         import numpy as np
         rng = np.random.RandomState(7)
-        base = np.full((500, 2200, 3), 200, np.uint8)
-        for _ in range(160):                                 # distinct matchable features
-            x, y = int(rng.randint(0, 2200)), int(rng.randint(0, 500))
-            c = tuple(int(v) for v in rng.randint(0, 255, 3))
-            if rng.rand() < 0.5:
-                cv2.circle(base, (x, y), int(rng.randint(6, 28)), c, -1)
-            else:
-                cv2.rectangle(base, (x, y), (x + int(rng.randint(10, 60)),
-                                             y + int(rng.randint(10, 60))), c, -1)
         frames = []
-        for i, x in enumerate(range(0, 1500, 300)):
-            crop = base[:, x:x + 700]
-            ok, buf = cv2.imencode(".jpg", crop)
-            frames.append((i * 60 - 120, -5, buf.tobytes()))
+        for pan in (-120, -60, 0, 60, 120, 180):
+            img = np.full((240, 320, 3), 180, np.uint8)
+            for _ in range(30):
+                x, y = int(rng.randint(0, 320)), int(rng.randint(0, 240))
+                cv2.circle(img, (x, y), int(rng.randint(4, 16)),
+                           tuple(int(v) for v in rng.randint(0, 255, 3)), -1)
+            frames.append((pan, -5, cv2.imencode(".jpg", img)[1].tobytes()))
+        frames.append((0, 80, frames[0][2]))                 # a ceiling frame
         return frames
 
-    def test_stitch_overlapping_ring(self):
-        pano = scene.build_panorama(self._ring())
-        self.assertIsNotNone(pano)
-        self.assertEqual(pano[:2], b"\xff\xd8")            # JPEG out
-
-    def test_stitch_failure_falls_back_to_known_pose(self):
-        # featureless frames can't feature-stitch; the known-pose compositor
-        # takes over and still returns a complete panorama
+    def test_equirect_shape_and_coverage(self):
         import cv2
         import numpy as np
-        blank = cv2.imencode(".jpg", np.zeros((200, 300, 3), np.uint8))[1].tobytes()
-        pano = scene.build_panorama([(p, -5, blank) for p in (-120, -60, 0, 60)])
+        pano = scene.build_panorama(self._frames(), width=1200)
         self.assertIsNotNone(pano)
+        img = cv2.imdecode(np.frombuffer(pano, np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual((img.shape[1], img.shape[0]), (1200, 600))   # true 2:1 equirect
+        upper = img[: img.shape[0] * 2 // 3]
+        g = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
+        self.assertLess(float((g < 8).mean()), 0.10)         # sky/ring region covered
 
     def test_few_frames_returns_none(self):
         self.assertIsNone(scene.build_panorama([(0, 80, b"x"), (0, 80, b"y")]))
 
     def test_shrink_passthrough_small(self):
-        # a small frame passes through untouched (vision-call payload helper)
         import cv2
         import numpy as np
         small = cv2.imencode(".jpg", np.zeros((100, 200, 3), np.uint8))[1].tobytes()
@@ -184,20 +174,6 @@ class PanoramaTest(unittest.TestCase):
         out = scene._shrink(big, max_w=800)
         img = cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual(img.shape[1], 800)
-
-    def test_known_pose_fallback_complete(self):
-        # feature-poor frames (solid colors) can't feature-stitch; the known-pose
-        # compositor must still return a COMPLETE 360° band (~no black)
-        import cv2
-        import numpy as np
-        frames = []
-        for i, pan in enumerate((-120, -60, 0, 60, 120, 180)):
-            img = np.full((240, 320, 3), 40 * (i + 1) % 255, np.uint8)
-            frames.append((pan, -5, cv2.imencode(".jpg", img)[1].tobytes()))
-        pano = scene.build_panorama(frames)
-        self.assertIsNotNone(pano)
-        dec = cv2.imdecode(np.frombuffer(pano, np.uint8), cv2.IMREAD_COLOR)
-        self.assertLess(scene._black_fraction(dec), 0.05)
 
     def test_save_scene_writes_panorama(self):
         inv = {"views": [], "overall": ""}

@@ -175,6 +175,183 @@ def render_inventory(inv) -> str:
     return "\n".join(out) or "(empty scene)"
 
 
+def _fisheye_focal(frames):
+    """Fisheye focal (px/radian) measured from the pixel shift between adjacent
+    eye-ring frames (template matching). None if unmeasurable."""
+    import cv2
+    import numpy as np
+    ring = sorted((p, im) for p, t, im in frames if abs(t - SCAN_TILT) < 1)
+    shifts, step = [], None
+    for (p1, a), (p2, b) in zip(ring, ring[1:]):
+        step = abs(p2 - p1)
+        h, w = a.shape[:2]
+        strip = slice(int(h * 0.30), int(h * 0.70))
+        ag = cv2.cvtColor(a[strip], cv2.COLOR_BGR2GRAY)
+        bg = cv2.cvtColor(b[strip], cv2.COLOR_BGR2GRAY)
+        res = cv2.matchTemplate(ag, bg[:, :w // 4], cv2.TM_CCOEFF_NORMED)
+        _, conf, _, loc = cv2.minMaxLoc(res)
+        if conf > 0.5 and 0.15 * w < loc[0] < 0.95 * w:
+            shifts.append(loc[0])
+    if not shifts or not step:
+        return None
+    import math
+    shifts.sort()
+    return shifts[len(shifts) // 2] / math.radians(step)
+
+
+def build_panorama(frames, width=3600):
+    """Project ALL scan frames onto a true 2:1 EQUIRECTANGULAR panorama — the
+    scan's "3D space". The lens is (approximately) an equidistant fisheye, so
+    each frame maps onto the sphere at its KNOWN pan/tilt: r_px = f·θ, with f
+    measured live from adjacent-frame overlap. Frames blend by angular weight
+    (strong at each frame's center, fading at its rim), the ceiling frame fills
+    the zenith, and the un-imaged area under the rover stays dark (physics).
+    Deterministic and complete; geometrically exact for the web viewer's
+    equirect mapping. Returns JPEG bytes or None (no OpenCV / no frames)."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    import math
+    decoded = []
+    for pan, tilt, img in frames:
+        im = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+        if im is not None:
+            decoded.append((float(pan), float(tilt), im))
+    if len(decoded) < 3:
+        return None
+    W = int(width)
+    H = W // 2
+    f = _fisheye_focal(decoded) or decoded[0][2].shape[1] / math.radians(130)
+    lon = (np.arange(W) + 0.5) / W * 2 * math.pi - math.pi
+    lat = math.pi / 2 - (np.arange(H) + 0.5) / H * math.pi
+    LON, LAT = np.meshgrid(lon, lat)
+    wx = np.sin(LON) * np.cos(LAT)
+    wy = np.sin(LAT)
+    wz = np.cos(LON) * np.cos(LAT)
+    acc = np.zeros((H, W, 3), np.float64)
+    wgt = np.zeros((H, W), np.float64) + 1e-9
+    rim = f * math.radians(62)             # usable image circle (~124° of the lens)
+    for pan, tilt, im in decoded:
+        h, w = im.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+        p, t = math.radians(pan), math.radians(tilt)
+        cz = np.array([math.sin(p) * math.cos(t), math.sin(t), math.cos(p) * math.cos(t)])
+        cxv = np.array([math.cos(p), 0.0, -math.sin(p)])
+        cyv = -np.cross(cz, cxv)           # image-down direction
+        dz = wx * cz[0] + wy * cz[1] + wz * cz[2]
+        dx = wx * cxv[0] + wy * cxv[1] + wz * cxv[2]
+        dy = wx * cyv[0] + wy * cyv[1] + wz * cyv[2]
+        theta = np.arccos(np.clip(dz, -1, 1))
+        alpha = np.arctan2(dy, dx)
+        r = f * theta
+        mx = (cx + r * np.cos(alpha)).astype(np.float32)
+        my = (cy + r * np.sin(alpha)).astype(np.float32)
+        valid = (dz > 0.05) & (mx >= 0) & (mx < w - 1) & (my >= 0) & (my < h - 1)
+        wf = np.where(valid, np.clip(1.0 - r / rim, 0, 1) ** 1.5, 0)
+        samp = cv2.remap(im, mx, my, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT)
+        acc += samp * wf[..., None]
+        wgt += wf
+    pano = (acc / wgt[..., None]).astype(np.uint8)
+    ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    return buf.tobytes() if ok else None
+
+
+def render_inventory(inv) -> str:
+    """Compact, chat-friendly text of the scene inventory."""
+    if not isinstance(inv, dict):
+        return str(inv)
+    out = []
+    for v in inv.get("views") or []:
+        objs = "; ".join(
+            " ".join(x for x in (str(o.get("color") or "").strip(),
+                                 str(o.get("name") or "").strip()) if x)
+            + (f" ({o.get('details')})" if o.get("details") else "")
+            for o in (v.get("objects") or []) if isinstance(o, dict))
+        out.append(f"[{v.get('direction', '?')}] {objs or v.get('summary', '')}")
+    if inv.get("overall"):
+        out.append(f"overall: {inv['overall']}")
+    if out:
+        out.append(
+            "note: directions are approximate and OVERLAP — \"behind you\" includes "
+            "back-left, behind AND back-right; \"in front\" includes front-left, front "
+            "AND front-right; the wide lens means one object often appears in several "
+            "adjacent views. Check every relevant view (and object synonyms: bin = "
+            "container = tub = box) before concluding something is not in the scene.")
+    return "\n".join(out) or "(empty scene)"
+
+
+def _ring_shift_px(imgs, step_deg=60):
+    """Measured horizontal pixel shift for one pan step: the left edge of the
+    NEXT frame appears somewhere in the PREVIOUS frame — template-match it.
+    Returns the median across pairs (px per step), or None if unmeasurable."""
+    import cv2
+    import numpy as np
+    shifts = []
+    for a, b in zip(imgs, imgs[1:]):
+        h, w = a.shape[:2]
+        strip = slice(int(h * 0.30), int(h * 0.70))
+        tmpl = b[strip, 0:w // 4]
+        res = cv2.matchTemplate(a[strip, :], tmpl, cv2.TM_CCOEFF_NORMED)
+        _, conf, _, loc = cv2.minMaxLoc(res)
+        if conf > 0.5 and 0.15 * w < loc[0] < 0.95 * w:
+            shifts.append(loc[0])
+    if not shifts:
+        return None
+    shifts.sort()
+    return float(shifts[len(shifts) // 2])
+
+
+def render_inventory(inv) -> str:
+    """Compact, chat-friendly text of the scene inventory."""
+    if not isinstance(inv, dict):
+        return str(inv)
+    out = []
+    for v in inv.get("views") or []:
+        objs = "; ".join(
+            " ".join(x for x in (str(o.get("color") or "").strip(),
+                                 str(o.get("name") or "").strip()) if x)
+            + (f" ({o.get('details')})" if o.get("details") else "")
+            for o in (v.get("objects") or []) if isinstance(o, dict))
+        out.append(f"[{v.get('direction', '?')}] {objs or v.get('summary', '')}")
+    if inv.get("overall"):
+        out.append(f"overall: {inv['overall']}")
+    if out:
+        out.append(
+            "note: directions are approximate and OVERLAP — \"behind you\" includes "
+            "back-left, behind AND back-right; \"in front\" includes front-left, front "
+            "AND front-right; the wide lens means one object often appears in several "
+            "adjacent views. Check every relevant view (and object synonyms: bin = "
+            "container = tub = box) before concluding something is not in the scene.")
+    return "\n".join(out) or "(empty scene)"
+
+
+def render_inventory(inv) -> str:
+    """Compact, chat-friendly text of the scene inventory."""
+    if not isinstance(inv, dict):
+        return str(inv)
+    out = []
+    for v in inv.get("views") or []:
+        objs = "; ".join(
+            " ".join(x for x in (str(o.get("color") or "").strip(),
+                                 str(o.get("name") or "").strip()) if x)
+            + (f" ({o.get('details')})" if o.get("details") else "")
+            for o in (v.get("objects") or []) if isinstance(o, dict))
+        out.append(f"[{v.get('direction', '?')}] {objs or v.get('summary', '')}")
+    if inv.get("overall"):
+        out.append(f"overall: {inv['overall']}")
+    if out:
+        out.append(
+            "note: directions are approximate and OVERLAP — \"behind you\" includes "
+            "back-left, behind AND back-right; \"in front\" includes front-left, front "
+            "AND front-right; the wide lens means one object often appears in several "
+            "adjacent views. Check every relevant view (and object synonyms: bin = "
+            "container = tub = box) before concluding something is not in the scene.")
+    return "\n".join(out) or "(empty scene)"
+
+
 def _ring_shift_px(imgs, step_deg=60):
     """Measured horizontal pixel shift for one pan step: the left edge of the
     NEXT frame appears somewhere in the PREVIOUS frame — template-match it.
@@ -275,38 +452,6 @@ def _black_fraction(pano_bgr):
     import cv2
     g = cv2.cvtColor(pano_bgr, cv2.COLOR_BGR2GRAY)
     return float((g < 8).mean())
-
-
-def build_panorama(frames, max_width=4096):
-    """Stitch ALL frames (both rings + ceiling — live-tested: the stitcher
-    places the ceiling and extends top coverage) into one 360° panorama — the
-    scan's "3D space". Returns JPEG bytes, or None if OpenCV is missing or
-    stitching fails."""
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return None
-    imgs = [cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
-            for pan, tilt, img in frames]
-    imgs = [i for i in imgs if i is not None]
-    if len(imgs) < 3:
-        return None
-    try:
-        st = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
-        status, pano = st.stitch(imgs)
-    except cv2.error:                      # stitcher can throw, not just non-OK
-        return None
-    if status != cv2.Stitcher_OK or pano is None:
-        return _compose_known_pose(frames, out_w=max_width)
-    if _black_fraction(pano) > 0.28:       # "succeeded" but mostly void → partial
-        return _compose_known_pose(frames, out_w=max_width)
-    h, w = pano.shape[:2]
-    if w > max_width:
-        pano = cv2.resize(pano, (max_width, int(h * max_width / w)),
-                          interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
-    return buf.tobytes() if ok else None
 
 
 def save_scene(frames, inv, scenes_dir=SCENES_DIR, panorama=None):
