@@ -2218,11 +2218,11 @@ async function pano3d(){
   cv.onmousedown=e=>{drag=[e.clientX,e.clientY];cv.style.cursor='grabbing';};
   addEventListener('mouseup',()=>{drag=null;cv.style.cursor='grab';});
   addEventListener('mousemove',e=>{if(!drag)return;
-   yaw-=(e.clientX-drag[0])*0.005;pitch+=(e.clientY-drag[1])*0.005;
+   yaw-=(e.clientX-drag[0])*0.005;pitch-=(e.clientY-drag[1])*0.005;
    pitch=Math.max(-vspan/2,Math.min(vspan/2,pitch));drag=[e.clientX,e.clientY];draw();});
   cv.ontouchstart=e=>{drag=[e.touches[0].clientX,e.touches[0].clientY];};
   cv.ontouchmove=e=>{if(!drag)return;const t0=e.touches[0];
-   yaw-=(t0.clientX-drag[0])*0.005;pitch+=(t0.clientY-drag[1])*0.005;
+   yaw-=(t0.clientX-drag[0])*0.005;pitch-=(t0.clientY-drag[1])*0.005;
    pitch=Math.max(-vspan/2,Math.min(vspan/2,pitch));drag=[t0.clientX,t0.clientY];draw();e.preventDefault();};
   cv.onwheel=e=>{fov=Math.max(0.4,Math.min(2.0,fov+e.deltaY*0.001));draw();e.preventDefault();};
   draw();
