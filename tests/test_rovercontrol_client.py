@@ -159,6 +159,17 @@ class RovercontrolGetTest(unittest.TestCase):
         rc.urllib.request.urlopen = lambda url, timeout=None: StreamResp()
         self.assertEqual(rc.get_stream_frame(), b"\xff\xd8JPEGDATA\xff\xd9")
 
+    def test_set_panorama_posts_jpeg(self):
+        captured = {}
+        def fake(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["body"] = req.data
+            return FakeJSONResp('{"ok":true}')
+        rc.urllib.request.urlopen = fake
+        rc.set_panorama(b"\xff\xd8PANODATA")
+        self.assertTrue(captured["url"].endswith("/panorama"))
+        self.assertEqual(captured["body"][:2], b"\xff\xd8")
+
     def test_get_photo_returns_bytes(self):
         rc.urllib.request.urlopen = lambda url, timeout=None: FakeJSONResp("BINARYJPEG")
         self.assertEqual(rc.get_photo("rover_z.jpg"), b"BINARYJPEG")

@@ -130,5 +130,50 @@ class RenderAndPersistTest(unittest.TestCase):
             self.assertEqual(scene.load_latest_scene(scenes_dir=d), (None, None))
 
 
+@unittest.skipUnless(scene and __import__("importlib").util.find_spec("cv2"), "opencv not installed")
+class PanoramaTest(unittest.TestCase):
+    def _ring(self):
+        # synthetic overlapping ring: crops sliding across one textured image
+        import cv2
+        import numpy as np
+        rng = np.random.RandomState(7)
+        base = np.full((500, 2200, 3), 200, np.uint8)
+        for _ in range(160):                                 # distinct matchable features
+            x, y = int(rng.randint(0, 2200)), int(rng.randint(0, 500))
+            c = tuple(int(v) for v in rng.randint(0, 255, 3))
+            if rng.rand() < 0.5:
+                cv2.circle(base, (x, y), int(rng.randint(6, 28)), c, -1)
+            else:
+                cv2.rectangle(base, (x, y), (x + int(rng.randint(10, 60)),
+                                             y + int(rng.randint(10, 60))), c, -1)
+        frames = []
+        for i, x in enumerate(range(0, 1500, 300)):
+            crop = base[:, x:x + 700]
+            ok, buf = cv2.imencode(".jpg", crop)
+            frames.append((i * 60 - 120, -5, buf.tobytes()))
+        return frames
+
+    def test_stitch_overlapping_ring(self):
+        pano = scene.build_panorama(self._ring())
+        self.assertIsNotNone(pano)
+        self.assertEqual(pano[:2], b"\xff\xd8")            # JPEG out
+
+    def test_stitch_failure_returns_none(self):
+        import cv2
+        import numpy as np
+        blank = cv2.imencode(".jpg", np.zeros((200, 300, 3), np.uint8))[1].tobytes()
+        self.assertIsNone(scene.build_panorama([(0, -5, blank)] * 4))
+
+    def test_ceiling_frame_excluded_and_few_frames_none(self):
+        self.assertIsNone(scene.build_panorama([(0, 80, b"x"), (0, 80, b"y")]))
+
+    def test_save_scene_writes_panorama(self):
+        inv = {"views": [], "overall": ""}
+        with tempfile.TemporaryDirectory() as d:
+            saved = scene.save_scene([(0, -5, b"JPEG0")], inv, scenes_dir=d,
+                                     panorama=b"\xff\xd8PANO")
+            self.assertTrue(os.path.exists(os.path.join(saved, "panorama.jpg")))
+
+
 if __name__ == "__main__":
     unittest.main()

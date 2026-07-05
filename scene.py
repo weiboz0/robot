@@ -158,7 +158,36 @@ def render_inventory(inv) -> str:
     return "\n".join(out) or "(empty scene)"
 
 
-def save_scene(frames, inv, scenes_dir=SCENES_DIR):
+def build_panorama(frames, max_width=2400):
+    """Stitch the ring frames (eye-level + upper; the ceiling frame's geometry
+    doesn't overlap usefully) into one 360° panorama — the scan's "3D space".
+    Returns JPEG bytes, or None if OpenCV is missing or stitching fails."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    imgs = [cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+            for pan, tilt, img in frames if tier_label(tilt) != "ceiling"]
+    imgs = [i for i in imgs if i is not None]
+    if len(imgs) < 3:
+        return None
+    try:
+        st = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
+        status, pano = st.stitch(imgs)
+    except cv2.error:                      # stitcher can throw, not just non-OK
+        return None
+    if status != cv2.Stitcher_OK or pano is None:
+        return None
+    h, w = pano.shape[:2]
+    if w > max_width:
+        pano = cv2.resize(pano, (max_width, int(h * max_width / w)),
+                          interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    return buf.tobytes() if ok else None
+
+
+def save_scene(frames, inv, scenes_dir=SCENES_DIR, panorama=None):
     """Persist frames + inventory under scenes/<local timestamp>/; returns the dir."""
     d = os.path.join(scenes_dir, time.strftime("%Y%m%d_%H%M%S"))
     n = 1
@@ -171,6 +200,9 @@ def save_scene(frames, inv, scenes_dir=SCENES_DIR):
             f.write(img)
     with open(os.path.join(d, "inventory.json"), "w") as f:
         json.dump(inv, f, indent=1)
+    if panorama:
+        with open(os.path.join(d, "panorama.jpg"), "wb") as f:
+            f.write(panorama)
     return d
 
 

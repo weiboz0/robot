@@ -1784,6 +1784,29 @@ func (app *App) routes() http.Handler {
 		}
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
+	// 360° panorama — the scan's "3D space" (plan 023). POST stores the latest
+	// stitched JPEG; GET serves it for the website's look-around viewer.
+	mux.HandleFunc("POST /panorama", func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+		if err != nil || len(b) < 4 || b[0] != 0xff || b[1] != 0xd8 {
+			errJSON(w, http.StatusBadRequest, "body must be a JPEG (max 8MB)")
+			return
+		}
+		if err := os.WriteFile(filepath.Join(app.photoDir, "panorama.jpg"), b, 0o644); err != nil {
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "bytes": len(b)})
+	})
+	mux.HandleFunc("GET /panorama", func(w http.ResponseWriter, r *http.Request) {
+		p := filepath.Join(app.photoDir, "panorama.jpg")
+		if _, err := os.Stat(p); err != nil {
+			errJSON(w, http.StatusNotFound, "no panorama yet — run a scene scan")
+			return
+		}
+		http.ServeFile(w, r, p)
+	})
+
 	mux.HandleFunc("GET /photo_meta/", func(w http.ResponseWriter, r *http.Request) {
 		name, ok := photoName(r.URL.Path, "/photo_meta/")
 		if !ok {
@@ -1986,6 +2009,7 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
 <header><h1>🤖 Rover controller</h1>
  <button class="warn" onclick="cmd('estop')">⛔ E-STOP</button>
  <button onclick="snap()">📸 Snapshot</button>
+ <button onclick="pano3d()">🌐 3D view</button>
  <span id="gp" style="font-size:12px;color:#999">🎮 none (press a button)</span>
  <span id="health"><small>…</small></span>
 </header>
@@ -2088,6 +2112,93 @@ async function load(){
   '<figcaption><span>'+n+'</span>'+
   (outlined.has(n)?'<button onclick="outline(this,\''+n+'\')" title="toggle found-object outline">◻</button>':'')+
   '<button class="warn" onclick="del(\''+n+'\')">del</button></figcaption></figure>').join('');
+}
+// ── 🌐 3D view: drag-to-look-around viewer over the stitched 360° panorama ──
+// WebGL fragment shader maps view direction -> equirect UV. The pano's vertical
+// span is inferred from its aspect (equirect: width = 360°). Esc/background
+// closes. Falls back to a scrollable flat image if WebGL is unavailable.
+async function pano3d(){
+ const head=await fetch('/panorama',{method:'HEAD'}).catch(()=>null);
+ if(!head||!head.ok){cout('no 3D space yet — run a scene scan ($scan in the chatbot)');return;}
+ const lb=document.createElement('div');lb.className='lb';
+ lb.onclick=e=>{if(e.target===lb)lb.remove();};
+ const bar=document.createElement('div');bar.className='lbbar';
+ const x=document.createElement('button');x.textContent='✕ close';x.onclick=()=>lb.remove();
+ bar.appendChild(x);
+ const img=new Image();
+ img.onload=function(){
+  const cv=document.createElement('canvas');
+  cv.width=Math.min(innerWidth*0.92,1280);cv.height=Math.min(innerHeight*0.8,720);
+  cv.style.borderRadius='8px';cv.style.cursor='grab';
+  const gl=cv.getContext('webgl');
+  if(!gl){ // fallback: flat scrollable pano
+   const wrap=document.createElement('div');
+   wrap.style.cssText='max-width:92vw;max-height:80vh;overflow:auto';
+   img.style.maxHeight='78vh';wrap.appendChild(img);lb.appendChild(wrap);return;
+  }
+  lb.appendChild(cv);
+  const vs='attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}';
+  const fs='precision mediump float;uniform sampler2D t;uniform vec2 res;'+
+   'uniform float yaw,pitch,fov,vspan;'+
+   'void main(){vec2 uv=(gl_FragCoord.xy/res-0.5);'+
+   'float ar=res.x/res.y;'+
+   'vec3 d=normalize(vec3(uv.x*ar*tan(fov*0.5)*2.0,uv.y*tan(fov*0.5)*2.0,1.0));'+
+   'float cy=cos(pitch),sy=sin(pitch);'+
+   'vec3 d2=vec3(d.x,d.y*cy - d.z*sy,d.y*sy + d.z*cy);'+
+   'float cx=cos(yaw),sx=sin(yaw);'+
+   'vec3 d3=vec3(d2.x*cx + d2.z*sx,d2.y,-d2.x*sx + d2.z*cx);'+
+   'float lon=atan(d3.x,d3.z);float lat=asin(clamp(d3.y,-1.,1.));'+
+   'float u=lon/6.2831853+0.5;float v=0.5 - lat/vspan;'+
+   'if(v<0.||v>1.){gl_FragColor=vec4(0.06,0.06,0.06,1);}'+
+   'else{gl_FragColor=texture2D(t,vec2(u,v));}}';
+  function sh(ty,src){const h=gl.createShader(ty);gl.shaderSource(h,src);gl.compileShader(h);return h;}
+  const pr=gl.createProgram();
+  gl.attachShader(pr,sh(gl.VERTEX_SHADER,vs));gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(pr);
+  if(!gl.getProgramParameter(pr,gl.LINK_STATUS)){    // shader failed → flat fallback
+   cv.remove();const wrap=document.createElement('div');
+   wrap.style.cssText='max-width:92vw;max-height:80vh;overflow:auto';
+   img.style.maxHeight='78vh';wrap.appendChild(img);lb.appendChild(wrap);return;
+  }
+  gl.useProgram(pr);
+  const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  const loc=gl.getAttribLocation(pr,'p');gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+  const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  // vertical span from aspect: equirect width = 2π rad
+  const vspan=Math.min(3.14159,6.2831853*img.height/img.width);
+  let yaw=0,pitch=0,fov=1.2,drag=null;
+  function draw(){
+   gl.viewport(0,0,cv.width,cv.height);
+   gl.uniform2f(gl.getUniformLocation(pr,'res'),cv.width,cv.height);
+   gl.uniform1f(gl.getUniformLocation(pr,'yaw'),yaw);
+   gl.uniform1f(gl.getUniformLocation(pr,'pitch'),pitch);
+   gl.uniform1f(gl.getUniformLocation(pr,'fov'),fov);
+   gl.uniform1f(gl.getUniformLocation(pr,'vspan'),vspan);
+   gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  }
+  cv.onmousedown=e=>{drag=[e.clientX,e.clientY];cv.style.cursor='grabbing';};
+  addEventListener('mouseup',()=>{drag=null;cv.style.cursor='grab';});
+  addEventListener('mousemove',e=>{if(!drag)return;
+   yaw-=(e.clientX-drag[0])*0.005;pitch+=(e.clientY-drag[1])*0.005;
+   pitch=Math.max(-vspan/2,Math.min(vspan/2,pitch));drag=[e.clientX,e.clientY];draw();});
+  cv.ontouchstart=e=>{drag=[e.touches[0].clientX,e.touches[0].clientY];};
+  cv.ontouchmove=e=>{if(!drag)return;const t0=e.touches[0];
+   yaw-=(t0.clientX-drag[0])*0.005;pitch+=(t0.clientY-drag[1])*0.005;
+   pitch=Math.max(-vspan/2,Math.min(vspan/2,pitch));drag=[t0.clientX,t0.clientY];draw();e.preventDefault();};
+  cv.onwheel=e=>{fov=Math.max(0.4,Math.min(2.0,fov+e.deltaY*0.001));draw();e.preventDefault();};
+  draw();
+ };
+ img.src='/panorama?ts='+Date.now();
+ lb.appendChild(bar);
+ document.body.appendChild(lb);
+ document.addEventListener('keydown',function esc(e){
+  if(e.key==='Escape'){lb.remove();document.removeEventListener('keydown',esc);}});
 }
 async function fetchMeta(n){
  try{const r=await fetch('/photo_meta/'+encodeURIComponent(n));if(r.ok)return await r.json();}catch(e){}

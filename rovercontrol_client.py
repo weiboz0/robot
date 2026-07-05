@@ -178,6 +178,15 @@ def get_stream_frame(timeout: float = 6.0) -> bytes:
     raise OSError("no frame from the camera stream")
 
 
+def set_panorama(jpeg: bytes, timeout: float = 20.0) -> None:
+    """Upload the stitched 360° panorama (the scan's '3D space') — POST /panorama.
+    The website's 🌐 3D view renders it."""
+    req = urllib.request.Request(_base() + "/panorama", data=jpeg, method="POST",
+                                 headers={"Content-Type": "image/jpeg"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        r.read()
+
+
 def set_photo_meta(name: str, meta: dict, timeout: float = 5.0) -> None:
     """Store outline metadata for a photo — POST /photo_meta/<name> with a JSON
     body {target,color,bbox,confidence}. The gallery's ◻ toggle reads it back."""
