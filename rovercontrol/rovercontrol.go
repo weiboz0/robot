@@ -509,8 +509,8 @@ func resolveCameraMode(mode, device string) string {
 // Override per-launch with -width/-height/-fps. (USB/V4L2 honours -fps via
 // --set-parm; see buildCameraCmd.)
 const (
-	defaultCamWidth  = 640
-	defaultCamHeight = 480
+	defaultCamWidth  = 1920 // the UVC cam offers 1080p MJPG — 3x the detail of
+	defaultCamHeight = 1080 // 640x480 (panorama sharpness; detection unaffected)
 	defaultCamFPS    = 15
 )
 
@@ -797,6 +797,10 @@ type App struct {
 	cam   *Camera
 
 	photoDir string
+
+	panoMu      sync.Mutex // scan-progress indicator state (plan 023b)
+	panoState   string
+	panoStateAt time.Time
 	snapMu   sync.Mutex
 	snapSeq  int
 
@@ -1784,6 +1788,32 @@ func (app *App) routes() http.Handler {
 		}
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
+	// scan progress indicator (plan 023b): the chatbot posts its stage; the web
+	// page polls and shows a badge next to the 🌐 button.
+	mux.HandleFunc("POST /pano_status", func(w http.ResponseWriter, r *http.Request) {
+		st := r.URL.Query().Get("state")
+		switch st {
+		case "scanning", "describing", "stitching", "uploading", "done", "failed", "idle":
+		default:
+			errJSON(w, http.StatusBadRequest, "bad state")
+			return
+		}
+		app.panoMu.Lock()
+		app.panoState, app.panoStateAt = st, time.Now()
+		app.panoMu.Unlock()
+		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("GET /pano_status", func(w http.ResponseWriter, r *http.Request) {
+		app.panoMu.Lock()
+		st, at := app.panoState, app.panoStateAt
+		app.panoMu.Unlock()
+		age := -1.0
+		if !at.IsZero() {
+			age = time.Since(at).Seconds()
+		}
+		writeJSON(w, 200, map[string]any{"state": st, "age_s": age})
+	})
+
 	// 360° panorama — the scan's "3D space" (plan 023). POST stores the latest
 	// stitched JPEG; GET serves it for the website's look-around viewer.
 	mux.HandleFunc("POST /panorama", func(w http.ResponseWriter, r *http.Request) {
@@ -2010,6 +2040,7 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  <button class="warn" onclick="cmd('estop')">⛔ E-STOP</button>
  <button onclick="snap()">📸 Snapshot</button>
  <button onclick="pano3d()">🌐 3D view</button>
+ <span id="panostat"><small></small></span>
  <span id="gp" style="font-size:12px;color:#999">🎮 none (press a button)</span>
  <span id="health"><small>…</small></span>
 </header>
@@ -2121,7 +2152,9 @@ async function pano3d(){
  const head=await fetch('/panorama',{method:'HEAD'}).catch(()=>null);
  if(!head||!head.ok){cout('no 3D space yet — run a scene scan ($scan in the chatbot)');return;}
  const lb=document.createElement('div');lb.className='lb';
- lb.onclick=e=>{if(e.target===lb)lb.remove();};
+ let downBg=false;                              // drag-safe: press AND release on the
+ lb.onmousedown=e=>{downBg=(e.target===lb);};   // background — releasing a look-around
+ lb.onclick=e=>{if(e.target===lb&&downBg)lb.remove();};  // drag outside must NOT close
  const bar=document.createElement('div');bar.className='lbbar';
  const x=document.createElement('button');x.textContent='✕ close';x.onclick=()=>lb.remove();
  bar.appendChild(x);
@@ -2216,7 +2249,9 @@ function boxLabel(d,m){
 async function lightbox(n){
  const m=await fetchMeta(n);
  const lb=document.createElement('div');lb.className='lb';
- lb.onclick=e=>{if(e.target===lb)lb.remove();};
+ let downBg=false;
+ lb.onmousedown=e=>{downBg=(e.target===lb);};
+ lb.onclick=e=>{if(e.target===lb&&downBg)lb.remove();};
  const wrap=document.createElement('div');wrap.className='lbwrap';
  const img=document.createElement('img');img.src='/photos/'+encodeURIComponent(n);
  wrap.appendChild(img);
@@ -2434,10 +2469,20 @@ function saveProg(){if(!prog.length)return;const n=(prompt('Save program as:')||
  localStorage.setItem('roverprog:'+n,JSON.stringify(prog));refreshSaved();cout('saved "'+n+'"');}
 function loadProg(n){if(!n)return;try{const p=JSON.parse(localStorage.getItem('roverprog:'+n));
  if(Array.isArray(p)){prog=p.filter(x=>typeof x==='string');renderProg();cout('loaded "'+n+'"');}}catch(e){}}
+const PANO_LABELS={scanning:'📷 scanning the room…',describing:'🧠 building scene memory…',
+ stitching:'🌀 creating 3D view…',uploading:'⬆ saving 3D view…'};
+async function panoStat(){try{
+ const j=await(await fetch('/pano_status')).json();
+ const el=document.getElementById('panostat');if(!el)return;
+ if(PANO_LABELS[j.state])el.innerHTML='<small>'+PANO_LABELS[j.state]+'</small>';
+ else if(j.state==='done'&&j.age_s>=0&&j.age_s<60)el.innerHTML='<small>✅ 3D view updated</small>';
+ else if(j.state==='failed'&&j.age_s>=0&&j.age_s<60)el.innerHTML='<small>⚠ 3D view failed</small>';
+ else el.textContent='';
+}catch(e){}}
 async function health(){try{const h=await(await fetch('/healthz')).json();
  document.getElementById('health').innerHTML='<small>serial '+(h.serial.up?'✓':'✗')+
  ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad.up?'✓':'–')+'</small>';}catch(e){}}
-setInterval(()=>{load();health();},2000);load();health();initCap();renderProg();refreshSaved();
+setInterval(()=>{load();health();panoStat();},2000);load();health();panoStat();initCap();renderProg();refreshSaved();
 
 // ── Mac-side gamepad: Gamepad API → existing HTTP endpoints (no server change).
 // Drive is in-flight-guarded and refreshed continuously while deflected (feeds

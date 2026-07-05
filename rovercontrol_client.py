@@ -178,6 +178,14 @@ def get_stream_frame(timeout: float = 6.0) -> bytes:
     raise OSError("no frame from the camera stream")
 
 
+def set_pano_status(state: str, timeout: float = 4.0) -> None:
+    """Report scan progress for the website badge — POST /pano_status?state=."""
+    req = urllib.request.Request(
+        _base() + "/pano_status?" + urllib.parse.urlencode({"state": state}), method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        r.read()
+
+
 def set_panorama(jpeg: bytes, timeout: float = 20.0) -> None:
     """Upload the stitched 360° panorama (the scan's '3D space') — POST /panorama.
     The website's 🌐 3D view renders it."""

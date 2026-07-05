@@ -231,19 +231,29 @@ def scan_surroundings(rover):
         return f"scene scan needs a vision model: {e}"
     import scene
     import rovercontrol_client as client
+    def status(st):
+        try:
+            client.set_pano_status(st)     # website badge; best-effort
+        except Exception:
+            pass
     print("   scanning 360° (camera only — wheels untouched)...")
+    status("scanning")
     frames = scene.scan_frames(client, log=lambda m: print("   " + m))
     print("   describing the scene (one vision call over all views)...")
+    status("describing")
     inv = scene.describe_scene(vm, frames, log=lambda m: print("   " + m))
     print("   stitching the 3D space (360° panorama)...")
+    status("stitching")
     pano = scene.build_panorama(frames)
     pano_note = "no 3D space (stitch failed)"
     if pano:
         try:
+            status("uploading")
             client.set_panorama(pano)
             pano_note = "3D space saved — press 🌐 3D view on the website to look around"
         except Exception as e:
             pano_note = f"3D space stitched but upload failed: {e}"
+    status("done" if pano and "saved" in pano_note else "failed")
     d = scene.save_scene(frames, inv, panorama=pano)
     text = scene.render_inventory(inv)
     LAST_SCENE.update(text=text, when=time.strftime("%H:%M"))
