@@ -96,6 +96,7 @@ class RenderAndPersistTest(unittest.TestCase):
         self.assertIn("[behind]", text)
         self.assertIn("grey bin (black lid)", text)
         self.assertIn("overall: a tidy room", text)
+        self.assertIn("OVERLAP", text)                          # direction-overlap legend
 
     def test_save_and_load_roundtrip(self):
         inv = {"views": [{"direction": "front", "objects": [], "summary": "s"}],
