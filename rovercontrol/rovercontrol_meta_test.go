@@ -89,10 +89,27 @@ func TestPhotoMetaValidation(t *testing.T) {
 	}
 }
 
+func TestPanoramaEndpoints(t *testing.T) {
+	app, _ := testApp(t)
+	if w := do(t, app, "GET", "/panorama"); w.Code != 404 {
+		t.Fatalf("GET before upload = %d (want 404)", w.Code)
+	}
+	jpeg := "\xff\xd8fakejpegdata"
+	if w := doJSON(t, app, "POST", "/panorama", jpeg); w.Code != 200 {
+		t.Fatalf("POST pano = %d %s", w.Code, w.Body.String())
+	}
+	if w := doJSON(t, app, "POST", "/panorama", "not a jpeg"); w.Code != 400 {
+		t.Fatalf("POST non-jpeg = %d (want 400)", w.Code)
+	}
+	if w := do(t, app, "GET", "/panorama"); w.Code != 200 || w.Body.String() != jpeg {
+		t.Fatalf("GET pano = %d", w.Code)
+	}
+}
+
 func TestWebUIHasOutlineToggle(t *testing.T) {
 	app, _ := testApp(t)
 	body := do(t, app, "GET", "/").Body.String()
-	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel("} {
+	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel(", "pano3d(", "3D view", "/panorama"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)
 		}
