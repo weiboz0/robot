@@ -103,6 +103,13 @@ def render_inventory(inv) -> str:
         out.append(f"[{v.get('direction', '?')}] {objs or v.get('summary', '')}")
     if inv.get("overall"):
         out.append(f"overall: {inv['overall']}")
+    if out:
+        out.append(
+            "note: directions are approximate and OVERLAP — \"behind you\" includes "
+            "back-left, behind AND back-right; \"in front\" includes front-left, front "
+            "AND front-right; the wide lens means one object often appears in several "
+            "adjacent views. Check every relevant view (and object synonyms: bin = "
+            "container = tub = box) before concluding something is not in the scene.")
     return "\n".join(out) or "(empty scene)"
 
 
