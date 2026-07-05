@@ -215,6 +215,44 @@ def autonomous_find(rover, target):
     return f"did not find {target} within the budget — wheels stopped."
 
 
+# ------------------------------------------------- 360° scene scan (plan 022)
+LAST_SCENE = {"text": None, "when": None}
+
+
+def scan_surroundings(rover):
+    """Camera-only 360° scan → direction-labeled inventory (the 'map'). Returns
+    the full inventory text so follow-up questions are answered from context."""
+    if rover is None or rover.backend != "rovercontrol":
+        return "scene scan needs the rovercontrol backend (:8080)."
+    try:
+        import vision as _vision
+        vm = _vision.VisionModel(timeout=90)   # one big multi-image call
+    except Exception as e:
+        return f"scene scan needs a vision model: {e}"
+    import scene
+    import rovercontrol_client as client
+    print("   scanning 360° (camera only — wheels untouched)...")
+    frames = scene.scan_frames(client, log=lambda m: print("   " + m))
+    print("   describing the scene (one vision call over all views)...")
+    inv = scene.describe_scene(vm, frames, log=lambda m: print("   " + m))
+    d = scene.save_scene(frames, inv)
+    text = scene.render_inventory(inv)
+    LAST_SCENE.update(text=text, when=time.strftime("%H:%M"))
+    return (f"SCENE MEMORY (360° scan, saved to {os.path.basename(d)}) — answer "
+            f"questions about the surroundings from this, do NOT re-scan unless "
+            f"the room changed:\n{text}")
+
+
+def recall_scene():
+    if LAST_SCENE["text"]:
+        return f"scene memory from {LAST_SCENE['when']}:\n{LAST_SCENE['text']}"
+    import scene
+    d, inv = scene.load_latest_scene()
+    if inv is None:
+        return "no scene memory yet — run a scan first (rover_scan_surroundings / $scan)."
+    return f"scene memory (loaded from {os.path.basename(d)}):\n{scene.render_inventory(inv)}"
+
+
 # --------------------------------------------------------------------- tools
 def build_tools(rover, arm):
     tools = []
@@ -263,6 +301,17 @@ def build_tools(rover, arm):
              "parameters": {"type": "object", "properties": {}}},
             {"name": "rover_list_photos",
              "description": "List photo filenames taken by the rover camera, newest first.",
+             "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_scan_surroundings",
+             "description": "Build a 360° spatial memory: the camera sweeps a full circle "
+                            "(wheels never move) and every direction is inventoried (objects, "
+                            "colors, positions). AFTER a scan, answer questions about the "
+                            "surroundings from the returned inventory — do NOT re-scan or look "
+                            "again unless the user says the room changed.",
+             "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_scene_recall",
+             "description": "Recall the most recent 360° scene memory (use when asked about "
+                            "the surroundings and no scan result is in the conversation).",
              "parameters": {"type": "object", "properties": {}}},
             {"name": "rover_find_object",
              "description": "Physically search for an object: the rover autonomously scans, "
@@ -333,6 +382,10 @@ def run_tool(rover, arm, name, a):
             if not t:
                 return "rover_find_object needs a target description"
             return autonomous_find(rover, t)
+        if name == "rover_scan_surroundings":
+            return scan_surroundings(rover)
+        if name == "rover_scene_recall":
+            return recall_scene()
         if name == "dobot_get_pose":
             return arm.pose()
         if name == "dobot_get_mode":
@@ -360,7 +413,11 @@ SYSTEM = (
     "Use rover_get_status to check what is connected. When the user asks you to "
     "find/look for a physical object, use rover_find_object with a color in the "
     "description (e.g. 'a green pen') — it drives itself and returns an outlined "
-    "photo; report the result including the photo name. "
+    "photo; report the result including the photo name. rover_scan_surroundings "
+    "builds a 360-degree memory of the room; AFTER a scan, answer questions about "
+    "the surroundings (colors, what is where, what is behind you) from the scan "
+    "text already in the conversation — never re-scan or move the camera for "
+    "them; use rover_scene_recall if the scan text is no longer in context. "
     "Dobot: coordinates are mm (x,y,z) and degrees (r); move "
     "conservatively and enable the arm before moving. After acting, briefly say what "
     "you did. Be concise."
@@ -453,6 +510,8 @@ def main():
                                   else arm.dashboard(raw))
                         except Exception as e:
                             print(f"  dobot error: {e}")
+                elif cmd.lower() == "scan":
+                    print(" ", scan_surroundings(rover))
                 elif cmd.lower() in FIND_SHORTCUTS or cmd.lower().startswith("find "):
                     target = FIND_SHORTCUTS.get(cmd.lower()) or cmd[5:].strip()
                     print(" ", autonomous_find(rover, target))

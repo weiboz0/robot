@@ -88,6 +88,24 @@ class VisionModel:
             self._client = OpenAI(api_key=self.api_key, base_url=self.base_url,
                                   timeout=timeout, max_retries=1)
 
+    def describe_many(self, labeled_images, prompt: str, *, json_out: bool = False,
+                      max_tokens: int = 1800) -> "str | dict":
+        """Multi-image call: labeled_images = [(label, jpeg_bytes), ...]. Each
+        image is preceded by its text label so the model can reference views."""
+        content = [{"type": "text", "text": prompt}]
+        for label, img in labeled_images:
+            b64 = base64.b64encode(img).decode()
+            content.append({"type": "text", "text": label})
+            content.append({"type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64," + b64}})
+        kw = {"model": self.model, "max_tokens": max_tokens,
+              "messages": [{"role": "user", "content": content}]}
+        if json_out:
+            kw["response_format"] = {"type": "json_object"}
+        resp = self._client.chat.completions.create(**kw)
+        text = resp.choices[0].message.content or ""
+        return _extract_json(text) if json_out else text.strip()
+
     def describe(self, image_bytes: bytes, prompt: str, *, json_out: bool = False,
                  max_tokens: int = 400) -> "str | dict":
         """Send the frame + prompt; return text, or a parsed dict if json_out."""
