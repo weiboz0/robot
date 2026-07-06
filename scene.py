@@ -356,7 +356,9 @@ def _stitcher_pano(frames, max_width=4096):
     if status != cv2.Stitcher_OK or pano is None:
         return None
     g = cv2.cvtColor(pano, cv2.COLOR_BGR2GRAY)
-    if float((g < 8).mean()) > 0.25:
+    # Good stitches carry ~10-15% black border from the projection bounds; the
+    # degenerate under-furniture scene measured 22-39%. Gate between them.
+    if float((g < 8).mean()) > 0.18:
         return None
     h, w = pano.shape[:2]
     if w > max_width:
