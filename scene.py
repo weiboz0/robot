@@ -151,6 +151,44 @@ def describe_scene(vision, frames, log=lambda m: None):
     return inv
 
 
+SWEEP_RING_STEP = 10      # sweep density: 10° + a real settle = sharp frames
+                          # (2.5°/0.1s live-tested: gimbal never stops → motion blur)
+SWEEP_FRAME_W = 960       # downscale in flight (a strip only needs ~25px anyway)
+
+
+def sweep_frames(client, *, tilts=(SCAN_TILT, UPPER_TILT), step_deg=SWEEP_RING_STEP,
+                 settle_s=0.9, ceiling=True, sleep=time.sleep, log=lambda m: None):
+    """Dense video-style sweep for the panorama build: both rings in a
+    serpentine at `step_deg`, plus one ceiling still. Frames are downscaled in
+    flight (memory). Nothing is saved anywhere — the frames are raw material
+    for build_panorama and are discarded after. Camera only."""
+    def shrink(jpeg):
+        return _shrink(jpeg, max_w=SWEEP_FRAME_W)
+    frames = []
+    try:
+        for i, tilt in enumerate(tilts):
+            pans = [(-180.0 + k * step_deg) for k in range(int(360.0 / step_deg) + 1)]
+            if i % 2 == 1:
+                pans.reverse()
+            for pan in pans:
+                client.set_camera(pan, tilt)
+                sleep(settle_s)
+                frames.append((pan, tilt, shrink(client.get_stream_frame())))
+                if len(frames) % 40 == 0:
+                    log(f"  swept {len(frames)} frames (pan {pan:.0f}°, tilt {tilt:.0f}°)")
+        if ceiling:
+            client.set_camera(frames[-1][0] if frames else 0, CEILING_TILT)
+            sleep(1.0)
+            frames.append((frames[-1][0] if frames else 0, CEILING_TILT,
+                           shrink(client.get_stream_frame())))
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return frames
+
+
 TOUR_STEP_DEG = 2.5
 TOUR_TILT = -5.0
 TOUR_SETTLE_S = 0.10
@@ -219,7 +257,241 @@ def _fisheye_focal(frames):
         bg = cv2.cvtColor(b[strip], cv2.COLOR_BGR2GRAY)
         res = cv2.matchTemplate(ag, bg[:, :w // 4], cv2.TM_CCOEFF_NORMED)
         _, conf, _, loc = cv2.minMaxLoc(res)
-        if conf > 0.5 and 0.15 * w < loc[0] < 0.95 * w:
+        if conf > 0.5 and 4 <= loc[0] < 0.95 * w:   # dense sweeps shift only ~20px
+            shifts.append(loc[0])
+    if not shifts or not step:
+        return None
+    import math
+    shifts.sort()
+    return shifts[len(shifts) // 2] / math.radians(step)
+
+
+def _correct_sweep_pans(metas, frames):
+    """Dense sweeps tag frames with the COMMANDED pan, but the gimbal trails by
+    a varying lag — strips land at wrong longitudes and smear the panorama.
+    Re-estimate each frame's TRUE pan by visual odometry: template-match the
+    shift between consecutive frames of a ring, integrate, and rescale so the
+    ring still spans exactly its commanded range."""
+    import cv2
+    import numpy as np
+    out = list(metas)
+    # group ring indices by tilt, in capture order
+    by_tilt = {}
+    for i, (pan, tilt) in enumerate(metas):
+        if tier_label(tilt) == "ceiling":
+            continue
+        by_tilt.setdefault(round(tilt, 1), []).append(i)
+    for tilt, idxs in by_tilt.items():
+        if len(idxs) < 3:
+            continue
+        grays = []
+        for i in idxs:
+            im = cv2.imdecode(np.frombuffer(frames[i][2], np.uint8),
+                              cv2.IMREAD_REDUCED_GRAYSCALE_2)
+            grays.append(im)
+        shifts = []
+        for a, b in zip(grays, grays[1:]):
+            if a is None or b is None:
+                shifts.append(None)
+                continue
+            h, w = a.shape
+            strip = slice(int(h * 0.30), int(h * 0.70))
+            res = cv2.matchTemplate(a[strip], b[strip, : w // 3], cv2.TM_CCOEFF_NORMED)
+            _, conf, _, loc = cv2.minMaxLoc(res)
+            shifts.append(float(loc[0]) if conf > 0.4 else None)
+        good = [x for x in shifts if x is not None]
+        if len(good) < len(shifts) // 2 or not good:
+            continue                        # too little signal — keep commanded pans
+        med = sorted(good)[len(good) // 2]
+        shifts = [x if x is not None and 0 <= x <= 3 * med + 5 else med for x in shifts]
+        pos = [0.0]
+        for x in shifts:
+            pos.append(pos[-1] + x)
+        span = metas[idxs[-1]][0] - metas[idxs[0]][0]   # commanded ring span (signed)
+        total = pos[-1] or 1.0
+        for k, i in enumerate(idxs):
+            out[i] = (metas[idxs[0]][0] + span * pos[k] / total, metas[i][1])
+    return out
+
+
+def build_panorama(frames, width=3600, strip_sigma_deg=None):
+    """Project frames onto a true 2:1 EQUIRECTANGULAR panorama.
+
+    Two modes, auto-selected from the ring spacing:
+    - SLIT-SCAN (dense video sweep, spacing < 15°): each frame contributes only
+      a thin vertical strip around its optical axis — the lens's sharpest,
+      least-distorted region, with negligible parallax between neighboring
+      strips. This is how phone panoramas avoid the "multiple images" look.
+    - WIDE (sparse 13-still scan): frames blend by full angular falloff.
+
+    Fisheye model r = f·θ with f measured from adjacent-frame overlap; frames
+    are gain-compensated (per-direction auto-exposure) and streamed one at a
+    time (a dense sweep is ~290 frames). Returns JPEG bytes or None."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    import math
+    metas = [(float(p), float(t)) for p, t, _ in frames]
+    if len(metas) < 3:
+        return None
+    ring = sorted(p for (p, t), (_, _, _) in zip(metas, frames) if abs(t - SCAN_TILT) < 1)
+    spacing = 60.0
+    if len(ring) > 1:
+        diffs = sorted(b - a for a, b in zip(ring, ring[1:]) if b > a)
+        if diffs:
+            spacing = diffs[len(diffs) // 2]
+    if strip_sigma_deg is None and spacing < 15.0:
+        strip_sigma_deg = max(1.0, spacing * 0.9)
+
+    if strip_sigma_deg is not None:
+        metas = _correct_sweep_pans(metas, frames)
+
+    W = int(width)
+    H = W // 2
+    lon = (np.arange(W) + 0.5) / W * 2 * math.pi - math.pi
+    lat = math.pi / 2 - (np.arange(H) + 0.5) / H * math.pi
+    LON, LAT = np.meshgrid(lon, lat)
+    LON_DEG = np.degrees(LON)
+    wx = np.sin(LON) * np.cos(LAT)
+    wy = np.sin(LAT)
+    wz = np.cos(LON) * np.cos(LAT)
+    acc = np.zeros((H, W, 3), np.float64)
+    wgt = np.zeros((H, W), np.float64) + 1e-9
+
+    # pass 1 (cheap): per-frame exposure means from thumbnails; focal from a
+    # decoded eye-ring subset
+    means = []
+    eye_imgs = []
+    for (pan, tilt), (_, _, jpeg) in zip(metas, frames):
+        im = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_REDUCED_COLOR_4)
+        if im is None:
+            means.append(None)
+            continue
+        h, w = im.shape[:2]
+        means.append(im[h // 4:3 * h // 4, w // 4:3 * w // 4].reshape(-1, 3).mean(axis=0))
+        if abs(tilt - SCAN_TILT) < 1 and len(eye_imgs) < 8:
+            eye_imgs.append((pan, jpeg))
+    valid_means = [m for m in means if m is not None]
+    if not valid_means:
+        return None
+    global_mean = np.mean(valid_means, axis=0)
+
+    f = None
+    if len(eye_imgs) > 1:
+        dec = [(p, cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR))
+               for p, j in eye_imgs]
+        f = _fisheye_focal([(p, SCAN_TILT, im) for p, im in dec if im is not None])
+    # pass 2: stream-project
+    first = cv2.imdecode(np.frombuffer(frames[0][2], np.uint8), cv2.IMREAD_COLOR)
+    if first is None:
+        return None
+    if f is None:
+        f = first.shape[1] / math.radians(130)
+    rim = f * math.radians(62)
+    for (pan, tilt), (_, _, jpeg), mean in zip(metas, frames, means):
+        if mean is None:
+            continue
+        im = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if im is None:
+            continue
+        gain = np.clip(global_mean / np.maximum(mean, 1.0), 0.55, 1.8)
+        h, w = im.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+        p, t = math.radians(pan), math.radians(tilt)
+        cz = np.array([math.sin(p) * math.cos(t), math.sin(t), math.cos(p) * math.cos(t)])
+        cxv = np.array([math.cos(p), 0.0, -math.sin(p)])
+        cyv = -np.cross(cz, cxv)
+        dz = wx * cz[0] + wy * cz[1] + wz * cz[2]
+        # cheap prefilter: skip output columns far outside this frame's reach
+        theta = np.arccos(np.clip(dz, -1, 1))
+        r = f * theta
+        dx = wx * cxv[0] + wy * cxv[1] + wz * cxv[2]
+        dy = wx * cyv[0] + wy * cyv[1] + wz * cyv[2]
+        alpha = np.arctan2(dy, dx)
+        mx = (cx + r * np.cos(alpha)).astype(np.float32)
+        my = (cy + r * np.sin(alpha)).astype(np.float32)
+        valid = (dz > 0.05) & (mx >= 0) & (mx < w - 1) & (my >= 0) & (my < h - 1)
+        wf = np.where(valid, np.clip(1.0 - r / rim, 0, 1) ** 1.5, 0)
+        if strip_sigma_deg is not None and tier_label(tilt) != "ceiling":
+            dlon = (LON_DEG - pan + 180.0) % 360.0 - 180.0
+            wf = wf * np.exp(-(dlon / strip_sigma_deg) ** 2)
+        if not wf.any():
+            continue
+        samp = cv2.remap(im, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        samp = np.clip(samp.astype(np.float64) * gain[None, None, :], 0, 255)
+        acc += samp * wf[..., None]
+        wgt += wf
+    pano = (acc / wgt[..., None]).astype(np.uint8)
+    ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    return buf.tobytes() if ok else None
+
+
+def record_tour(client, *, step_deg=TOUR_STEP_DEG, tilt=TOUR_TILT,
+                settle_s=TOUR_SETTLE_S, sleep=time.sleep, log=lambda m: None):
+    """Record a smooth 360° video tour: sweep the gimbal in small steps and grab
+    a live-stream frame at each — no stitching at all, so it can't show seams.
+    Returns the frames as one concatenated MJPEG bytes blob (the controller's
+    /tour_feed plays it in a loop). Camera only; wheels never commanded."""
+    frames = []
+    try:
+        pan = -180.0
+        while pan <= 180.0:
+            client.set_camera(pan, tilt)
+            sleep(settle_s)
+            frames.append(client.get_stream_frame())
+            if len(frames) % 20 == 0:
+                log(f"  recorded {len(frames)} frames (pan {pan:.0f}°)")
+            pan += step_deg
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return b"".join(frames)
+
+
+def render_inventory(inv) -> str:
+    """Compact, chat-friendly text of the scene inventory."""
+    if not isinstance(inv, dict):
+        return str(inv)
+    out = []
+    for v in inv.get("views") or []:
+        objs = "; ".join(
+            " ".join(x for x in (str(o.get("color") or "").strip(),
+                                 str(o.get("name") or "").strip()) if x)
+            + (f" ({o.get('details')})" if o.get("details") else "")
+            for o in (v.get("objects") or []) if isinstance(o, dict))
+        out.append(f"[{v.get('direction', '?')}] {objs or v.get('summary', '')}")
+    if inv.get("overall"):
+        out.append(f"overall: {inv['overall']}")
+    if out:
+        out.append(
+            "note: directions are approximate and OVERLAP — \"behind you\" includes "
+            "back-left, behind AND back-right; \"in front\" includes front-left, front "
+            "AND front-right; the wide lens means one object often appears in several "
+            "adjacent views. Check every relevant view (and object synonyms: bin = "
+            "container = tub = box) before concluding something is not in the scene.")
+    return "\n".join(out) or "(empty scene)"
+
+
+def _fisheye_focal(frames):
+    """Fisheye focal (px/radian) measured from the pixel shift between adjacent
+    eye-ring frames (template matching). None if unmeasurable."""
+    import cv2
+    import numpy as np
+    ring = sorted((p, im) for p, t, im in frames if abs(t - SCAN_TILT) < 1)
+    shifts, step = [], None
+    for (p1, a), (p2, b) in zip(ring, ring[1:]):
+        step = abs(p2 - p1)
+        h, w = a.shape[:2]
+        strip = slice(int(h * 0.30), int(h * 0.70))
+        ag = cv2.cvtColor(a[strip], cv2.COLOR_BGR2GRAY)
+        bg = cv2.cvtColor(b[strip], cv2.COLOR_BGR2GRAY)
+        res = cv2.matchTemplate(ag, bg[:, :w // 4], cv2.TM_CCOEFF_NORMED)
+        _, conf, _, loc = cv2.minMaxLoc(res)
+        if conf > 0.5 and 4 <= loc[0] < 0.95 * w:   # dense sweeps shift only ~20px
             shifts.append(loc[0])
     if not shifts or not step:
         return None
@@ -300,6 +572,44 @@ def build_panorama(frames, width=3600):
     return buf.tobytes() if ok else None
 
 
+SWEEP_RING_STEP = 10      # sweep density: 10° + a real settle = sharp frames
+                          # (2.5°/0.1s live-tested: gimbal never stops → motion blur)
+SWEEP_FRAME_W = 960       # downscale in flight (a strip only needs ~25px anyway)
+
+
+def sweep_frames(client, *, tilts=(SCAN_TILT, UPPER_TILT), step_deg=SWEEP_RING_STEP,
+                 settle_s=0.9, ceiling=True, sleep=time.sleep, log=lambda m: None):
+    """Dense video-style sweep for the panorama build: both rings in a
+    serpentine at `step_deg`, plus one ceiling still. Frames are downscaled in
+    flight (memory). Nothing is saved anywhere — the frames are raw material
+    for build_panorama and are discarded after. Camera only."""
+    def shrink(jpeg):
+        return _shrink(jpeg, max_w=SWEEP_FRAME_W)
+    frames = []
+    try:
+        for i, tilt in enumerate(tilts):
+            pans = [(-180.0 + k * step_deg) for k in range(int(360.0 / step_deg) + 1)]
+            if i % 2 == 1:
+                pans.reverse()
+            for pan in pans:
+                client.set_camera(pan, tilt)
+                sleep(settle_s)
+                frames.append((pan, tilt, shrink(client.get_stream_frame())))
+                if len(frames) % 40 == 0:
+                    log(f"  swept {len(frames)} frames (pan {pan:.0f}°, tilt {tilt:.0f}°)")
+        if ceiling:
+            client.set_camera(frames[-1][0] if frames else 0, CEILING_TILT)
+            sleep(1.0)
+            frames.append((frames[-1][0] if frames else 0, CEILING_TILT,
+                           shrink(client.get_stream_frame())))
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return frames
+
+
 TOUR_STEP_DEG = 2.5
 TOUR_TILT = -5.0
 TOUR_SETTLE_S = 0.10
@@ -366,7 +676,7 @@ def _ring_shift_px(imgs, step_deg=60):
         tmpl = b[strip, 0:w // 4]
         res = cv2.matchTemplate(a[strip, :], tmpl, cv2.TM_CCOEFF_NORMED)
         _, conf, _, loc = cv2.minMaxLoc(res)
-        if conf > 0.5 and 0.15 * w < loc[0] < 0.95 * w:
+        if conf > 0.5 and 4 <= loc[0] < 0.95 * w:   # dense sweeps shift only ~20px
             shifts.append(loc[0])
     if not shifts:
         return None
@@ -374,6 +684,44 @@ def _ring_shift_px(imgs, step_deg=60):
     return float(shifts[len(shifts) // 2])
 
 
+SWEEP_RING_STEP = 10      # sweep density: 10° + a real settle = sharp frames
+                          # (2.5°/0.1s live-tested: gimbal never stops → motion blur)
+SWEEP_FRAME_W = 960       # downscale in flight (a strip only needs ~25px anyway)
+
+
+def sweep_frames(client, *, tilts=(SCAN_TILT, UPPER_TILT), step_deg=SWEEP_RING_STEP,
+                 settle_s=0.9, ceiling=True, sleep=time.sleep, log=lambda m: None):
+    """Dense video-style sweep for the panorama build: both rings in a
+    serpentine at `step_deg`, plus one ceiling still. Frames are downscaled in
+    flight (memory). Nothing is saved anywhere — the frames are raw material
+    for build_panorama and are discarded after. Camera only."""
+    def shrink(jpeg):
+        return _shrink(jpeg, max_w=SWEEP_FRAME_W)
+    frames = []
+    try:
+        for i, tilt in enumerate(tilts):
+            pans = [(-180.0 + k * step_deg) for k in range(int(360.0 / step_deg) + 1)]
+            if i % 2 == 1:
+                pans.reverse()
+            for pan in pans:
+                client.set_camera(pan, tilt)
+                sleep(settle_s)
+                frames.append((pan, tilt, shrink(client.get_stream_frame())))
+                if len(frames) % 40 == 0:
+                    log(f"  swept {len(frames)} frames (pan {pan:.0f}°, tilt {tilt:.0f}°)")
+        if ceiling:
+            client.set_camera(frames[-1][0] if frames else 0, CEILING_TILT)
+            sleep(1.0)
+            frames.append((frames[-1][0] if frames else 0, CEILING_TILT,
+                           shrink(client.get_stream_frame())))
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return frames
+
+
 TOUR_STEP_DEG = 2.5
 TOUR_TILT = -5.0
 TOUR_SETTLE_S = 0.10
@@ -425,6 +773,44 @@ def render_inventory(inv) -> str:
             "adjacent views. Check every relevant view (and object synonyms: bin = "
             "container = tub = box) before concluding something is not in the scene.")
     return "\n".join(out) or "(empty scene)"
+
+
+SWEEP_RING_STEP = 10      # sweep density: 10° + a real settle = sharp frames
+                          # (2.5°/0.1s live-tested: gimbal never stops → motion blur)
+SWEEP_FRAME_W = 960       # downscale in flight (a strip only needs ~25px anyway)
+
+
+def sweep_frames(client, *, tilts=(SCAN_TILT, UPPER_TILT), step_deg=SWEEP_RING_STEP,
+                 settle_s=0.9, ceiling=True, sleep=time.sleep, log=lambda m: None):
+    """Dense video-style sweep for the panorama build: both rings in a
+    serpentine at `step_deg`, plus one ceiling still. Frames are downscaled in
+    flight (memory). Nothing is saved anywhere — the frames are raw material
+    for build_panorama and are discarded after. Camera only."""
+    def shrink(jpeg):
+        return _shrink(jpeg, max_w=SWEEP_FRAME_W)
+    frames = []
+    try:
+        for i, tilt in enumerate(tilts):
+            pans = [(-180.0 + k * step_deg) for k in range(int(360.0 / step_deg) + 1)]
+            if i % 2 == 1:
+                pans.reverse()
+            for pan in pans:
+                client.set_camera(pan, tilt)
+                sleep(settle_s)
+                frames.append((pan, tilt, shrink(client.get_stream_frame())))
+                if len(frames) % 40 == 0:
+                    log(f"  swept {len(frames)} frames (pan {pan:.0f}°, tilt {tilt:.0f}°)")
+        if ceiling:
+            client.set_camera(frames[-1][0] if frames else 0, CEILING_TILT)
+            sleep(1.0)
+            frames.append((frames[-1][0] if frames else 0, CEILING_TILT,
+                           shrink(client.get_stream_frame())))
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return frames
 
 
 TOUR_STEP_DEG = 2.5
@@ -493,7 +879,7 @@ def _ring_shift_px(imgs, step_deg=60):
         tmpl = b[strip, 0:w // 4]
         res = cv2.matchTemplate(a[strip, :], tmpl, cv2.TM_CCOEFF_NORMED)
         _, conf, _, loc = cv2.minMaxLoc(res)
-        if conf > 0.5 and 0.15 * w < loc[0] < 0.95 * w:
+        if conf > 0.5 and 4 <= loc[0] < 0.95 * w:   # dense sweeps shift only ~20px
             shifts.append(loc[0])
     if not shifts:
         return None
