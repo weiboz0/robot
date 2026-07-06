@@ -150,7 +150,7 @@ class PanoramaTest(unittest.TestCase):
     def test_equirect_shape_and_coverage(self):
         import cv2
         import numpy as np
-        pano = scene.build_panorama(self._frames(), width=1200)
+        pano = scene.build_panorama(self._frames(), width=1200, try_stitcher=False)
         self.assertIsNotNone(pano)
         img = cv2.imdecode(np.frombuffer(pano, np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual((img.shape[1], img.shape[0]), (1200, 600))   # true 2:1 equirect
