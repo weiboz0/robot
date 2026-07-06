@@ -242,9 +242,19 @@ def scan_surroundings(rover):
     print("   describing the scene (one vision call over all views)...")
     status("describing")
     inv = scene.describe_scene(vm, frames, log=lambda m: print("   " + m))
-    print("   stitching the 3D space (360° panorama)...")
+    # 3D space from a dense VIDEO sweep (slit-scan): each frame contributes a
+    # thin center strip — no seams/parallax patchwork. Falls back to the 13
+    # stills if the sweep fails. The sweep frames are discarded after building.
+    print("   video-sweeping for the 3D space (camera only)...")
+    status("recording")
+    try:
+        sweep = scene.sweep_frames(client, log=lambda m: print("   " + m))
+    except Exception as e:
+        print(f"   sweep failed ({e}); building from the scan stills")
+        sweep = None
+    print("   building the 3D space...")
     status("stitching")
-    pano = scene.build_panorama(frames)
+    pano = scene.build_panorama(sweep or frames)
     pano_note = "no 3D space (stitch failed)"
     if pano:
         try:
