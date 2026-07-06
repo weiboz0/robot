@@ -314,7 +314,59 @@ def _correct_sweep_pans(metas, frames):
     return out
 
 
-def build_panorama(frames, width=3600, strip_sigma_deg=None):
+def _undistort_equidistant(im, f_fish, out_fov_deg=95):
+    """Fisheye (r = f·θ) → pinhole (r = f·tanθ), cropped to out_fov — feature
+    stitchers assume pinhole projection and misalign raw fisheye frames."""
+    import cv2
+    import numpy as np
+    import math
+    h, w = im.shape[:2]
+    f_pin = (w / 2) / math.tan(math.radians(out_fov_deg / 2))
+    X, Y = np.meshgrid(np.arange(w) - w / 2, np.arange(h) - h / 2)
+    r_pin = np.sqrt(X ** 2 + Y ** 2)
+    theta = np.arctan(r_pin / f_pin)
+    scale = np.where(r_pin > 0.5, f_fish * theta / np.maximum(r_pin, 0.5), 1.0)
+    mx = (X * scale + w / 2).astype(np.float32)
+    my = (Y * scale + h / 2).astype(np.float32)
+    return cv2.remap(im, mx, my, cv2.INTER_LINEAR)
+
+
+def _stitcher_pano(frames, max_width=4096):
+    """Quality path: undistort to pinhole, then OpenCV's full stitching pipeline
+    (bundle adjustment, gain compensation, graph-cut seams, multiband blending).
+    Near-invisible seams when the scene has features; returns None when the
+    result is partial (>25% black) or stitching fails — the known-pose
+    projector then guarantees completeness."""
+    import cv2
+    import numpy as np
+    decoded = []
+    for pan, tilt, img in frames:
+        im = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+        if im is not None:
+            decoded.append((float(pan), float(tilt), im))
+    if len(decoded) < 3:
+        return None
+    f = _fisheye_focal(decoded) or decoded[0][2].shape[1] / 2.27
+    und = [_undistort_equidistant(im, f) for _, _, im in decoded]
+    try:
+        st = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
+        status, pano = st.stitch(und)
+    except cv2.error:
+        return None
+    if status != cv2.Stitcher_OK or pano is None:
+        return None
+    g = cv2.cvtColor(pano, cv2.COLOR_BGR2GRAY)
+    if float((g < 8).mean()) > 0.25:
+        return None
+    h, w = pano.shape[:2]
+    if w > max_width:
+        pano = cv2.resize(pano, (max_width, int(h * max_width / w)),
+                          interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    return buf.tobytes() if ok else None
+
+
+def build_panorama(frames, width=3600, strip_sigma_deg=None, try_stitcher=True):
     """Project frames onto a true 2:1 EQUIRECTANGULAR panorama.
 
     Two modes, auto-selected from the ring spacing:
@@ -344,6 +396,11 @@ def build_panorama(frames, width=3600, strip_sigma_deg=None):
             spacing = diffs[len(diffs) // 2]
     if strip_sigma_deg is None and spacing < 15.0:
         strip_sigma_deg = max(1.0, spacing * 0.9)
+
+    if try_stitcher and strip_sigma_deg is None:
+        best = _stitcher_pano(frames)      # quality path for sparse stills
+        if best is not None:
+            return best
 
     if strip_sigma_deg is not None:
         metas = _correct_sweep_pans(metas, frames)
@@ -498,83 +555,6 @@ def _fisheye_focal(frames):
     import math
     shifts.sort()
     return shifts[len(shifts) // 2] / math.radians(step)
-
-
-def build_panorama(frames, width=3600):
-    """Project ALL scan frames onto a true 2:1 EQUIRECTANGULAR panorama — the
-    scan's "3D space". The lens is (approximately) an equidistant fisheye, so
-    each frame maps onto the sphere at its KNOWN pan/tilt: r_px = f·θ, with f
-    measured live from adjacent-frame overlap. Frames blend by angular weight
-    (strong at each frame's center, fading at its rim), the ceiling frame fills
-    the zenith, and the un-imaged area under the rover stays dark (physics).
-    Deterministic and complete; geometrically exact for the web viewer's
-    equirect mapping. Returns JPEG bytes or None (no OpenCV / no frames)."""
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return None
-    import math
-    decoded = []
-    for pan, tilt, img in frames:
-        im = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
-        if im is not None:
-            decoded.append((float(pan), float(tilt), im))
-    if len(decoded) < 3:
-        return None
-    W = int(width)
-    H = W // 2
-    f = _fisheye_focal(decoded) or decoded[0][2].shape[1] / math.radians(130)
-    lon = (np.arange(W) + 0.5) / W * 2 * math.pi - math.pi
-    lat = math.pi / 2 - (np.arange(H) + 0.5) / H * math.pi
-    LON, LAT = np.meshgrid(lon, lat)
-    wx = np.sin(LON) * np.cos(LAT)
-    wy = np.sin(LAT)
-    wz = np.cos(LON) * np.cos(LAT)
-    acc = np.zeros((H, W, 3), np.float64)
-    wgt = np.zeros((H, W), np.float64) + 1e-9
-    rim = f * math.radians(62)             # usable image circle (~124° of the lens)
-    # Gain compensation: each frame is auto-exposed/white-balanced differently
-    # (a window direction meters dark, a corner meters bright), which makes the
-    # blend look like a patchwork even where geometry aligns. Normalize each
-    # frame's per-channel mean (central region) toward the global mean.
-    means = []
-    for _, _, im in decoded:
-        h, w = im.shape[:2]
-        c = im[h // 4:3 * h // 4, w // 4:3 * w // 4]
-        means.append(c.reshape(-1, 3).mean(axis=0))
-    global_mean = np.mean(means, axis=0)
-    gains = [np.clip(global_mean / np.maximum(m, 1.0), 0.55, 1.8) for m in means]
-    for (pan, tilt, im), gain in zip(decoded, gains):
-        h, w = im.shape[:2]
-        cx, cy = w / 2.0, h / 2.0
-        p, t = math.radians(pan), math.radians(tilt)
-        cz = np.array([math.sin(p) * math.cos(t), math.sin(t), math.cos(p) * math.cos(t)])
-        cxv = np.array([math.cos(p), 0.0, -math.sin(p)])
-        cyv = -np.cross(cz, cxv)           # image-down direction
-        dz = wx * cz[0] + wy * cz[1] + wz * cz[2]
-        dx = wx * cxv[0] + wy * cxv[1] + wz * cxv[2]
-        dy = wx * cyv[0] + wy * cyv[1] + wz * cyv[2]
-        theta = np.arccos(np.clip(dz, -1, 1))
-        alpha = np.arctan2(dy, dx)
-        r = f * theta
-        mx = (cx + r * np.cos(alpha)).astype(np.float32)
-        my = (cy + r * np.sin(alpha)).astype(np.float32)
-        valid = (dz > 0.05) & (mx >= 0) & (mx < w - 1) & (my >= 0) & (my < h - 1)
-        wf = np.where(valid, np.clip(1.0 - r / rim, 0, 1) ** 1.5, 0)
-        samp = cv2.remap(im, mx, my, cv2.INTER_LINEAR,
-                         borderMode=cv2.BORDER_CONSTANT)
-        samp = np.clip(samp.astype(np.float64) * gain[None, None, :], 0, 255)
-        acc += samp * wf[..., None]
-        wgt += wf
-    pano = (acc / wgt[..., None]).astype(np.uint8)
-    ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
-    return buf.tobytes() if ok else None
-
-
-SWEEP_RING_STEP = 10      # sweep density: 10° + a real settle = sharp frames
-                          # (2.5°/0.1s live-tested: gimbal never stops → motion blur)
-SWEEP_FRAME_W = 960       # downscale in flight (a strip only needs ~25px anyway)
 
 
 def sweep_frames(client, *, tilts=(SCAN_TILT, UPPER_TILT), step_deg=SWEEP_RING_STEP,
