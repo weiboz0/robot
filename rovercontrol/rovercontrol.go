@@ -1793,7 +1793,7 @@ func (app *App) routes() http.Handler {
 	mux.HandleFunc("POST /pano_status", func(w http.ResponseWriter, r *http.Request) {
 		st := r.URL.Query().Get("state")
 		switch st {
-		case "scanning", "describing", "stitching", "uploading", "done", "failed", "idle":
+		case "scanning", "recording", "describing", "stitching", "uploading", "done", "failed", "idle":
 		default:
 			errJSON(w, http.StatusBadRequest, "bad state")
 			return
@@ -1812,6 +1812,71 @@ func (app *App) routes() http.Handler {
 			age = time.Since(at).Seconds()
 		}
 		writeJSON(w, 200, map[string]any{"state": st, "age_s": age})
+	})
+
+	// 360° video tour (plan 023c): a recorded gimbal sweep, stored as one
+	// concatenated-MJPEG blob; /tour_feed replays it in a browser <img> loop.
+	mux.HandleFunc("POST /tour", func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<20))
+		if err != nil || len(b) < 4 || b[0] != 0xff || b[1] != 0xd8 {
+			errJSON(w, http.StatusBadRequest, "body must be concatenated JPEG frames (max 64MB)")
+			return
+		}
+		if err := os.WriteFile(filepath.Join(app.photoDir, "tour.mjpeg"), b, 0o644); err != nil {
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "bytes": len(b)})
+	})
+	mux.HandleFunc("GET /tour_feed", func(w http.ResponseWriter, r *http.Request) {
+		b, err := os.ReadFile(filepath.Join(app.photoDir, "tour.mjpeg"))
+		if err != nil {
+			errJSON(w, http.StatusNotFound, "no tour yet — record one ($record in the chatbot)")
+			return
+		}
+		var frames [][]byte
+		for i := 0; i+1 < len(b); {
+			j := bytes.Index(b[i+2:], soi)
+			if j < 0 {
+				frames = append(frames, b[i:])
+				break
+			}
+			frames = append(frames, b[i:i+2+j])
+			i += 2 + j
+		}
+		if len(frames) == 0 {
+			errJSON(w, http.StatusNotFound, "tour file has no frames")
+			return
+		}
+		loops := 1 << 30
+		if r.URL.Query().Get("loops") == "1" {
+			loops = 1
+		}
+		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=tourframe")
+		fl, _ := w.(http.Flusher)
+		tick := time.NewTicker(time.Second / 14)
+		defer tick.Stop()
+		for l := 0; l < loops; l++ {
+			for _, fr := range frames {
+				if _, err := fmt.Fprintf(w, "--tourframe\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", len(fr)); err != nil {
+					return
+				}
+				if _, err := w.Write(fr); err != nil {
+					return
+				}
+				fmt.Fprint(w, "\r\n")
+				if fl != nil {
+					fl.Flush()
+				}
+				if loops > 1 {
+					select {
+					case <-tick.C:
+					case <-r.Context().Done():
+						return
+					}
+				}
+			}
+		}
 	})
 
 	// 360° panorama — the scan's "3D space" (plan 023). POST stores the latest
@@ -2040,6 +2105,7 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  <button class="warn" onclick="cmd('estop')">⛔ E-STOP</button>
  <button onclick="snap()">📸 Snapshot</button>
  <button onclick="pano3d()">🌐 3D view</button>
+ <button onclick="tour()">▶ Room tour</button>
  <span id="panostat"><small></small></span>
  <span id="gp" style="font-size:12px;color:#999">🎮 none (press a button)</span>
  <span id="health"><small>…</small></span>
@@ -2232,6 +2298,27 @@ async function pano3d(){
  document.body.appendChild(lb);
  document.addEventListener('keydown',function esc(e){
   if(e.key==='Escape'){lb.remove();document.removeEventListener('keydown',esc);}});
+}
+// ▶ Room tour: replay of the recorded gimbal sweep (looping MJPEG — no seams,
+// it's real video). Esc/background closes; the stream stops on close.
+function tour(){
+ fetch('/tour_feed?loops=1',{method:'HEAD'}).catch(()=>null);
+ const lb=document.createElement('div');lb.className='lb';
+ let downBg=false;
+ lb.onmousedown=e=>{downBg=(e.target===lb);};
+ lb.onclick=e=>{if(e.target===lb&&downBg){img.src='';lb.remove();}};
+ const bar=document.createElement('div');bar.className='lbbar';
+ const x=document.createElement('button');x.textContent='✕ close';
+ x.onclick=()=>{img.src='';lb.remove();};
+ bar.appendChild(x);
+ const img=new Image();
+ img.style.cssText='max-width:92vw;max-height:85vh;border-radius:8px';
+ img.onerror=()=>{cout('no room tour yet — say "record the room" in the chatbot');lb.remove();};
+ img.src='/tour_feed?ts='+Date.now();
+ lb.appendChild(img);lb.appendChild(bar);
+ document.body.appendChild(lb);
+ document.addEventListener('keydown',function esc(e){
+  if(e.key==='Escape'){img.src='';lb.remove();document.removeEventListener('keydown',esc);}});
 }
 async function fetchMeta(n){
  try{const r=await fetch('/photo_meta/'+encodeURIComponent(n));if(r.ok)return await r.json();}catch(e){}
@@ -2469,7 +2556,7 @@ function saveProg(){if(!prog.length)return;const n=(prompt('Save program as:')||
  localStorage.setItem('roverprog:'+n,JSON.stringify(prog));refreshSaved();cout('saved "'+n+'"');}
 function loadProg(n){if(!n)return;try{const p=JSON.parse(localStorage.getItem('roverprog:'+n));
  if(Array.isArray(p)){prog=p.filter(x=>typeof x==='string');renderProg();cout('loaded "'+n+'"');}}catch(e){}}
-const PANO_LABELS={scanning:'📷 scanning the room…',describing:'🧠 building scene memory…',
+const PANO_LABELS={scanning:'📷 scanning the room…',recording:'🎥 recording room tour…',describing:'🧠 building scene memory…',
  stitching:'🌀 creating 3D view…',uploading:'⬆ saving 3D view…'};
 async function panoStat(){try{
  const j=await(await fetch('/pano_status')).json();

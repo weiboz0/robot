@@ -151,6 +151,35 @@ def describe_scene(vision, frames, log=lambda m: None):
     return inv
 
 
+TOUR_STEP_DEG = 2.5
+TOUR_TILT = -5.0
+TOUR_SETTLE_S = 0.10
+
+
+def record_tour(client, *, step_deg=TOUR_STEP_DEG, tilt=TOUR_TILT,
+                settle_s=TOUR_SETTLE_S, sleep=time.sleep, log=lambda m: None):
+    """Record a smooth 360° video tour: sweep the gimbal in small steps and grab
+    a live-stream frame at each — no stitching at all, so it can't show seams.
+    Returns the frames as one concatenated MJPEG bytes blob (the controller's
+    /tour_feed plays it in a loop). Camera only; wheels never commanded."""
+    frames = []
+    try:
+        pan = -180.0
+        while pan <= 180.0:
+            client.set_camera(pan, tilt)
+            sleep(settle_s)
+            frames.append(client.get_stream_frame())
+            if len(frames) % 20 == 0:
+                log(f"  recorded {len(frames)} frames (pan {pan:.0f}°)")
+            pan += step_deg
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return b"".join(frames)
+
+
 def render_inventory(inv) -> str:
     """Compact, chat-friendly text of the scene inventory."""
     if not isinstance(inv, dict):
@@ -233,7 +262,18 @@ def build_panorama(frames, width=3600):
     acc = np.zeros((H, W, 3), np.float64)
     wgt = np.zeros((H, W), np.float64) + 1e-9
     rim = f * math.radians(62)             # usable image circle (~124° of the lens)
-    for pan, tilt, im in decoded:
+    # Gain compensation: each frame is auto-exposed/white-balanced differently
+    # (a window direction meters dark, a corner meters bright), which makes the
+    # blend look like a patchwork even where geometry aligns. Normalize each
+    # frame's per-channel mean (central region) toward the global mean.
+    means = []
+    for _, _, im in decoded:
+        h, w = im.shape[:2]
+        c = im[h // 4:3 * h // 4, w // 4:3 * w // 4]
+        means.append(c.reshape(-1, 3).mean(axis=0))
+    global_mean = np.mean(means, axis=0)
+    gains = [np.clip(global_mean / np.maximum(m, 1.0), 0.55, 1.8) for m in means]
+    for (pan, tilt, im), gain in zip(decoded, gains):
         h, w = im.shape[:2]
         cx, cy = w / 2.0, h / 2.0
         p, t = math.radians(pan), math.radians(tilt)
@@ -252,11 +292,41 @@ def build_panorama(frames, width=3600):
         wf = np.where(valid, np.clip(1.0 - r / rim, 0, 1) ** 1.5, 0)
         samp = cv2.remap(im, mx, my, cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_CONSTANT)
+        samp = np.clip(samp.astype(np.float64) * gain[None, None, :], 0, 255)
         acc += samp * wf[..., None]
         wgt += wf
     pano = (acc / wgt[..., None]).astype(np.uint8)
     ok, buf = cv2.imencode(".jpg", pano, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     return buf.tobytes() if ok else None
+
+
+TOUR_STEP_DEG = 2.5
+TOUR_TILT = -5.0
+TOUR_SETTLE_S = 0.10
+
+
+def record_tour(client, *, step_deg=TOUR_STEP_DEG, tilt=TOUR_TILT,
+                settle_s=TOUR_SETTLE_S, sleep=time.sleep, log=lambda m: None):
+    """Record a smooth 360° video tour: sweep the gimbal in small steps and grab
+    a live-stream frame at each — no stitching at all, so it can't show seams.
+    Returns the frames as one concatenated MJPEG bytes blob (the controller's
+    /tour_feed plays it in a loop). Camera only; wheels never commanded."""
+    frames = []
+    try:
+        pan = -180.0
+        while pan <= 180.0:
+            client.set_camera(pan, tilt)
+            sleep(settle_s)
+            frames.append(client.get_stream_frame())
+            if len(frames) % 20 == 0:
+                log(f"  recorded {len(frames)} frames (pan {pan:.0f}°)")
+            pan += step_deg
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return b"".join(frames)
 
 
 def render_inventory(inv) -> str:
@@ -304,6 +374,35 @@ def _ring_shift_px(imgs, step_deg=60):
     return float(shifts[len(shifts) // 2])
 
 
+TOUR_STEP_DEG = 2.5
+TOUR_TILT = -5.0
+TOUR_SETTLE_S = 0.10
+
+
+def record_tour(client, *, step_deg=TOUR_STEP_DEG, tilt=TOUR_TILT,
+                settle_s=TOUR_SETTLE_S, sleep=time.sleep, log=lambda m: None):
+    """Record a smooth 360° video tour: sweep the gimbal in small steps and grab
+    a live-stream frame at each — no stitching at all, so it can't show seams.
+    Returns the frames as one concatenated MJPEG bytes blob (the controller's
+    /tour_feed plays it in a loop). Camera only; wheels never commanded."""
+    frames = []
+    try:
+        pan = -180.0
+        while pan <= 180.0:
+            client.set_camera(pan, tilt)
+            sleep(settle_s)
+            frames.append(client.get_stream_frame())
+            if len(frames) % 20 == 0:
+                log(f"  recorded {len(frames)} frames (pan {pan:.0f}°)")
+            pan += step_deg
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return b"".join(frames)
+
+
 def render_inventory(inv) -> str:
     """Compact, chat-friendly text of the scene inventory."""
     if not isinstance(inv, dict):
@@ -326,6 +425,35 @@ def render_inventory(inv) -> str:
             "adjacent views. Check every relevant view (and object synonyms: bin = "
             "container = tub = box) before concluding something is not in the scene.")
     return "\n".join(out) or "(empty scene)"
+
+
+TOUR_STEP_DEG = 2.5
+TOUR_TILT = -5.0
+TOUR_SETTLE_S = 0.10
+
+
+def record_tour(client, *, step_deg=TOUR_STEP_DEG, tilt=TOUR_TILT,
+                settle_s=TOUR_SETTLE_S, sleep=time.sleep, log=lambda m: None):
+    """Record a smooth 360° video tour: sweep the gimbal in small steps and grab
+    a live-stream frame at each — no stitching at all, so it can't show seams.
+    Returns the frames as one concatenated MJPEG bytes blob (the controller's
+    /tour_feed plays it in a loop). Camera only; wheels never commanded."""
+    frames = []
+    try:
+        pan = -180.0
+        while pan <= 180.0:
+            client.set_camera(pan, tilt)
+            sleep(settle_s)
+            frames.append(client.get_stream_frame())
+            if len(frames) % 20 == 0:
+                log(f"  recorded {len(frames)} frames (pan {pan:.0f}°)")
+            pan += step_deg
+    finally:
+        try:
+            client.set_camera(0, 0)
+        except Exception:
+            pass
+    return b"".join(frames)
 
 
 def render_inventory(inv) -> str:

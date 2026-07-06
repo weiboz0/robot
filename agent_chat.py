@@ -273,6 +273,32 @@ def recall_scene():
     return f"scene memory (loaded from {os.path.basename(d)}):\n{scene.render_inventory(inv)}"
 
 
+def record_room(rover):
+    """Camera-only 360° video tour — smooth by construction (no stitching)."""
+    if rover is None or rover.backend != "rovercontrol":
+        return "room recording needs the rovercontrol backend (:8080)."
+    import scene
+    import rovercontrol_client as client
+    def status(st):
+        try:
+            client.set_pano_status(st)
+        except Exception:
+            pass
+    print("   recording a 360° tour (camera only — wheels untouched)...")
+    status("recording")
+    try:
+        blob = scene.record_tour(client, log=lambda m: print("   " + m))
+        status("uploading")
+        client.set_tour(blob)
+        status("done")
+        return ("room tour recorded — press ▶ Room tour on the website to watch it "
+                f"({len(blob) // 1024} KB). It is real video of the sweep, so it has "
+                "no stitching seams at all.")
+    except Exception as e:
+        status("failed")
+        return f"recording failed: {e}"
+
+
 # --------------------------------------------------------------------- tools
 def build_tools(rover, arm):
     tools = []
@@ -328,6 +354,12 @@ def build_tools(rover, arm):
                             "colors, positions). AFTER a scan, answer questions about the "
                             "surroundings from the returned inventory — do NOT re-scan or look "
                             "again unless the user says the room changed.",
+             "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_record_tour",
+             "description": "Record a smooth 360° VIDEO tour of the room (the camera sweeps a "
+                            "full circle; wheels never move) and publish it to the website's "
+                            "▶ Room tour player. Use when the user asks to record the room / "
+                            "make a video tour.",
              "parameters": {"type": "object", "properties": {}}},
             {"name": "rover_scene_recall",
              "description": "Recall the most recent 360° scene memory (use when asked about "
@@ -404,6 +436,8 @@ def run_tool(rover, arm, name, a):
             return autonomous_find(rover, t)
         if name == "rover_scan_surroundings":
             return scan_surroundings(rover)
+        if name == "rover_record_tour":
+            return record_room(rover)
         if name == "rover_scene_recall":
             return recall_scene()
         if name == "dobot_get_pose":
@@ -433,7 +467,8 @@ SYSTEM = (
     "Use rover_get_status to check what is connected. When the user asks you to "
     "find/look for a physical object, use rover_find_object with a color in the "
     "description (e.g. 'a green pen') — it drives itself and returns an outlined "
-    "photo; report the result including the photo name. rover_scan_surroundings "
+    "photo; report the result including the photo name. rover_record_tour records a smooth "
+    "360-degree video tour for the website. rover_scan_surroundings "
     "builds a 360-degree memory of the room; AFTER a scan, answer questions about "
     "the surroundings (colors, what is where, what is behind you) from the scan "
     "text already in the conversation — never re-scan or move the camera for "
@@ -539,6 +574,8 @@ def main():
                             print(f"  dobot error: {e}")
                 elif cmd.lower() == "scan":
                     print(" ", scan_surroundings(rover))
+                elif cmd.lower() == "record":
+                    print(" ", record_room(rover))
                 elif cmd.lower() in FIND_SHORTCUTS or cmd.lower().startswith("find "):
                     target = FIND_SHORTCUTS.get(cmd.lower()) or cmd[5:].strip()
                     print(" ", autonomous_find(rover, target))
