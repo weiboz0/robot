@@ -183,5 +183,26 @@ class PanoramaTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(saved, "panorama.jpg")))
 
 
+class RecordTourTest(unittest.TestCase):
+    def test_sweeps_full_circle_and_recenters(self):
+        c = FakeClient()
+        blob = scene.record_tour(c, step_deg=60, sleep=lambda s: None)
+        self.assertEqual(c.aims[-1], (0, 0))                      # recentered
+        pans = [p for p, t in c.aims[:-1]]
+        self.assertEqual(pans[0], -180.0)
+        self.assertEqual(pans[-1], 180.0)
+        self.assertEqual(len(pans), 7)                            # -180..180 by 60
+        self.assertGreater(len(blob), 0)
+
+    def test_recenters_on_failure(self):
+        class Boom(FakeClient):
+            def get_stream_frame(self):
+                raise OSError("gone")
+        c = Boom()
+        with self.assertRaises(OSError):
+            scene.record_tour(c, step_deg=90, sleep=lambda s: None)
+        self.assertEqual(c.aims[-1], (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

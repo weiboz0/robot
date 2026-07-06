@@ -127,10 +127,31 @@ func TestPanoStatusEndpoints(t *testing.T) {
 	}
 }
 
+func TestTourEndpoints(t *testing.T) {
+	app, _ := testApp(t)
+	if w := do(t, app, "GET", "/tour_feed"); w.Code != 404 {
+		t.Fatalf("feed before upload = %d", w.Code)
+	}
+	two := "\xff\xd8frameone\xff\xd8frametwo"
+	if w := doJSON(t, app, "POST", "/tour", two); w.Code != 200 {
+		t.Fatalf("POST tour = %d %s", w.Code, w.Body.String())
+	}
+	if w := doJSON(t, app, "POST", "/tour", "junk"); w.Code != 400 {
+		t.Fatalf("POST junk = %d", w.Code)
+	}
+	w := do(t, app, "GET", "/tour_feed?loops=1")
+	if w.Code != 200 {
+		t.Fatalf("feed = %d", w.Code)
+	}
+	if got := strings.Count(w.Body.String(), "--tourframe"); got != 2 {
+		t.Fatalf("frames streamed = %d (want 2)", got)
+	}
+}
+
 func TestWebUIHasOutlineToggle(t *testing.T) {
 	app, _ := testApp(t)
 	body := do(t, app, "GET", "/").Body.String()
-	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel(", "pano3d(", "3D view", "/panorama", "pano_status", "downBg", "panostat"} {
+	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel(", "pano3d(", "3D view", "/panorama", "pano_status", "downBg", "panostat", "tour_feed", "Room tour"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)
 		}

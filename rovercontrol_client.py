@@ -195,6 +195,14 @@ def set_panorama(jpeg: bytes, timeout: float = 20.0) -> None:
         r.read()
 
 
+def set_tour(mjpeg: bytes, timeout: float = 60.0) -> None:
+    """Upload a recorded 360° video tour (concatenated MJPEG) — POST /tour."""
+    req = urllib.request.Request(_base() + "/tour", data=mjpeg, method="POST",
+                                 headers={"Content-Type": "video/x-motion-jpeg"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        r.read()
+
+
 def set_photo_meta(name: str, meta: dict, timeout: float = 5.0) -> None:
     """Store outline metadata for a photo — POST /photo_meta/<name> with a JSON
     body {target,color,bbox,confidence}. The gallery's ◻ toggle reads it back."""
