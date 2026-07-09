@@ -38,6 +38,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1879,6 +1880,40 @@ func (app *App) routes() http.Handler {
 		}
 	})
 
+	// detector-comparison images (plan 024): the chatbot uploads one annotated
+	// frame per model; the website's 🧪 panel flips between them.
+	detName := regexp.MustCompile(`^[a-z0-9_]{1,24}$`)
+	mux.HandleFunc("POST /det_image/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/det_image/")
+		if !detName.MatchString(name) {
+			errJSON(w, http.StatusBadRequest, "bad model name")
+			return
+		}
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+		if err != nil || len(b) < 4 || b[0] != 0xff || b[1] != 0xd8 {
+			errJSON(w, http.StatusBadRequest, "body must be a JPEG")
+			return
+		}
+		if err := os.WriteFile(filepath.Join(app.photoDir, "det_"+name+".jpg"), b, 0o644); err != nil {
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("GET /det_image/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/det_image/")
+		if !detName.MatchString(name) {
+			errJSON(w, http.StatusBadRequest, "bad model name")
+			return
+		}
+		p := filepath.Join(app.photoDir, "det_"+name+".jpg")
+		if _, err := os.Stat(p); err != nil {
+			errJSON(w, http.StatusNotFound, "no result for this model yet — run $detect in the chatbot")
+			return
+		}
+		http.ServeFile(w, r, p)
+	})
+
 	// 360° panorama — the scan's "3D space" (plan 023). POST stores the latest
 	// stitched JPEG; GET serves it for the website's look-around viewer.
 	mux.HandleFunc("POST /panorama", func(w http.ResponseWriter, r *http.Request) {
@@ -2106,6 +2141,7 @@ const htmlPage = `<!doctype html><html><head><meta charset="utf-8">
  <button onclick="snap()">📸 Snapshot</button>
  <button onclick="pano3d()">🌐 3D view</button>
  <button onclick="tour()">▶ Room tour</button>
+ <button onclick="detcmp()">🧪 Detectors</button>
  <span id="panostat"><small></small></span>
  <span id="gp" style="font-size:12px;color:#999">🎮 none (press a button)</span>
  <span id="health"><small>…</small></span>
@@ -2319,6 +2355,34 @@ function tour(){
  document.body.appendChild(lb);
  document.addEventListener('keydown',function esc(e){
   if(e.key==='Escape'){img.src='';lb.remove();document.removeEventListener('keydown',esc);}});
+}
+// 🧪 detector comparison: one button per model flips the displayed result
+// (annotated frames uploaded by the chatbot's $detect).
+function detcmp(){
+ const models=['hsv','yolo11n','yolov8n','yolo11s'];
+ const lb=document.createElement('div');lb.className='lb';
+ let downBg=false;
+ lb.onmousedown=e=>{downBg=(e.target===lb);};
+ lb.onclick=e=>{if(e.target===lb&&downBg)lb.remove();};
+ const bar=document.createElement('div');bar.className='lbbar';
+ const img=new Image();
+ img.style.cssText='max-width:92vw;max-height:82vh;border-radius:8px';
+ img.onerror=()=>{cout('no results yet — run $detect in the chatbot first');lb.remove();};
+ const btns=[];
+ function show(m){
+  img.src='/det_image/'+m+'?ts='+Date.now();
+  btns.forEach(b=>b.style.background=(b.textContent===m)?'#1b50ad':'#2d6cdf');
+ }
+ models.forEach(m=>{
+  const b=document.createElement('button');b.textContent=m;b.onclick=()=>show(m);
+  btns.push(b);bar.appendChild(b);
+ });
+ const x=document.createElement('button');x.textContent='✕';x.onclick=()=>lb.remove();
+ bar.appendChild(x);
+ lb.appendChild(img);lb.appendChild(bar);document.body.appendChild(lb);
+ show('yolo11s');
+ document.addEventListener('keydown',function esc(e){
+  if(e.key==='Escape'){lb.remove();document.removeEventListener('keydown',esc);}});
 }
 async function fetchMeta(n){
  try{const r=await fetch('/photo_meta/'+encodeURIComponent(n));if(r.ok)return await r.json();}catch(e){}
