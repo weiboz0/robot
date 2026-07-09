@@ -283,6 +283,32 @@ def recall_scene():
     return f"scene memory (loaded from {os.path.basename(d)}):\n{scene.render_inventory(inv)}"
 
 
+def detect_compare(rover):
+    """Run all detection models on the current camera view and publish each
+    model's annotated frame to the website's 🧪 Detectors panel."""
+    if rover is None or rover.backend != "rovercontrol":
+        return "detector test needs the rovercontrol backend (:8080)."
+    import detectors
+    import rovercontrol_client as client
+    jpg = client.get_stream_frame()
+    lines = []
+    for m in detectors.MODELS:
+        if not detectors.available(m):
+            lines.append(f"{m}: unavailable (pip install ultralytics)")
+            continue
+        try:
+            import time as _t
+            t0 = _t.time()
+            vis, dets = detectors.run(m, jpg)
+            client.set_det_image(m, vis)
+            found = ", ".join(f"{d['label']}:{d['conf']}" for d in dets[:8]) or "nothing"
+            lines.append(f"{m}: {len(dets)} object(s) in {_t.time()-t0:.1f}s — {found}")
+        except Exception as e:
+            lines.append(f"{m}: failed ({e})")
+    return ("detector comparison done — press 🧪 Detectors on the website and flip "
+            "between models:\n" + "\n".join("  " + l for l in lines))
+
+
 def record_room(rover):
     """Camera-only 360° video tour — smooth by construction (no stitching)."""
     if rover is None or rover.backend != "rovercontrol":
@@ -364,6 +390,11 @@ def build_tools(rover, arm):
                             "colors, positions). AFTER a scan, answer questions about the "
                             "surroundings from the returned inventory — do NOT re-scan or look "
                             "again unless the user says the room changed.",
+             "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_test_detectors",
+             "description": "Run all object-detection models (color-blob + YOLO variants) on the "
+                            "current camera view and publish annotated results to the website's "
+                            "🧪 Detectors panel for side-by-side comparison.",
              "parameters": {"type": "object", "properties": {}}},
             {"name": "rover_record_tour",
              "description": "Record a smooth 360° VIDEO tour of the room (the camera sweeps a "
@@ -448,6 +479,8 @@ def run_tool(rover, arm, name, a):
             return scan_surroundings(rover)
         if name == "rover_record_tour":
             return record_room(rover)
+        if name == "rover_test_detectors":
+            return detect_compare(rover)
         if name == "rover_scene_recall":
             return recall_scene()
         if name == "dobot_get_pose":
@@ -586,6 +619,8 @@ def main():
                     print(" ", scan_surroundings(rover))
                 elif cmd.lower() == "record":
                     print(" ", record_room(rover))
+                elif cmd.lower() == "detect":
+                    print(" ", detect_compare(rover))
                 elif cmd.lower() in FIND_SHORTCUTS or cmd.lower().startswith("find "):
                     target = FIND_SHORTCUTS.get(cmd.lower()) or cmd[5:].strip()
                     print(" ", autonomous_find(rover, target))
