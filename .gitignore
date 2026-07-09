@@ -6,3 +6,4 @@ photos/
 rovercontrol-arm64
 rovercontrol/rovercontrol
 scenes/
+*.pt
