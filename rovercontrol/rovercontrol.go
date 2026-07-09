@@ -1880,6 +1880,40 @@ func (app *App) routes() http.Handler {
 		}
 	})
 
+	// panorama merge-method variants (plan 025): the chatbot uploads one pano
+	// per merge method; the 3D viewer's method buttons flip between them.
+	panoVarName := regexp.MustCompile(`^[a-z0-9_]{1,24}$`)
+	mux.HandleFunc("POST /pano_variant/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/pano_variant/")
+		if !panoVarName.MatchString(name) {
+			errJSON(w, http.StatusBadRequest, "bad variant name")
+			return
+		}
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 12<<20))
+		if err != nil || len(b) < 4 || b[0] != 0xff || b[1] != 0xd8 {
+			errJSON(w, http.StatusBadRequest, "body must be a JPEG")
+			return
+		}
+		if err := os.WriteFile(filepath.Join(app.photoDir, "pano_var_"+name+".jpg"), b, 0o644); err != nil {
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("GET /pano_variant/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/pano_variant/")
+		if !panoVarName.MatchString(name) {
+			errJSON(w, http.StatusBadRequest, "bad variant name")
+			return
+		}
+		p := filepath.Join(app.photoDir, "pano_var_"+name+".jpg")
+		if _, err := os.Stat(p); err != nil {
+			errJSON(w, http.StatusNotFound, "no such variant yet — run $panotest in the chatbot")
+			return
+		}
+		http.ServeFile(w, r, p)
+	})
+
 	// detector-comparison images (plan 024): the chatbot uploads one annotated
 	// frame per model; the website's 🧪 panel flips between them.
 	detName := regexp.MustCompile(`^[a-z0-9_]{1,24}$`)
@@ -2258,6 +2292,14 @@ async function pano3d(){
  lb.onmousedown=e=>{downBg=(e.target===lb);};   // background — releasing a look-around
  lb.onclick=e=>{if(e.target===lb&&downBg)lb.remove();};  // drag outside must NOT close
  const bar=document.createElement('div');bar.className='lbbar';
+ // merge-method buttons: reload the sphere texture from a stored variant
+ let setSrc=null;
+ [['live','/panorama'],['seamcut','/pano_variant/seamcut'],
+  ['projector','/pano_variant/projector'],['stitcher','/pano_variant/stitcher']].forEach(mv=>{
+  const b=document.createElement('button');b.textContent=mv[0];
+  b.onclick=()=>{if(setSrc)setSrc(mv[1]+'?ts='+Date.now());};
+  bar.appendChild(b);
+ });
  const x=document.createElement('button');x.textContent='✕ close';x.onclick=()=>lb.remove();
  bar.appendChild(x);
  const img=new Image();
@@ -2306,8 +2348,14 @@ async function pano3d(){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
   // vertical span from aspect: equirect width = 2π rad
-  const vspan=Math.min(3.14159,6.2831853*img.height/img.width);
+  let vspan=Math.min(3.14159,6.2831853*img.height/img.width);
   let yaw=0,pitch=0,fov=1.2,drag=null;
+  setSrc=function(url){const im2=new Image();
+   im2.onload=function(){gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,im2);
+    vspan=Math.min(3.14159,6.2831853*im2.height/im2.width);draw();};
+   im2.onerror=function(){cout('no such variant yet — run $panotest in the chatbot');};
+   im2.src=url;};
   function draw(){
    gl.viewport(0,0,cv.width,cv.height);
    gl.uniform2f(gl.getUniformLocation(pr,'res'),cv.width,cv.height);

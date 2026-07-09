@@ -283,6 +283,53 @@ def recall_scene():
     return f"scene memory (loaded from {os.path.basename(d)}):\n{scene.render_inventory(inv)}"
 
 
+def pano_compare(rover):
+    """Build the panorama with every merge method from the LATEST saved scan
+    frames (no camera use) and publish each to the 3D viewer's method buttons."""
+    if rover is None or rover.backend != "rovercontrol":
+        return "panorama test needs the rovercontrol backend (:8080)."
+    import glob as _glob
+    import os as _os
+    import scene
+    import rovercontrol_client as client
+    d, _ = scene.load_latest_scene()
+    if not d:
+        return "no saved scan yet — run $scan first."
+    frames = []
+    for f in sorted(_glob.glob(_os.path.join(d, "pan*_t*.jpg"))):
+        n = _os.path.basename(f)
+        try:
+            frames.append((int(n[3:7]), int(n[9:12]), open(f, "rb").read()))
+        except (ValueError, OSError):
+            continue
+    if len(frames) < 3:
+        return f"scan {_os.path.basename(d)} has no usable frames."
+    import time as _t
+    lines = []
+    best = None
+    for name, fn in (("seamcut", scene._seamcut_pano),
+                     ("projector", lambda fr: scene.build_panorama(fr, try_stitcher=False)),
+                     ("stitcher", scene._stitcher_pano)):
+        t0 = _t.time()
+        try:
+            pano = fn(frames)
+        except Exception as e:
+            pano = None
+            lines.append(f"{name}: failed ({e})")
+            continue
+        if pano:
+            client.set_pano_variant(name, pano)
+            if best is None:
+                best = pano
+            lines.append(f"{name}: {len(pano) // 1024}KB in {_t.time() - t0:.0f}s")
+        else:
+            lines.append(f"{name}: no result (gated out or failed)")
+    if best:
+        client.set_panorama(best)
+    return ("merge comparison ready — open 🌐 3D view and use the method buttons "
+            f"(from scan {_os.path.basename(d)}):\n" + "\n".join("  " + l for l in lines))
+
+
 def detect_compare(rover):
     """Run all detection models on the current camera view and publish each
     model's annotated frame to the website's 🧪 Detectors panel."""
@@ -391,6 +438,12 @@ def build_tools(rover, arm):
                             "surroundings from the returned inventory — do NOT re-scan or look "
                             "again unless the user says the room changed.",
              "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_test_panorama_merges",
+             "description": "Rebuild the 3D-view panorama with every merge method (seamcut / "
+                            "projector / stitcher) from the latest saved scan and publish them to "
+                            "the 3D viewer's method buttons for side-by-side comparison. No camera "
+                            "or motion use.",
+             "parameters": {"type": "object", "properties": {}}},
             {"name": "rover_test_detectors",
              "description": "Run all object-detection models (color-blob + YOLO variants) on the "
                             "current camera view and publish annotated results to the website's "
@@ -481,6 +534,8 @@ def run_tool(rover, arm, name, a):
             return record_room(rover)
         if name == "rover_test_detectors":
             return detect_compare(rover)
+        if name == "rover_test_panorama_merges":
+            return pano_compare(rover)
         if name == "rover_scene_recall":
             return recall_scene()
         if name == "dobot_get_pose":
@@ -621,6 +676,8 @@ def main():
                     print(" ", record_room(rover))
                 elif cmd.lower() == "detect":
                     print(" ", detect_compare(rover))
+                elif cmd.lower() == "panotest":
+                    print(" ", pano_compare(rover))
                 elif cmd.lower() in FIND_SHORTCUTS or cmd.lower().startswith("find "):
                     target = FIND_SHORTCUTS.get(cmd.lower()) or cmd[5:].strip()
                     print(" ", autonomous_find(rover, target))
