@@ -158,6 +158,12 @@ class PanoramaTest(unittest.TestCase):
         g = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
         self.assertLess(float((g < 8).mean()), 0.10)         # sky/ring region covered
 
+    def test_seamcut_too_few_frames_none(self):
+        self.assertIsNone(scene._seamcut_pano([(0, -5, b"x")]))
+
+    def test_seamcut_bad_frames_none(self):
+        self.assertIsNone(scene._seamcut_pano([(p, -5, b"junk") for p in (0, 60, 120)]))
+
     def test_few_frames_returns_none(self):
         self.assertIsNone(scene.build_panorama([(0, 80, b"x"), (0, 80, b"y")]))
 

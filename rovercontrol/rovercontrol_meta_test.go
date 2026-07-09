@@ -167,10 +167,26 @@ func TestDetImageEndpoints(t *testing.T) {
 	}
 }
 
+func TestPanoVariantEndpoints(t *testing.T) {
+	app, _ := testApp(t)
+	if w := do(t, app, "GET", "/pano_variant/seamcut"); w.Code != 404 {
+		t.Fatalf("GET before upload = %d", w.Code)
+	}
+	if w := doJSON(t, app, "POST", "/pano_variant/seamcut", "\xff\xd8img"); w.Code != 200 {
+		t.Fatalf("POST = %d %s", w.Code, w.Body.String())
+	}
+	if w := doJSON(t, app, "POST", "/pano_variant/Bad!", "\xff\xd8img"); w.Code != 400 {
+		t.Fatalf("bad name = %d", w.Code)
+	}
+	if w := do(t, app, "GET", "/pano_variant/seamcut"); w.Code != 200 {
+		t.Fatalf("GET after upload = %d", w.Code)
+	}
+}
+
 func TestWebUIHasOutlineToggle(t *testing.T) {
 	app, _ := testApp(t)
 	body := do(t, app, "GET", "/").Body.String()
-	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel(", "pano3d(", "3D view", "/panorama", "pano_status", "downBg", "panostat", "tour_feed", "Room tour", "detcmp(", "det_image", "Detectors"} {
+	for _, want := range []string{"outline(", "coverPct(", "photo_meta", "className='obox'", "lightbox(", "lbwrap", "fetchMeta(", "boxLabel(", "pano3d(", "3D view", "/panorama", "pano_status", "downBg", "panostat", "tour_feed", "Room tour", "detcmp(", "det_image", "Detectors", "pano_variant", "setSrc"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing %q", want)
 		}

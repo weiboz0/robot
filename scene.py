@@ -331,6 +331,104 @@ def _undistort_equidistant(im, f_fish, out_fov_deg=95):
     return cv2.remap(im, mx, my, cv2.INTER_LINEAR)
 
 
+def _seamcut_pano(frames, max_width=4096):
+    """Best-quality merge (plan 025): undistort each fisheye frame to pinhole,
+    warp onto the sphere at its KNOWN pan/tilt, even out exposure, cut each
+    overlap along an optimal GRAPH-CUT seam (each pixel comes from exactly ONE
+    photo — no averaging, no ghosting), and multiband-blend across the cuts.
+    Output is padded onto the full 2:1 equirect canvas so the web viewer's
+    mapping stays exact. Returns JPEG bytes or None on any failure."""
+    import cv2
+    import numpy as np
+    import math
+    decoded = []
+    for pan, tilt, img in frames:
+        im = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+        if im is not None:
+            decoded.append((float(pan), float(tilt), im))
+    if len(decoded) < 3:
+        return None
+    try:
+        f_fish = _fisheye_focal(decoded) or decoded[0][2].shape[1] / 2.27
+        FOV = 92.0
+        h, w = decoded[0][2].shape[:2]
+        f_pin = (w / 2) / math.tan(math.radians(FOV / 2))
+        K = np.array([[f_pin, 0, w / 2], [0, f_pin, h / 2], [0, 0, 1]], np.float32)
+
+        def rmat(pan, tilt):
+            p, t = math.radians(pan), math.radians(tilt)
+            ry = np.array([[math.cos(p), 0, math.sin(p)], [0, 1, 0],
+                           [-math.sin(p), 0, math.cos(p)]])
+            rx = np.array([[1, 0, 0], [0, math.cos(t), -math.sin(t)],
+                           [0, math.sin(t), math.cos(t)]])
+            return (ry @ rx).astype(np.float32)
+
+        warper = cv2.PyRotationWarper("spherical", f_pin)
+        imgs_w, masks_w, corners, sizes = [], [], [], []
+        for pan, tilt, im in decoded:
+            u = _undistort_equidistant(im, f_fish, out_fov_deg=FOV)
+            R = rmat(pan, tilt)
+            corner, img_w = warper.warp(u, K, R, cv2.INTER_LINEAR, cv2.BORDER_CONSTANT)
+            _, mask_w = warper.warp(255 * np.ones((h, w), np.uint8), K, R,
+                                    cv2.INTER_NEAREST, cv2.BORDER_CONSTANT)
+            imgs_w.append(img_w)
+            masks_w.append(mask_w)
+            corners.append(corner)
+            sizes.append((img_w.shape[1], img_w.shape[0]))
+        comp = cv2.detail.ExposureCompensator_createDefault(
+            cv2.detail.ExposureCompensator_GAIN_BLOCKS)
+        comp.feed(corners=corners, images=imgs_w, masks=masks_w)
+        for i, (im_, m_) in enumerate(zip(imgs_w, masks_w)):
+            comp.apply(i, corners[i], im_, m_)
+        # graph-cut at ~0.25 scale (standard practice): seam QUALITY is about
+        # path topology, not resolution — and full-res cuts took ~5 minutes.
+        SEAM_SCALE = 0.25
+        small = [cv2.resize(im, None, fx=SEAM_SCALE, fy=SEAM_SCALE,
+                            interpolation=cv2.INTER_AREA).astype(np.float32)
+                 for im in imgs_w]
+        small_masks = [cv2.resize(m, (im.shape[1], im.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST)
+                       for m, im in zip(masks_w, small)]
+        small_corners = [(int(c[0] * SEAM_SCALE), int(c[1] * SEAM_SCALE)) for c in corners]
+        finder = cv2.detail_GraphCutSeamFinder("COST_COLOR")
+        seams = finder.find(small, small_corners, small_masks)
+        seams = [m.get() if hasattr(m, "get") else m for m in seams]
+        # dilate the upscaled cut masks a little so neighbors overlap — the
+        # nearest-upscale otherwise leaves 1px cracks; multiband blends overlaps
+        kern = np.ones((9, 9), np.uint8)
+        seams = [cv2.bitwise_and(
+                    cv2.dilate(cv2.resize(sm, (mw.shape[1], mw.shape[0]),
+                                          interpolation=cv2.INTER_NEAREST), kern), mw)
+                 for sm, mw in zip(seams, masks_w)]
+        blender = cv2.detail_MultiBandBlender(0, 5)
+        roi = cv2.detail.resultRoi(corners=corners, sizes=sizes)
+        blender.prepare(roi)
+        for im_, m_, c in zip(imgs_w, seams, corners):
+            blender.feed(im_.astype(np.int16), m_, c)
+        pano, _ = blender.blend(None, None)
+        pano = np.clip(pano, 0, 255).astype(np.uint8)
+        # pad onto the full sphere canvas: spherical warper coords are radians
+        # × f_pin, x∈[-π f, π f], y∈[-π/2 f, π/2 f]
+        full_w = int(round(2 * math.pi * f_pin))
+        full_h = int(round(math.pi * f_pin))
+        canvas = np.zeros((full_h, full_w, 3), np.uint8)
+        # warper coords: x∈[-π f, π f] (0 = front), y∈[0, π f] (equator at π/2 f)
+        x0 = int(roi[0] + full_w // 2)
+        y0 = int(roi[1])
+        for row in range(pano.shape[0]):
+            ry_ = y0 + row
+            if 0 <= ry_ < full_h:
+                xs = (np.arange(pano.shape[1]) + x0) % full_w
+                canvas[ry_, xs] = pano[row]
+        if full_w > max_width:
+            canvas = cv2.resize(canvas, (max_width, max_width // 2),
+                                interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        return buf.tobytes() if ok else None
+    except (cv2.error, ValueError):
+        return None
+
+
 def _stitcher_pano(frames, max_width=4096):
     """Quality path: undistort to pinhole, then OpenCV's full stitching pipeline
     (bundle adjustment, gain compensation, graph-cut seams, multiband blending).
@@ -400,7 +498,9 @@ def build_panorama(frames, width=3600, strip_sigma_deg=None, try_stitcher=True):
         strip_sigma_deg = max(1.0, spacing * 0.9)
 
     if try_stitcher and strip_sigma_deg is None:
-        best = _stitcher_pano(frames)      # quality path for sparse stills
+        best = _seamcut_pano(frames)       # best merge: known-pose seam-cut
+        if best is None:
+            best = _stitcher_pano(frames)  # feature-based fallback
         if best is not None:
             return best
 
