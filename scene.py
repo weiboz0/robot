@@ -350,7 +350,9 @@ def _seamcut_pano(frames, max_width=4096):
         return None
     try:
         f_fish = _fisheye_focal(decoded) or decoded[0][2].shape[1] / 2.27
-        FOV = 92.0
+        FOV = 88.0   # crop balance (live-tested on the real scan): 92° keeps the
+                     # most coverage but duplicates near-field objects at seams; 82°
+                     # kills duplicates but loses top coverage + smudges thin overlaps
         h, w = decoded[0][2].shape[:2]
         f_pin = (w / 2) / math.tan(math.radians(FOV / 2))
         K = np.array([[f_pin, 0, w / 2], [0, f_pin, h / 2], [0, 0, 1]], np.float32)
@@ -395,7 +397,7 @@ def _seamcut_pano(frames, max_width=4096):
         seams = [m.get() if hasattr(m, "get") else m for m in seams]
         # dilate the upscaled cut masks a little so neighbors overlap — the
         # nearest-upscale otherwise leaves 1px cracks; multiband blends overlaps
-        kern = np.ones((9, 9), np.uint8)
+        kern = np.ones((7, 7), np.uint8)
         seams = [cv2.bitwise_and(
                     cv2.dilate(cv2.resize(sm, (mw.shape[1], mw.shape[0]),
                                           interpolation=cv2.INTER_NEAREST), kern), mw)
