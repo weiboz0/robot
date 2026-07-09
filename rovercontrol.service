@@ -1,22 +1,11 @@
-# rovercontrol — single-file rover controller on :8080 (drive + lights + camera
-# + joystick). Owns the serial port AND the camera, so the stock ugv_rpi app
-# must NOT run alongside it.
-#
-# Install on the rover:
-#   sudo cp ~/robot/rovercontrol.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now rovercontrol
-# Then DISABLE the stock @reboot jobs that grab the camera/serial:
-#   crontab -e   # comment out the ugv_rpi/app.py and rover_web.py @reboot lines
-# (app.py itself stays on disk — see docs/reference/app.py-superseded.md.)
 [Unit]
-Description=Rover controller (drive + lights + camera + joystick)
+Description=rovercontrold (Python rover controller)
 After=network.target
 
 [Service]
-ExecStart=/home/ws/robot/rovercontrol-arm64 -photos /home/ws/robot/photos
-User=ws
+ExecStart=/usr/bin/python3 /home/ws/robot/rovercontrold.py -photos /home/ws/robot/photos
 Restart=on-failure
-RestartSec=3
+User=ws
 
 [Install]
 WantedBy=multi-user.target
