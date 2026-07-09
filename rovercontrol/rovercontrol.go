@@ -2354,7 +2354,10 @@ async function pano3d(){
    im2.onload=function(){gl.bindTexture(gl.TEXTURE_2D,tex);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,im2);
     vspan=Math.min(3.14159,6.2831853*im2.height/im2.width);draw();};
-   im2.onerror=function(){cout('no such variant yet — run $panotest in the chatbot');};
+   im2.onerror=function(){const t=document.createElement('div');
+    t.textContent='no result for this method on this scene (it failed or gated out) — run $panotest to rebuild';
+    t.style.cssText='position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.85);color:#fc6;padding:6px 12px;border-radius:6px;z-index:12';
+    document.body.appendChild(t);setTimeout(()=>t.remove(),3500);};
    im2.src=url;};
   function draw(){
    gl.viewport(0,0,cv.width,cv.height);
