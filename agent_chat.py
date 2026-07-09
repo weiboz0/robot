@@ -242,19 +242,13 @@ def scan_surroundings(rover):
     print("   describing the scene (one vision call over all views)...")
     status("describing")
     inv = scene.describe_scene(vm, frames, log=lambda m: print("   " + m))
-    # 3D space from a dense VIDEO sweep (slit-scan): each frame contributes a
-    # thin center strip — no seams/parallax patchwork. Falls back to the 13
-    # stills if the sweep fails. The sweep frames are discarded after building.
-    print("   video-sweeping for the 3D space (camera only)...")
-    status("recording")
-    try:
-        sweep = scene.sweep_frames(client, log=lambda m: print("   " + m))
-    except Exception as e:
-        print(f"   sweep failed ({e}); building from the scan stills")
-        sweep = None
-    print("   building the 3D space...")
+    # 3D space: seam-cut merge of the scan stills (each pixel from exactly ONE
+    # photo — no averaging ghosts). The dense-sweep slit-scan path is retired
+    # from the default scan: it AVERAGED overlapping strips, which multiplied
+    # near-field objects (the "5 jackets" bug) and added ~80s of capture.
+    print("   building the 3D space (seam-cut merge)...")
     status("stitching")
-    pano = scene.build_panorama(sweep or frames)
+    pano = scene.build_panorama(frames)
     pano_note = "no 3D space (stitch failed)"
     if pano:
         try:
