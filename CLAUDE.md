@@ -34,12 +34,13 @@ Notes: scope one logical change per branch/PR; codex/opencode are external agent
   agents. Mirrored to GitHub `weiboz0/robot`, and cloned on the rover at `~/robot`
   (deploy by `git pull` there; the `rover` / `roverjoy` launchers run the pulled code).
   - Control goes through one auto-detecting backend (`rover_backend.py`): **serial** on the
-    Pi → **rovercontrol** (the Go controller's `:8080` API, `rovercontrol_client.py`) →
+    Pi → **rovercontrol** (the controller's `:8080` API, `rovercontrol_client.py`) →
     **app.py** (`:5000`, `rover_client.py`, legacy fallback).
   - Chatbot: `agent_chat.py` (the one chatbot; runs on rover or any computer). LLM provider
     config in `llm_config.py` (used by `list_models.py` / `list_ark_endpoints.py` too).
-  - Gamepad + camera: the Go controller `rovercontrol/` (reads the Pi gamepad, serves
-    camera + control on `:8080`). The old Python joysticks are in `graveyard/`.
+  - Gamepad + camera: the controller `rovercontrold.py` (single-file Python, stdlib
+    only; reads the Pi gamepad, serves camera + control on `:8080`). Ported 1:1
+    from the retired Go build; the old Python joysticks are in `graveyard/`.
   - On-rover serial tools: `rover_direct.py` (motors/camera).
 
 ## Rover facts worth remembering (hard-won)
