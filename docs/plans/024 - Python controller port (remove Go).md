@@ -95,4 +95,27 @@ Python**, delete all Go, and merge — with everything behaving the same way
 
 ## Post-execution report
 
-(appended after merge)
+**Implemented as planned**, merged as PR #58; the rover is back on `main` and
+running the Python controller (serial + camera + gamepad all up on restart).
+
+- **Delivered**: `rovercontrold.py` (1,808 lines), `rovercontrold_page.py`
+  (web page byte-identical to Go's), 53 ported tests, launcher/service/CI
+  swapped to Python, all Go removed (−5,164 lines).
+- **Performance (the go/no-go question)**: measured live on the Pi 5 —
+  15.0 fps sustained over 5 s at 1920×1080 (the camera's configured cap),
+  snapshot latency 12–25 ms, ~57 MB RSS, ~0% idle CPU. The pass-through MJPEG
+  design (no re-encode) is what makes Python equivalent here.
+- **Deviations from a literal 1:1**: none functional. One porting bug found
+  and fixed during testing (HTTP keep-alive hung clients on multipart
+  streams → `close_connection = True` on `/video_feed` / `/tour_feed` —
+  Go's chunked writer didn't need this). Two review-driven hardening fixes
+  went beyond the Go original: keep-alive close on oversized POST bodies,
+  NaN `confidence` rejected in `/photo_meta`.
+- **Reviews**: codex SOUND, Opus PASS, glm-5.1 PASS — zero blocking findings
+  (details above). CI green (222 tests).
+- **Deferred** (reviewer polish notes, not regressions vs Go): temp+rename
+  for blob writes, shutdown-path unit test, surfacing serial write errors in
+  movement state, float rounding on the wire.
+- **Ops note**: `pkill -f rovercontrold.py` inside an ssh one-liner matches
+  the remote shell's own command line and kills the session — use a
+  `"[r]over..."` bracket pattern and separate kill/start invocations.
