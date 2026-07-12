@@ -183,6 +183,10 @@ class Movement:
         self._moving = False
         self._deadline = 0.0
         self._estopped = False
+        self._l = 0.0                # last ACCEPTED wheel command (nudges too),
+        self._r_val = 0.0            # so is_moving() covers in-flight nudges
+        self.on_nonzero_drive = None  # fired under _mu — must only set an event
+        self.on_estop = None          # fired under _mu — must only set an event
 
     def _apply_drive(self, left, right, continuous):
         """State decision AND serial write under the lock (r's own lock nests
@@ -197,12 +201,15 @@ class Movement:
             self._gen += 1
             gen = self._gen
             self._moving = (left != 0 or right != 0) and continuous
+            self._l, self._r_val = left, right
             if continuous:
                 self._deadline = time.monotonic() + WATCHDOG_TTL
             try:
                 self.r.drive(left, right)
             except OSError:
                 pass
+            if (left != 0 or right != 0) and self.on_nonzero_drive:
+                self.on_nonzero_drive()      # accepted nonzero only
             return gen
 
     def set_drive(self, left, right):
@@ -223,6 +230,7 @@ class Movement:
             with self._mu:
                 if gen == self._gen:
                     self._moving = False
+                    self._l = self._r_val = 0.0
                     try:
                         self.r.stop_wheels()
                     except OSError:
@@ -235,6 +243,7 @@ class Movement:
         with self._mu:
             self._gen += 1
             self._moving = False
+            self._l = self._r_val = 0.0
             self._estopped = False
             try:
                 self.r.stop_wheels()
@@ -245,15 +254,24 @@ class Movement:
         with self._mu:
             self._gen += 1
             self._moving = False
+            self._l = self._r_val = 0.0
             self._estopped = True
             try:
                 self.r.estop()
             except OSError:
                 pass
+            if self.on_estop:
+                self.on_estop()
 
     def is_estopped(self):
         with self._mu:
             return self._estopped
+
+    def is_moving(self):
+        """True while any accepted wheel command — including an in-flight
+        nudge — is nonzero."""
+        with self._mu:
+            return self._l != 0 or self._r_val != 0
 
     def set_cap(self, c):
         with self._mu:
@@ -270,6 +288,7 @@ class Movement:
             if not self._moving or now < self._deadline:
                 return False
             self._moving = False
+            self._l = self._r_val = 0.0
             self._gen += 1
             try:
                 self.r.stop_wheels()
@@ -562,6 +581,7 @@ class CameraAim:
 
 SAFE_PHOTO_RE = re.compile(r"^[A-Za-z0-9._-]+\.jpg$")
 DET_NAME_RE = re.compile(r"^[a-z0-9_]{1,24}$")
+SCAN_BUILD_TIMEOUT_S = 300.0   # stitcher subprocess hard kill
 
 
 def safe_photo_name(name):
@@ -582,6 +602,16 @@ class App:
         self._snap_seq = 0
         self._pano_mu = threading.Lock()
         self.pano_state, self.pano_state_at = "", None
+        self._scan_active = False               # under _pano_mu
+        self._scan_cancel = threading.Event()   # set by estop/drive hooks
+        self.scan_settle_s = None               # None → scene.SETTLE_S
+        self.scan_build_timeout = SCAN_BUILD_TIMEOUT_S
+        self.pano_builder = self._build_pano_subprocess
+        # any accepted drive or an e-stop aborts a running scan; the hooks fire
+        # under Movement._mu so they only set the event — the scan thread does
+        # the actual abort/killpg itself.
+        move.on_nonzero_drive = self._scan_cancel.set
+        move.on_estop = self._scan_cancel.set
         self.mapping = None
         self.map_source = "default"
 
@@ -665,6 +695,159 @@ class App:
                 out.append(e[:-len(".meta.json")])
         return out
 
+    # ── 3D scan (gamepad button / POST /scan) ────────────────────────────────
+    # Single-flight authority is the private _scan_active flag under _pano_mu
+    # (pano_state is externally writable via POST /pano_status — display only).
+
+    def start_scan(self):
+        """Kick off a gimbal sweep + out-of-process stitch. One at a time;
+        refused while the wheels are moving. Returns (ok, why-not)."""
+        if self.move.is_estopped():
+            return False, "e-stopped"       # a zero drive/stop releases it
+        if self.move.is_moving():
+            return False, "wheels are moving"
+        with self._pano_mu:
+            if self._scan_active:
+                return False, "scan already running"
+            self._scan_active = True
+            self.pano_state, self.pano_state_at = "scanning", time.monotonic()
+            self._scan_cancel.clear()
+        # estop/drive that slipped in around the clear() (its cancel-event set
+        # would have been erased) → re-check both and abort before any motion
+        if self.move.is_estopped():
+            self._finish_scan(False)
+            return False, "e-stopped"
+        if self.move.is_moving():
+            self._finish_scan(False)
+            return False, "wheels are moving"
+        threading.Thread(target=self._run_scan, daemon=True).start()
+        return True, ""
+
+    def _finish_scan(self, ok):
+        with self._pano_mu:
+            self._scan_active = False
+            self.pano_state = "done" if ok else "failed"
+            self.pano_state_at = time.monotonic()
+
+    def _run_scan(self):
+        ok = False
+        try:
+            import scene
+            kw = {}
+            if self.scan_settle_s is not None:
+                kw["settle_s"] = self.scan_settle_s
+            client = _ScanClient(self)
+            log("scan: gimbal sweep started")
+            frames = scene.scan_frames(client, sleep=client.sleep, **kw)
+            with self._pano_mu:
+                self.pano_state, self.pano_state_at = "stitching", time.monotonic()
+            log(f"scan: {len(frames)} frames captured; stitching…")
+            ok = bool(self.pano_builder(frames)) and not self._scan_cancel.is_set()
+        except ScanCancelled as e:
+            log(f"scan: cancelled ({e})")
+        except Exception as e:
+            log(f"scan: failed ({e})")
+        finally:
+            self._finish_scan(ok)
+            log("scan: 3D view updated" if ok else "scan: not completed")
+
+    def pano_build_cmd(self, frames_dir, out_path):
+        """argv + env for the stitcher subprocess: niced, thread-capped so the
+        build gets at most half the Pi's cores. Separate for test pinning."""
+        scene_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scene.py")
+        env = dict(os.environ)
+        for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                  "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+            env[k] = "1"
+        return (["nice", "-n", "10", sys.executable, scene_py,
+                 "build-pano", frames_dir, out_path], env)
+
+    def _build_pano_subprocess(self, frames):
+        """cv2 runs OUT of process (own process group) so a native crash or
+        memory spike can never touch the controller. The group is killed on
+        cancel (e-stop / drive input) or timeout. Returns True on success."""
+        import tempfile
+        os.makedirs(self.photo_dir, exist_ok=True)
+        # temp dir inside photo_dir → final os.replace is same-fs atomic
+        with tempfile.TemporaryDirectory(prefix=".scan-", dir=self.photo_dir) as td:
+            for pan, tilt, img in frames:
+                name = f"pan{int(pan):+04d}_t{int(tilt):+03d}.jpg"
+                with open(os.path.join(td, name), "wb") as fh:
+                    fh.write(img)
+            out = os.path.join(td, "panorama.jpg")
+            argv, env = self.pano_build_cmd(td, out)
+            with open(os.path.join(td, "stderr.txt"), "w+b") as errf:
+                try:
+                    proc = subprocess.Popen(argv, env=env, start_new_session=True,
+                                            stdout=subprocess.DEVNULL, stderr=errf)
+                except OSError as e:
+                    log(f"scan: stitcher failed to start ({e})")
+                    return False
+                deadline = time.monotonic() + self.scan_build_timeout
+                while proc.poll() is None:
+                    if self._scan_cancel.is_set() or time.monotonic() > deadline:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        proc.wait()
+                        log("scan: stitcher killed (cancelled or timed out)")
+                        return False
+                    time.sleep(0.1)
+                errf.seek(0)
+                tail = errf.read()[-400:].decode("utf-8", "replace").strip()
+            if proc.returncode != 0:
+                log(f"scan: stitcher exited {proc.returncode}: {tail}")
+                return False
+            if self._scan_cancel.is_set():   # cancel landed after proc exit
+                log("scan: cancelled — result discarded, not published")
+                return False
+            try:
+                os.replace(out, os.path.join(self.photo_dir, "panorama.jpg"))
+            except OSError as e:
+                log(f"scan: could not publish panorama ({e})")
+                return False
+            return True
+
+
+class ScanCancelled(RuntimeError):
+    pass
+
+
+class _ScanClient:
+    """scene.scan_frames client that gates EVERY gimbal command and frame grab
+    on the scan-cancel event — after e-stop or a drive input, no further gimbal
+    motion can be issued by the scan, including scan_frames' finally-recenter
+    (the raise there is swallowed by its except-pass, so the recenter is
+    suppressed rather than sent)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def _check(self):
+        if self.app._scan_cancel.is_set():
+            raise ScanCancelled("cancelled by e-stop or drive input")
+
+    def set_camera(self, pan, tilt):
+        self._check()
+        self.app.aim.set(pan, tilt)
+
+    def get_stream_frame(self):
+        self._check()
+        frame = self.app.hub.latest_frame()
+        if frame is None:
+            raise OSError("no camera frame")
+        return frame
+
+    def sleep(self, seconds):
+        deadline = time.monotonic() + seconds
+        while True:
+            self._check()
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(0.05, left))
+
 
 # minimal 1x1 grey baseline JPEG served when the camera is down
 PLACEHOLDER_FRAME = bytes([
@@ -742,6 +925,7 @@ def default_mapping():
         "turbo": _btn(5), "stop": _btn(0), "snapshot": _btn(1),
         "head_light": _btn(2), "center": _btn(3), "base_light": _btn(4),
         "estop": _btn(6), "relax": _btn(9), "lock": _btn(10),
+        "scan": _btn(7),
         "hat": {"kind": "axis", "axis": _axis_map(7, True)},
         "precision": _none(), "boost": _none(), "panic_stop": _none(),
         "hat_x": {"kind": "none"},
@@ -749,7 +933,7 @@ def default_mapping():
 
 
 CONTROL_KEYS = ("turbo", "stop", "estop", "head_light", "base_light",
-                "center", "snapshot", "relax", "lock",
+                "center", "snapshot", "relax", "lock", "scan",
                 "precision", "boost", "panic_stop")
 AXIS_KEYS = ("throttle", "steer", "pan", "tilt")
 
@@ -915,6 +1099,7 @@ def compute_joystick(m, state, prev):
     a["center"] = ctrl_edge("center", m["center"])
     a["relax"] = ctrl_edge("relax", m["relax"])
     a["lock"] = ctrl_edge("lock", m["lock"])
+    a["scan"] = ctrl_edge("scan", m["scan"])
     a["turbo"] = control_held(m["turbo"], state)
     a["boost"] = control_held(m["boost"], state)
     a["precision"] = control_held(m["precision"], state)
@@ -989,6 +1174,9 @@ def joystick_loop(app, gp, stop_event):
             _quiet(lambda: app.rover.gimbal_torque(False))
         if a["lock"]:
             _quiet(lambda: app.rover.gimbal_torque(True))
+        if a["scan"]:
+            ok, why = app.start_scan()
+            log("scan: started from gamepad" if ok else f"scan: refused ({why})")
         if a["hat_delta"]:
             speed_idx = int(clamp(speed_idx + a["hat_delta"], 0, len(SPEED_STEPS) - 1))
             app.move.set_cap(SPEED_STEPS[speed_idx])
@@ -1198,7 +1386,8 @@ def run_calibrate(js_path, map_path):
                         ("center", "Press CENTER camera"),
                         ("snapshot", "Press SNAPSHOT"),
                         ("relax", "Press RELAX gimbal (e.g. L2)"),
-                        ("lock", "Press LOCK gimbal (e.g. R2)")):
+                        ("lock", "Press LOCK gimbal (e.g. R2)"),
+                        ("scan", "Press 3D-SCAN (starts a room panorama scan)")):
         c = _capture_control(f, prompt)
         m[key] = c if c is not None else _none()   # skip → disabled
     m["hat"] = _capture_hat(f, "Press D-pad UP", "speed cap")
@@ -1502,6 +1691,14 @@ def make_handler(app):
                         self._err(503, str(e))
                         return
                     self._json(200, {"ok": True, "name": name})
+                elif p == "/scan":
+                    if not self._require_serial():
+                        return
+                    ok, why = app.start_scan()
+                    if not ok:
+                        self._err(409, why)
+                        return
+                    self._json(200, {"ok": True, "state": "scanning"})
                 elif p.startswith("/delete_photo/"):
                     name = p[len("/delete_photo/"):]
                     if not safe_photo_name(name):

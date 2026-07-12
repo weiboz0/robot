@@ -50,6 +50,7 @@ serial down → 503. CORS is open (any page/client can call it).
 | `GET /latest` | `{"count":N,"latest":"…jpg"}` (used by the gallery auto-refresh) |
 | `GET /photos/<name>` | serve a photo file |
 | `POST /delete_photo/<name>` | delete a photo |
+| `POST /scan` | start a 3D room scan (gimbal sweep → panorama built on the Pi); `409` while one runs or the wheels are moving; e-stop or any drive input aborts it |
 
 ### Meta
 | Method · path | Does |
@@ -90,6 +91,7 @@ Two ways to use a gamepad; both go through the same server-side safety
 | **X** | head light · **LB** base light |
 | **Y** | center camera |
 | **L3 / R3** | relax / lock gimbal |
+| **Start** | 3D scan (room panorama; e-stop or driving aborts it) |
 | **RB (hold)** | turbo |
 | **LT (hold)** ※ | precision / slow mode |
 | **RT (hold)** ※ | boost (max speed) |

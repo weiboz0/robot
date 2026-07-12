@@ -133,7 +133,8 @@ class SerialDownTest(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             for path in ("/move_forward", "/stop", "/estop", "/drive?l=0&r=0",
-                         "/camera_center", "/light_head", "/gimbal_relax"):
+                         "/camera_center", "/light_head", "/gimbal_relax",
+                         "/scan"):
                 c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
                 c.request("POST", path)
                 self.assertEqual(c.getresponse().status, 503, path)
@@ -142,6 +143,40 @@ class SerialDownTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             tmp.cleanup()
+
+
+class ScanHTTPTest(HTTPBase):
+    def test_scan_starts_conflicts_and_completes(self):
+        import threading as _t
+        gate = _t.Event()
+        old_builder, old_settle = self.app.pano_builder, self.app.scan_settle_s
+        self.app.scan_settle_s = 0
+        self.app.pano_builder = lambda frames: gate.wait(5) or True
+        self.hub.publish(b"\xff\xd8JPEG")
+        try:
+            s, j = self.jreq("POST", "/scan")
+            self.assertEqual((s, j["ok"]), (200, True))
+            s, _ = self.jreq("POST", "/scan")            # single-flight
+            self.assertEqual(s, 409)
+            gate.set()
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                s, j = self.jreq("GET", "/pano_status")
+                if j.get("state") in ("done", "failed"):
+                    break
+                time.sleep(0.02)
+            self.assertEqual(j["state"], "done")
+        finally:
+            self.app.pano_builder, self.app.scan_settle_s = old_builder, old_settle
+
+    def test_scan_409_while_driving(self):
+        self.move.set_drive(0.1, 0.1)
+        try:
+            s, j = self.jreq("POST", "/scan")
+            self.assertEqual(s, 409)
+            self.assertIn("moving", j.get("error", ""))
+        finally:
+            self.move.stop()
 
 
 class PhotoHTTPTest(HTTPBase):

@@ -189,6 +189,49 @@ class PanoramaTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(saved, "panorama.jpg")))
 
 
+class FrameNameTest(unittest.TestCase):
+    def test_roundtrip_save_scene_naming(self):
+        for pan, tilt in ((0, -5), (-120, 35), (180, 80), (60, -5)):
+            name = f"pan{int(pan):+04d}_t{int(tilt):+03d}.jpg"   # save_scene format
+            self.assertEqual(scene.parse_frame_name(name), (float(pan), float(tilt)))
+
+    def test_rejects_junk(self):
+        for bad in ("panorama.jpg", "pan+000.jpg", "pan000_t-05.jpg",
+                    "pan+000_t-05.png", "inventory.json"):
+            self.assertIsNone(scene.parse_frame_name(bad))
+
+
+@unittest.skipUnless(__import__("importlib").util.find_spec("cv2"), "opencv not installed")
+class BuildPanoCliTest(unittest.TestCase):
+    def test_empty_dir_exit_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(scene.cli_build_pano(d, os.path.join(d, "o.jpg")), 2)
+
+    def test_corrupt_frames_exit_3(self):
+        with tempfile.TemporaryDirectory() as d:
+            for pan in (-120, -60, 0, 60, 120, 180):
+                with open(os.path.join(d, f"pan{pan:+04d}_t-05.jpg"), "wb") as f:
+                    f.write(b"junk")
+            self.assertEqual(scene.cli_build_pano(d, os.path.join(d, "o.jpg")), 3)
+
+    def test_end_to_end(self):
+        import cv2
+        import numpy as np
+        rng = np.random.RandomState(7)
+        with tempfile.TemporaryDirectory() as d:
+            for pan in (-120, -60, 0, 60, 120, 180):
+                img = np.full((240, 320, 3), 180, np.uint8)
+                for _ in range(30):
+                    x, y = int(rng.randint(0, 320)), int(rng.randint(0, 240))
+                    cv2.circle(img, (x, y), int(rng.randint(4, 16)),
+                               tuple(int(v) for v in rng.randint(0, 255, 3)), -1)
+                with open(os.path.join(d, f"pan{pan:+04d}_t-05.jpg"), "wb") as f:
+                    f.write(cv2.imencode(".jpg", img)[1].tobytes())
+            out = os.path.join(d, "o.jpg")
+            self.assertEqual(scene.cli_build_pano(d, out), 0)
+            self.assertTrue(os.path.getsize(out) > 0)
+
+
 class RecordTourTest(unittest.TestCase):
     def test_sweeps_full_circle_and_recenters(self):
         c = FakeClient()
