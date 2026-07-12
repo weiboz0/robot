@@ -41,6 +41,10 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  .prog li span{flex:1;word-break:break-all}
  .prog li button{padding:2px 7px;font-size:12px}
 </style></head><body>
+<div id="posebadge" style="position:fixed;top:8px;right:8px;background:rgba(0,0,0,.7);padding:6px 10px;border-radius:8px;font:12px ui-monospace,monospace;z-index:9;text-align:right">
+ <span id="posetext" style="color:#667">pose: …</span>
+ <button onclick="poseReset()" title="set current spot as origin (0,0), heading 0°" style="margin-left:6px;padding:2px 8px;border:0;border-radius:6px;cursor:pointer">⌂ 0,0</button>
+</div>
 <header><h1>🤖 Rover controller</h1>
  <button class="warn" onclick="cmd('estop')">⛔ E-STOP</button>
  <button onclick="snap()">📸 Snapshot</button>
@@ -129,8 +133,14 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
 </div>
 <ol id="program" class="prog"></ol>
 <div style="max-width:640px;margin:0 auto;padding:0 12px"><small>press ■ Stop to end a running program — E-STOP halts motion but the loop keeps going</small></div>
-<div class="bar"><button class="warn" onclick="clearAll()">🗑 Clear all photos</button></div>
+<div class="bar">
+ <button id="tabphotos" onclick="showTab('photos')">📷 Photos</button>
+ <button id="tabscans" onclick="showTab('scans')">🌍 3D views</button>
+ <button class="warn" id="clearphotos" onclick="clearAll()">🗑 Clear all photos</button>
+ <button class="warn" id="clearscans" onclick="clearAllScans()" style="display:none">🗑 Clear all 3D views</button>
+</div>
 <div class="grid" id="gallery"></div>
+<div class="grid" id="scangrid" style="display:none"></div>
 <script>
 const cmd = (c,q='')=>fetch('/'+c+(q?'?'+q:''),{method:'POST'});
 let driving=false;
@@ -155,22 +165,43 @@ async function load(){
 // WebGL fragment shader maps view direction -> equirect UV. The pano's vertical
 // span is inferred from its aspect (equirect: width = 360°). Esc/background
 // closes. Falls back to a scrollable flat image if WebGL is unavailable.
-async function pano3d(){
- const head=await fetch('/panorama',{method:'HEAD'}).catch(()=>null);
- if(!head||!head.ok){cout('no 3D space yet — run a scene scan ($scan in the chatbot)');return;}
+async function pano3d(src){
+ // src: archived scan URL ('/scans/…') — no merge variants exist for those.
+ // Live view probes the variants and DEFAULTS TO THE CLEAREST that exists:
+ // seamcut (graph-cut seams — the sharp one) → live pano → projector → stitcher.
+ const VARIANTS=[['seamcut','/pano_variant/seamcut'],['live','/panorama'],
+  ['projector','/pano_variant/projector'],['stitcher','/pano_variant/stitcher']];
+ let start=src||null;const avail={};
+ if(!src){
+  for(const mv of VARIANTS){
+   const h=await fetch(mv[1],{method:'HEAD'}).catch(()=>null);
+   avail[mv[0]]=!!(h&&h.ok);
+   if(!start&&avail[mv[0]])start=mv[1];
+  }
+  if(!start){cout('no 3D space yet — run a scene scan ($scan in the chatbot)');return;}
+ }else{
+  const h=await fetch(src,{method:'HEAD'}).catch(()=>null);
+  if(!h||!h.ok){cout('that 3D view is gone');return;}
+ }
  const lb=document.createElement('div');lb.className='lb';
  let downBg=false;                              // drag-safe: press AND release on the
  lb.onmousedown=e=>{downBg=(e.target===lb);};   // background — releasing a look-around
  lb.onclick=e=>{if(e.target===lb&&downBg)lb.remove();};  // drag outside must NOT close
  const bar=document.createElement('div');bar.className='lbbar';
- // merge-method buttons: reload the sphere texture from a stored variant
- let setSrc=null;
- [['live','/panorama'],['seamcut','/pano_variant/seamcut'],
-  ['projector','/pano_variant/projector'],['stitcher','/pano_variant/stitcher']].forEach(mv=>{
-  const b=document.createElement('button');b.textContent=mv[0];
-  b.onclick=()=>{if(setSrc)setSrc(mv[1]+'?ts='+Date.now());};
-  bar.appendChild(b);
- });
+ // merge-method buttons: only for the live pano, only for variants that exist,
+ // with the ACTIVE one highlighted blue
+ let setSrc=null,cur=start;const vbtns=[];
+ function markActive(){vbtns.forEach(([u,b])=>{
+  b.style.background=(u===cur)?'#08f':'';b.style.color=(u===cur)?'#fff':'';});}
+ if(!src){
+  VARIANTS.forEach(mv=>{
+   if(!avail[mv[0]])return;                     // missing variant → no button
+   const b=document.createElement('button');b.textContent=mv[0];b.id='pv_'+mv[0];
+   b.onclick=()=>{if(setSrc){cur=mv[1];markActive();setSrc(mv[1]+'?ts='+Date.now());}};
+   vbtns.push([mv[1],b]);bar.appendChild(b);
+  });
+  markActive();
+ }
  const x=document.createElement('button');x.textContent='✕ close';x.onclick=()=>lb.remove();
  bar.appendChild(x);
  const img=new Image();
@@ -251,7 +282,7 @@ async function pano3d(){
   cv.onwheel=e=>{fov=Math.max(0.4,Math.min(2.0,fov+e.deltaY*0.001));draw();e.preventDefault();};
   draw();
  };
- img.src='/panorama?ts='+Date.now();
+ img.src=start+'?ts='+Date.now();
  lb.appendChild(bar);
  document.body.appendChild(lb);
  document.addEventListener('keydown',function esc(e){
@@ -384,6 +415,42 @@ async function clearAll(){const p=await(await fetch('/photos')).json();const ns=
  if(!ns.length||!confirm('Delete all '+ns.length+' photos?'))return;
  for(const n of ns){await fetch('/delete_photo/'+encodeURIComponent(n),{method:'POST'});}
  seen='';load();}
+
+// ── gallery tabs: Photos ⇄ 3D views (archived scans) ─────────────────────────
+let gtab='photos';
+function showTab(t){gtab=t;
+ document.getElementById('gallery').style.display=t==='photos'?'':'none';
+ document.getElementById('scangrid').style.display=t==='scans'?'':'none';
+ document.getElementById('clearphotos').style.display=t==='photos'?'':'none';
+ document.getElementById('clearscans').style.display=t==='scans'?'':'none';
+ const tp=document.getElementById('tabphotos'),ts=document.getElementById('tabscans');
+ tp.style.background=t==='photos'?'#08f':'';tp.style.color=t==='photos'?'#fff':'';
+ ts.style.background=t==='scans'?'#08f':'';ts.style.color=t==='scans'?'#fff':'';
+ if(t==='scans')loadScans();}
+async function loadScans(){
+ const j=await(await fetch('/scans')).json();
+ document.getElementById('scangrid').innerHTML=(j.scans||[]).map(n=>
+  '<figure><a href="/scans/'+n+'" onclick="pano3d(\'/scans/'+n+'\');return false"><img loading="lazy" src="/scans/'+n+'"></a>'+
+  '<figcaption><span>'+n+'</span><button class="warn" onclick="delScan(\''+n+'\')">del</button></figcaption></figure>').join('')
+  ||'<small style="grid-column:1/-1;text-align:center">no 3D views saved yet — press Start on the gamepad or run a scan</small>';}
+async function delScan(n){await fetch('/delete_scan/'+n,{method:'POST'});loadScans();}
+async function clearAllScans(){const j=await(await fetch('/scans')).json();const ns=j.scans||[];
+ if(!ns.length||!confirm('Delete all '+ns.length+' 3D views?'))return;
+ for(const n of ns){await fetch('/delete_scan/'+n,{method:'POST'});}
+ loadScans();}
+
+// ── pose badge: dead-reckoned position/heading + camera aim (top right) ──────
+async function poseTick(){try{
+ const p=await(await fetch('/pose')).json();
+ const el=document.getElementById('posetext');if(!el)return;
+ if(!p.fresh){el.style.color='#667';el.textContent='pose: no telemetry';return;}
+ el.style.color='#cde';
+ el.textContent='('+p.x.toFixed(2)+', '+p.y.toFixed(2)+')m ⟲'+p.heading.toFixed(0)+
+  '° cam '+p.pan.toFixed(0)+'°/'+p.tilt.toFixed(0)+'°'+
+  (p.battery_v?' 🔋'+p.battery_v.toFixed(1)+'V':'');
+}catch(e){}}
+async function poseReset(){await fetch('/pose_reset',{method:'POST'});poseTick();}
+setInterval(poseTick,500);poseTick();
 
 // ── speed cap: slider + number input + live value, synced from the server ────
 function syncCap(v){v=Number(v);const c=document.getElementById('cap'),n=document.getElementById('capNum'),

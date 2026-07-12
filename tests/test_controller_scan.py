@@ -248,6 +248,27 @@ class BuilderSubprocessTest(unittest.TestCase):
             [sys.executable, "-c", "import sys; sys.exit(3)"], None)
         self.assertFalse(app._build_pano_subprocess([(0, -5, b"x")]))
 
+    def test_success_archives_a_history_copy(self):
+        app = self._app()
+        app.pano_build_cmd = lambda d, o: (
+            [sys.executable, "-c", f"open({o!r},'wb').write(b'PANO')"], None)
+        self.assertTrue(app._build_pano_subprocess([(0, -5, b"x")]))
+        scans = app.list_scans()
+        self.assertEqual(len(scans), 1)
+        with open(os.path.join(app.scans_dir, scans[0]), "rb") as f:
+            self.assertEqual(f.read(), b"PANO")
+
+    def test_archive_failure_does_not_fail_scan(self):
+        app = self._app()
+        app.pano_build_cmd = lambda d, o: (
+            [sys.executable, "-c", f"open({o!r},'wb').write(b'PANO')"], None)
+        # scans_dir path blocked by a plain file → os.makedirs raises
+        with open(app.scans_dir, "wb") as f:
+            f.write(b"in the way")
+        self.assertTrue(app._build_pano_subprocess([(0, -5, b"x")]))
+        with open(os.path.join(app.photo_dir, "panorama.jpg"), "rb") as f:
+            self.assertEqual(f.read(), b"PANO")    # latest stays authoritative
+
     def test_success_publishes_atomically(self):
         app = self._app()
         real_cmd = app.pano_build_cmd
