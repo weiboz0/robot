@@ -201,6 +201,43 @@ class FrameNameTest(unittest.TestCase):
             self.assertIsNone(scene.parse_frame_name(bad))
 
 
+class BuildPanoVariantsTest(unittest.TestCase):
+    """Pure preference-order logic with injected builders — no cv2."""
+
+    def test_first_success_is_best_in_quality_order(self):
+        builders = (("seamcut", lambda f: b"SEAM"),
+                    ("projector", lambda f: b"PROJ"),
+                    ("stitcher", lambda f: b"STIT"))
+        best, out = scene.build_pano_variants([], builders=builders)
+        self.assertEqual(best, b"SEAM")
+        self.assertEqual(out, {"seamcut": b"SEAM", "projector": b"PROJ",
+                               "stitcher": b"STIT"})
+
+    def test_failed_better_method_falls_through(self):
+        builders = (("seamcut", lambda f: None),           # gated out
+                    ("projector", lambda f: (_ for _ in ()).throw(RuntimeError("x"))),
+                    ("stitcher", lambda f: b"STIT"))
+        best, out = scene.build_pano_variants([], builders=builders)
+        self.assertEqual(best, b"STIT")                    # only success wins
+        self.assertEqual(out, {"stitcher": b"STIT"})
+
+    def test_later_failure_does_not_unseat_best(self):
+        builders = (("seamcut", lambda f: b"SEAM"),
+                    ("stitcher", lambda f: (_ for _ in ()).throw(ValueError("y"))))
+        best, out = scene.build_pano_variants([], builders=builders)
+        self.assertEqual(best, b"SEAM")
+        self.assertEqual(out, {"seamcut": b"SEAM"})
+
+    def test_all_fail(self):
+        builders = (("a", lambda f: None), ("b", lambda f: None))
+        self.assertEqual(scene.build_pano_variants([], builders=builders),
+                         (None, {}))
+
+    def test_default_order_is_the_panotest_trio(self):
+        self.assertEqual([n for n, _ in scene.VARIANT_BUILDERS],
+                         ["seamcut", "projector", "stitcher"])
+
+
 @unittest.skipUnless(__import__("importlib").util.find_spec("cv2"), "opencv not installed")
 class BuildPanoCliTest(unittest.TestCase):
     def test_empty_dir_exit_2(self):
@@ -214,22 +251,42 @@ class BuildPanoCliTest(unittest.TestCase):
                     f.write(b"junk")
             self.assertEqual(scene.cli_build_pano(d, os.path.join(d, "o.jpg")), 3)
 
-    def test_end_to_end(self):
+    def _write_frames(self, d):
         import cv2
         import numpy as np
         rng = np.random.RandomState(7)
+        for pan in (-120, -60, 0, 60, 120, 180):
+            img = np.full((240, 320, 3), 180, np.uint8)
+            for _ in range(30):
+                x, y = int(rng.randint(0, 320)), int(rng.randint(0, 240))
+                cv2.circle(img, (x, y), int(rng.randint(4, 16)),
+                           tuple(int(v) for v in rng.randint(0, 255, 3)), -1)
+            with open(os.path.join(d, f"pan{pan:+04d}_t-05.jpg"), "wb") as f:
+                f.write(cv2.imencode(".jpg", img)[1].tobytes())
+
+    def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as d:
-            for pan in (-120, -60, 0, 60, 120, 180):
-                img = np.full((240, 320, 3), 180, np.uint8)
-                for _ in range(30):
-                    x, y = int(rng.randint(0, 320)), int(rng.randint(0, 240))
-                    cv2.circle(img, (x, y), int(rng.randint(4, 16)),
-                               tuple(int(v) for v in rng.randint(0, 255, 3)), -1)
-                with open(os.path.join(d, f"pan{pan:+04d}_t-05.jpg"), "wb") as f:
-                    f.write(cv2.imencode(".jpg", img)[1].tobytes())
+            self._write_frames(d)
             out = os.path.join(d, "o.jpg")
             self.assertEqual(scene.cli_build_pano(d, out), 0)
             self.assertTrue(os.path.getsize(out) > 0)
+
+    def test_end_to_end_with_variants(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_frames(d)
+            out = os.path.join(d, "o.jpg")
+            self.assertEqual(scene.cli_build_pano(d, out, d), 0)
+            with open(out, "rb") as f:
+                main = f.read()
+            # the canonical output is the best (first-in-order) variant
+            for name, _ in scene.VARIANT_BUILDERS:
+                vp = os.path.join(d, "pano_var_" + name + ".jpg")
+                if os.path.exists(vp):
+                    with open(vp, "rb") as f:
+                        self.assertEqual(main, f.read())
+                    break
+            else:
+                self.fail("no variant file written")
 
 
 class RecordTourTest(unittest.TestCase):
