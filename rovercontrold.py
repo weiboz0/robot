@@ -760,6 +760,8 @@ class App:
         self._pano_mu = threading.Lock()
         self.pano_state, self.pano_state_at = "", None
         self._scan_active = False               # under _pano_mu
+        self._scan_published = False            # under _pano_mu — cancel's
+                                                # point of no return
         self._scan_cancel = threading.Event()   # set by estop/drive hooks
         self.scan_settle_s = None               # None → scene.SETTLE_S
         self.scan_build_timeout = SCAN_BUILD_TIMEOUT_S
@@ -869,6 +871,7 @@ class App:
             if self._scan_active:
                 return False, "scan already running"
             self._scan_active = True
+            self._scan_published = False
             self.pano_state, self.pano_state_at = "scanning", time.monotonic()
             self._scan_cancel.clear()
         # estop/drive that slipped in around the clear() (its cancel-event set
@@ -887,6 +890,29 @@ class App:
             self._scan_active = False
             self.pano_state = "done" if ok else "failed"
             self.pano_state_at = time.monotonic()
+
+    def cancel_scan(self):
+        """User-requested abort (⏹ / POST /scan_cancel): same event the
+        e-stop/drive hooks set — sweep stops before the next gimbal command,
+        the stitcher process group dies, the result is discarded. Atomic
+        check+set under _pano_mu; when idle the event is NOT set. A 200 must
+        never lie: once _mark_published() won the lock, cancel is refused —
+        the result is no longer discardable. Returns whether it cancelled."""
+        with self._pano_mu:
+            if not self._scan_active or self._scan_published:
+                return False
+            self._scan_cancel.set()
+            return True
+
+    def _mark_published(self):
+        """Atomic point-of-no-return vs cancel_scan: True → the canonical
+        publish proceeds and any later cancel gets 409; False → a cancel
+        already won and the result must be discarded."""
+        with self._pano_mu:
+            if self._scan_cancel.is_set():
+                return False
+            self._scan_published = True
+            return True
 
     def _run_scan(self):
         ok = False
@@ -962,9 +988,9 @@ class App:
             if proc.returncode != 0:
                 log(f"scan: stitcher exited {proc.returncode}")
                 return False
-            if self._scan_cancel.is_set():   # cancel landed after proc exit
+            if not self._mark_published():   # cancel landed after proc exit —
                 log("scan: cancelled — result discarded, not published")
-                return False
+                return False                  # atomic vs a racing /scan_cancel
             pano = os.path.join(self.photo_dir, "panorama.jpg")
             try:
                 os.replace(out, pano)
@@ -1919,6 +1945,12 @@ def make_handler(app):
                         self._err(409, why)
                         return
                     self._json(200, {"ok": True, "state": "scanning"})
+                elif p == "/scan_cancel":
+                    # ungated: touches no hardware, only aborts+discards
+                    if not app.cancel_scan():
+                        self._err(409, "no scan running (or already publishing)")
+                        return
+                    self._json(200, {"ok": True})
                 elif p.startswith("/delete_photo/"):
                     name = p[len("/delete_photo/"):]
                     if not safe_photo_name(name):

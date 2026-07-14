@@ -161,6 +161,32 @@ class PanoramaTest(unittest.TestCase):
     def test_seamcut_too_few_frames_none(self):
         self.assertIsNone(scene._seamcut_pano([(0, -5, b"x")]))
 
+    def test_guard_trips_when_finder_cuts_nothing(self):
+        # simulate the exact cv2-4.6 regression: find() returns None AND
+        # leaves the masks untouched → the guard must fail the whole variant
+        import cv2
+
+        class NoopFinder:
+            def __init__(self, *a):
+                pass
+
+            def find(self, imgs, corners, masks):
+                return None                    # no return, no mutation
+
+        orig = cv2.detail_GraphCutSeamFinder
+        cv2.detail_GraphCutSeamFinder = NoopFinder
+        try:
+            self.assertIsNone(scene._seamcut_pano(self._frames()))
+        finally:
+            cv2.detail_GraphCutSeamFinder = orig
+
+    def test_seamcut_output_masks_actually_cut(self):
+        # e2e on synthetic frames: if the finder's cuts were being discarded
+        # (the cv2-4.6 numpy-mask bug), the no-cut guard would return None —
+        # so a non-None seamcut result proves the seams really applied
+        pano = scene._seamcut_pano(self._frames())
+        self.assertIsNotNone(pano)
+
     def test_seamcut_bad_frames_none(self):
         self.assertIsNone(scene._seamcut_pano([(p, -5, b"junk") for p in (0, 60, 120)]))
 

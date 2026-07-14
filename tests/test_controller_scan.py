@@ -187,6 +187,67 @@ class ScanInterlockTest(unittest.TestCase):
         self.assertFalse(
             os.path.exists(os.path.join(app.photo_dir, "panorama.jpg")))
 
+    def test_cancel_scan_aborts_and_discards(self):
+        app, link = make_scan_app()
+        app.pano_builder = lambda frames: self.fail("builder must not run")
+        app.hub.on_grab = lambda n: n == 2 and app.cancel_scan()
+        self.assertTrue(app.start_scan()[0])
+        self.assertEqual(wait_scan_end(app), "failed")
+        # no gimbal command (incl. recenter) after the cancel took effect
+        lines = link.all()
+        aims = [i for i, l in enumerate(lines) if '"T":133' in l]
+        self.assertLess(len(aims), 15)             # aborted before completion
+
+    def test_cancel_scan_idle_returns_false_and_leaves_event_clear(self):
+        app, _ = make_scan_app()
+        self.assertFalse(app.cancel_scan())
+        self.assertFalse(app._scan_cancel.is_set())   # contract: no side effect
+
+    def test_cancel_during_stitching_kills_builder(self):
+        app, _ = make_scan_app()
+        gate = threading.Event()
+
+        def blocking_builder(frames):
+            # simulate the subprocess loop: watch the cancel event
+            cancelled = app._scan_cancel.wait(5)
+            gate.set()
+            return not cancelled
+        app.pano_builder = blocking_builder
+        self.assertTrue(app.start_scan()[0])
+        deadline = time.monotonic() + 5
+        while app.pano_state != "stitching" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(app.cancel_scan())
+        self.assertTrue(gate.wait(5))
+        self.assertEqual(wait_scan_end(app), "failed")
+
+    def test_cancel_after_publish_point_refused(self):
+        # publish won the race: a later cancel must 409, never lie with a 200
+        app, _ = make_scan_app()
+        gate = threading.Event()
+
+        def builder(frames):
+            self.assertTrue(app._mark_published())   # point of no return
+            self.assertFalse(app.cancel_scan())      # _scan_active still True
+            gate.set()
+            return True
+        app.pano_builder = builder
+        self.assertTrue(app.start_scan()[0])
+        self.assertTrue(gate.wait(5))
+        self.assertEqual(wait_scan_end(app), "done")  # published, not failed
+
+    def test_cancel_before_publish_point_discards(self):
+        # cancel won the race: _mark_published must refuse the publish
+        app, _ = make_scan_app()
+
+        def builder(frames):
+            self.assertTrue(app.cancel_scan())
+            self.assertFalse(app._mark_published())   # too late to publish
+            return False
+        app.pano_builder = builder
+        self.assertTrue(app.start_scan()[0])
+        self.assertEqual(wait_scan_end(app), "failed")
+
     def test_no_frame_fails_cleanly(self):
         app, _ = make_scan_app(frame=None)
         app.pano_builder = lambda frames: self.fail("builder must not run")

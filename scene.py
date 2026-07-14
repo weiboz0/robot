@@ -412,10 +412,20 @@ def _seamcut_pano(frames, max_width=4096):
                             interpolation=cv2.INTER_AREA).astype(np.float32)
                  for im in imgs_w]
         finder = cv2.detail_GraphCutSeamFinder("COST_COLOR")
-        seams = finder.find(small, small_corners, small_masks)
-        if seams is None:                      # cv2 4.6: in-place into masks
-            seams = small_masks
+        # masks go in as UMat: cv2 4.6's find() returns None AND discards
+        # numpy-mask mutations (they happen on internal copies) — the uncut
+        # masks then blend full overlaps into the double-image blur (plan
+        # 028 root cause). UMats ARE mutated in place on 4.6; newer cv2
+        # returns the cut masks. Keep numpy ORIGINALS for the no-cut guard.
+        orig_masks = [m.copy() for m in small_masks]
+        umasks = [cv2.UMat(m) for m in small_masks]
+        ret = finder.find(small, small_corners, umasks)
+        seams = ret if ret is not None else umasks
         seams = [m.get() if hasattr(m, "get") else m for m in seams]
+        # guard: if NO mask was cut, something silently failed — return None
+        # (fail to the next merge variant) rather than ship an uncut blur
+        if all(np.array_equal(s, o) for s, o in zip(seams, orig_masks)):
+            return None
         # dilate the upscaled cut masks a little so neighbors overlap — the
         # nearest-upscale otherwise leaves 1px cracks; multiband blends overlaps
         kern = np.ones((7, 7), np.uint8)

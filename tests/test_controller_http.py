@@ -169,6 +169,34 @@ class ScanHTTPTest(HTTPBase):
         finally:
             self.app.pano_builder, self.app.scan_settle_s = old_builder, old_settle
 
+    def test_scan_cancel_endpoint(self):
+        s, j = self.jreq("POST", "/scan_cancel")       # idle → 409
+        self.assertEqual(s, 409)
+        import threading as _t
+        gate = _t.Event()
+        old_builder, old_settle = self.app.pano_builder, self.app.scan_settle_s
+        self.app.scan_settle_s = 0
+        self.app.pano_builder = (
+            lambda frames: not self.app._scan_cancel.wait(5) and gate.set())
+        self.hub.publish(b"\xff\xd8JPEG")
+        try:
+            s, _ = self.jreq("POST", "/scan")
+            self.assertEqual(s, 200)
+            deadline = time.time() + 5
+            while self.app.pano_state != "stitching" and time.time() < deadline:
+                time.sleep(0.02)
+            s, j = self.jreq("POST", "/scan_cancel")   # running → 200
+            self.assertEqual((s, j["ok"]), (200, True))
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                s, j = self.jreq("GET", "/pano_status")
+                if j.get("state") in ("done", "failed"):
+                    break
+                time.sleep(0.02)
+            self.assertEqual(j["state"], "failed")     # discarded, not saved
+        finally:
+            self.app.pano_builder, self.app.scan_settle_s = old_builder, old_settle
+
     def test_scan_409_while_driving(self):
         self.move.set_drive(0.1, 0.1)
         try:
@@ -385,7 +413,10 @@ class PageAndHealthTest(HTTPBase):
                        "showTab(", "loadScans(", "clearAllScans(",
                        "Clear all 3D views", "delScan(", "/delete_scan/",
                        "pano3d(\\'/scans/", "DEFAULTS TO THE CLEAREST",
-                       "markActive(", "'#08f'", "if(!avail[mv[0]])return;"):
+                       "markActive(", "'#08f'", "if(!avail[mv[0]])return;",
+                       # plan 028: stop button inside the polled status HTML
+                       'id="scanstop"', "scanCancel(", "/scan_cancel",
+                       "j.state==='scanning'||j.state==='stitching'"):
             self.assertIn(marker, body, marker)
 
     def test_viewer_archived_scans_have_no_variant_buttons(self):
