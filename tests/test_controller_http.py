@@ -27,6 +27,7 @@ class HTTPBase(unittest.TestCase):
         cls.aim = rc.CameraAim(cls.rover)
         cls.app = rc.App(cls.rover, cls.move, cls.aim, cls.hub, cls.cam,
                          cls.tmp.name)
+        cls.app.identify_builder = None    # tests never spawn the LLM step
         cls.app.mapping, cls.app.map_source = rc.default_mapping(), "default"
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), rc.make_handler(cls.app))
         cls.server.daemon_threads = True
@@ -281,6 +282,44 @@ class ScansHTTPTest(HTTPBase):
             s, _ = self.req("POST", "/delete_scan/" + bad)
             self.assertEqual(s, 400, bad)
 
+    def test_meta_endpoints(self):
+        os.makedirs(self.app.scans_dir, exist_ok=True)
+        with open(os.path.join(self.app.photo_dir, "panorama.meta.json"), "w") as f:
+            f.write('{"objects":[{"name":"printer","lon":5,"lat":0,"w":10,"h":8}]}')
+        with open(os.path.join(self.app.scans_dir,
+                               "scan_20260714_120000.jpg.meta.json"), "w") as f:
+            f.write('{"objects":[]}')
+        s, j = self.jreq("GET", "/pano_meta")
+        self.assertEqual((s, j["objects"][0]["name"]), (200, "printer"))
+        s, _ = self.jreq("GET", "/scan_meta/scan_20260714_120000.jpg")
+        self.assertEqual(s, 200)
+        s, _ = self.req("GET", "/scan_meta/../evil")
+        self.assertEqual(s, 400)
+        s, _ = self.req("GET", "/scan_meta/scan_20990101_000000.jpg")
+        self.assertEqual(s, 404)
+        os.remove(os.path.join(self.app.photo_dir, "panorama.meta.json"))
+        s, _ = self.req("GET", "/pano_meta")
+        self.assertEqual(s, 404)
+
+    def test_post_panorama_clears_stale_meta(self):
+        with open(os.path.join(self.app.photo_dir, "panorama.meta.json"), "w") as f:
+            f.write('{"objects":[]}')
+        s, _ = self.jreq("POST", "/panorama", b"\xff\xd8\xff\xe0new")
+        self.assertEqual(s, 200)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.app.photo_dir, "panorama.meta.json")))
+
+    def test_delete_scan_removes_meta_sidecar(self):
+        os.makedirs(self.app.scans_dir, exist_ok=True)
+        for suffix in ("", ".meta.json"):
+            with open(os.path.join(self.app.scans_dir,
+                                   "scan_20260714_130000.jpg" + suffix), "w") as f:
+                f.write("x")
+        s, _ = self.jreq("POST", "/delete_scan/scan_20260714_130000.jpg")
+        self.assertEqual(s, 200)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.app.scans_dir, "scan_20260714_130000.jpg.meta.json")))
+
     def test_archive_name_matches_regex_and_photos_unpolluted(self):
         pano = os.path.join(self.tmp.name, "panorama.jpg")
         with open(pano, "wb") as f:
@@ -416,8 +455,21 @@ class PageAndHealthTest(HTTPBase):
                        "markActive(", "'#08f'", "if(!avail[mv[0]])return;",
                        # plan 028: stop button inside the polled status HTML
                        'id="scanstop"', "scanCancel(", "/scan_cancel",
-                       "j.state==='scanning'||j.state==='stitching'"):
+                       "j.state==='scanning'||j.state==='stitching'",
+                       # plan 029: object boxes + scans auto-refresh
+                       "drawBoxes(", "boxesCmd(", "tb.id='boxtoggle'",
+                       "/pano_meta", "/scan_meta/", "scansTick(",
+                       "roverboxes:on", "roverboxes:filter", ".hbox",
+                       "boxes on|off|all|NAMES",
+                       "Ry(yaw)^T", "Rx(pitch)^T"):
             self.assertIn(marker, body, marker)
+
+    def test_boxes_cmd_intercepted_before_parse(self):
+        s, data = self.req("GET", "/")
+        body = data.decode()
+        # the client-only 'boxes' command must be handled before parseCmd
+        self.assertLess(body.index("if(boxesCmd(raw))return"),
+                        body.index("const p=parseCmd(raw);"))
 
     def test_viewer_archived_scans_have_no_variant_buttons(self):
         s, data = self.req("GET", "/")

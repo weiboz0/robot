@@ -739,6 +739,8 @@ DET_NAME_RE = re.compile(r"^[a-z0-9_]{1,24}$")
 SCAN_NAME_RE = re.compile(r"^scan_\d{8}_\d{6}(_\d+)?\.jpg$")
 SCAN_BUILD_TIMEOUT_S = 300.0   # stitcher subprocess hard kill
 PANO_VARIANT_NAMES = ("seamcut", "projector", "stitcher")  # scene.VARIANT_BUILDERS order
+IDENTIFY_TIMEOUT_S = 420.0     # identify subprocess hard kill (scan already safe;
+                               # runs AFTER "done" — only the boxes arrive late)
 
 
 def safe_photo_name(name):
@@ -766,6 +768,9 @@ class App:
         self.scan_settle_s = None               # None → scene.SETTLE_S
         self.scan_build_timeout = SCAN_BUILD_TIMEOUT_S
         self.pano_builder = self._build_pano_subprocess
+        self.identify_builder = self.identify_cmd   # None disables (tests)
+        self._last_archived = None                  # under _pano_mu
+        self._identify_proc = None                  # under _pano_mu
         # any accepted drive or an e-stop aborts a running scan; the hooks fire
         # under Movement._mu so they only set the event — the scan thread does
         # the actual abort/killpg itself.
@@ -882,6 +887,14 @@ class App:
         if self.move.is_moving():
             self._finish_scan(False)
             return False, "wheels are moving"
+        with self._pano_mu:                 # a straggling identify from the
+            iproc = self._identify_proc     # PREVIOUS scan must not attach
+        if iproc is not None:               # its stale meta to this one
+            try:
+                os.killpg(iproc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            log("scan: killed the previous scan's identify")
         threading.Thread(target=self._run_scan, daemon=True).start()
         return True, ""
 
@@ -927,7 +940,14 @@ class App:
             with self._pano_mu:
                 self.pano_state, self.pano_state_at = "stitching", time.monotonic()
             log(f"scan: {len(frames)} frames captured; stitching…")
-            ok = bool(self.pano_builder(frames)) and not self._scan_cancel.is_set()
+            built = bool(self.pano_builder(frames))
+            with self._pano_mu:
+                published = self._scan_published
+            # once published, the scan IS done — a later e-stop/drive event
+            # (which may land during the minutes-long identify phase) must
+            # not flip the state to failed; before publish, a cancel still
+            # discards (the builder's _mark_published gate is the authority)
+            ok = built and (published or not self._scan_cancel.is_set())
         except ScanCancelled as e:
             log(f"scan: cancelled ({e})")
         except Exception as e:
@@ -935,6 +955,35 @@ class App:
         finally:
             self._finish_scan(ok)
             log("scan: 3D view updated" if ok else "scan: not completed")
+        if ok and published and self.identify_builder is not None:
+            # scan slot is free; identification is best-effort background work
+            self._identify_frames(frames)
+
+    def _identify_frames(self, frames):
+        """Write the frames to a fresh temp dir, run the identify subprocess,
+        publish the meta (live + archive sidecar). Every failure just logs."""
+        import shutil
+        import tempfile
+        with self._pano_mu:
+            archived = self._last_archived
+        td = tempfile.mkdtemp(prefix=".identify-", dir=self.photo_dir)
+        try:
+            for pan, tilt, img in frames:
+                name = f"pan{int(pan):+04d}_t{int(tilt):+03d}.jpg"
+                with open(os.path.join(td, name), "wb") as fh:
+                    fh.write(img)
+            src_meta = os.path.join(td, "meta.json")
+            self._run_identify(td, src_meta)
+            if os.path.exists(src_meta):
+                live_meta = os.path.join(self.photo_dir, "panorama.meta.json")
+                os.replace(src_meta, live_meta)
+                if archived:
+                    os.link(live_meta,
+                            os.path.join(self.scans_dir, archived + ".meta.json"))
+        except OSError as e:
+            log(f"scan: meta publish failed ({e})")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
 
     def pano_build_cmd(self, frames_dir, out_path):
         """argv + env for the stitcher subprocess: niced, thread-capped so the
@@ -948,6 +997,13 @@ class App:
             env[k] = "1"
         return (["nice", "-n", "10", sys.executable, scene_py,
                  "build-pano", frames_dir, out_path, frames_dir], env)
+
+    def identify_cmd(self, frames_dir, out_json):
+        """argv + env for the OBJECT-IDENTIFICATION subprocess — separate
+        from the build so its failure/timeout can never cost a scan."""
+        scene_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scene.py")
+        return (["nice", "-n", "10", sys.executable, scene_py,
+                 "identify", frames_dir, out_json], dict(os.environ))
 
     def _build_pano_subprocess(self, frames):
         """cv2 runs OUT of process (own process group) so a native crash or
@@ -997,6 +1053,10 @@ class App:
             except OSError as e:
                 log(f"scan: could not publish panorama ({e})")
                 return False
+            # the OLD meta must never describe the NEW pano — not even for
+            # the minutes identification takes; boxes reappear when fresh
+            _quiet(lambda: os.remove(
+                os.path.join(self.photo_dir, "panorama.meta.json")))
             # debug variants: publish this run's, delete stale ones for
             # methods that failed this run (a button must never show a
             # previous scan's result). Failures here never fail the scan.
@@ -1011,11 +1071,62 @@ class App:
                         _quiet(lambda: os.remove(dst))
                 except OSError as e:
                     log(f"scan: variant {name} publish failed ({e})")
+            # object-identification runs AFTER the publish, in its own
+            # subprocess with its own timeout — it can only ever cost the
+            # meta, never the scan (plan 029 restructure after the live
+            # budget measurements). Meta: live copy + archive sidecar (the
+            # SAME file via hard-link, so they can't diverge); a scan with no
+            # meta deletes the stale live one.
+            live_meta = os.path.join(self.photo_dir, "panorama.meta.json")
+            src_meta = os.path.join(td, "meta.json")
+            archived = None
             try:
-                self.archive_scan(pano)      # history copy; failure is not
-            except OSError as e:             # allowed to fail the scan
+                archived = self.archive_scan(pano)   # history copy; failure is
+            except OSError as e:                     # not allowed to fail the scan
                 log(f"scan: archive failed ({e}) — latest panorama unaffected")
+            # identification happens AFTER this returns (in _run_scan, with
+            # the scan slot already released — back-to-back scans must not be
+            # refused for the minutes the LLM takes); remember where the
+            # archive went so the meta sidecar can attach to it
+            del live_meta, src_meta
+            with self._pano_mu:
+                self._last_archived = archived
             return True
+
+    def _run_identify(self, frames_dir, out_json):
+        """Run the identification subprocess (own group, own timeout, cancel-
+        aware). Any failure just logs — the scan is already published. The
+        proc handle is stashed so a NEW scan kills a straggling identify
+        (its stale meta must never attach to the newer panorama)."""
+        argv, env = self.identify_builder(frames_dir, out_json)
+        try:
+            proc = subprocess.Popen(argv, env=env, start_new_session=True,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE)
+        except OSError as e:
+            log(f"scan: identify failed to start ({e})")
+            return
+        with self._pano_mu:
+            self._identify_proc = proc
+        try:
+            deadline = time.monotonic() + IDENTIFY_TIMEOUT_S
+            while proc.poll() is None:
+                if self._scan_cancel.is_set() or time.monotonic() > deadline:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    proc.wait()
+                    log("scan: identify killed (cancelled or timed out)")
+                    return
+                time.sleep(0.2)
+        finally:
+            with self._pano_mu:
+                self._identify_proc = None
+        tail = (proc.stderr.read() or b"")[-300:].decode("utf-8", "replace").strip()
+        proc.stderr.close()
+        if tail:
+            log(f"scan: identify said: {tail}")
 
     def archive_scan(self, src):
         """Hard-link the just-published panorama into photos/scans/ with a
@@ -1156,7 +1267,7 @@ def default_mapping():
         "turbo": _btn(5), "stop": _btn(0), "snapshot": _btn(1),
         "head_light": _btn(2), "center": _btn(3), "base_light": _btn(4),
         "estop": _btn(6), "relax": _btn(9), "lock": _btn(10),
-        "scan": _btn(7),
+        "scan": _btn(7), "scan_stop": _btn(8),
         "hat": {"kind": "axis", "axis": _axis_map(7, True)},
         "precision": _none(), "boost": _none(), "panic_stop": _none(),
         "hat_x": {"kind": "none"},
@@ -1164,7 +1275,7 @@ def default_mapping():
 
 
 CONTROL_KEYS = ("turbo", "stop", "estop", "head_light", "base_light",
-                "center", "snapshot", "relax", "lock", "scan",
+                "center", "snapshot", "relax", "lock", "scan", "scan_stop",
                 "precision", "boost", "panic_stop")
 AXIS_KEYS = ("throttle", "steer", "pan", "tilt")
 
@@ -1331,6 +1442,7 @@ def compute_joystick(m, state, prev):
     a["relax"] = ctrl_edge("relax", m["relax"])
     a["lock"] = ctrl_edge("lock", m["lock"])
     a["scan"] = ctrl_edge("scan", m["scan"])
+    a["scan_stop"] = ctrl_edge("scan_stop", m["scan_stop"])
     a["turbo"] = control_held(m["turbo"], state)
     a["boost"] = control_held(m["boost"], state)
     a["precision"] = control_held(m["precision"], state)
@@ -1408,6 +1520,9 @@ def joystick_loop(app, gp, stop_event):
         if a["scan"]:
             ok, why = app.start_scan()
             log("scan: started from gamepad" if ok else f"scan: refused ({why})")
+        if a["scan_stop"]:
+            log("scan: stopped from gamepad" if app.cancel_scan()
+                else "scan: stop pressed, nothing to stop")
         if a["hat_delta"]:
             speed_idx = int(clamp(speed_idx + a["hat_delta"], 0, len(SPEED_STEPS) - 1))
             app.move.set_cap(SPEED_STEPS[speed_idx])
@@ -1618,7 +1733,8 @@ def run_calibrate(js_path, map_path):
                         ("snapshot", "Press SNAPSHOT"),
                         ("relax", "Press RELAX gimbal (e.g. L2)"),
                         ("lock", "Press LOCK gimbal (e.g. R2)"),
-                        ("scan", "Press 3D-SCAN (starts a room panorama scan)")):
+                        ("scan", "Press 3D-SCAN (starts a room panorama scan)"),
+                        ("scan_stop", "Press STOP-SCAN (aborts + discards a running scan)")):
         c = _capture_control(f, prompt)
         m[key] = c if c is not None else _none()   # skip → disabled
     m["hat"] = _capture_hat(f, "Press D-pad UP", "speed cap")
@@ -1762,6 +1878,16 @@ def make_handler(app):
                 pan, tilt = app.aim.get()
                 snap.update({"ok": True, "pan": pan, "tilt": tilt})
                 self._json(200, snap)
+            elif p == "/pano_meta":
+                self._serve_file(os.path.join(app.photo_dir, "panorama.meta.json"),
+                                 "application/json")
+            elif p.startswith("/scan_meta/"):
+                name = p[len("/scan_meta/"):]
+                if not SCAN_NAME_RE.match(name):
+                    self._err(400, "bad scan name")
+                    return
+                self._serve_file(os.path.join(app.scans_dir, name + ".meta.json"),
+                                 "application/json")
             elif p == "/scans":
                 self._json(200, {"scans": app.list_scans()})
             elif p.startswith("/scans/"):
@@ -1968,6 +2094,8 @@ def make_handler(app):
                         self._err(400, "bad scan name")
                         return
                     _quiet(lambda: os.remove(os.path.join(app.scans_dir, name)))
+                    _quiet(lambda: os.remove(
+                        os.path.join(app.scans_dir, name + ".meta.json")))
                     self._json(200, {"ok": True})
                 elif p.startswith("/photo_meta/"):
                     self._post_photo_meta(p[len("/photo_meta/"):])
@@ -1976,6 +2104,10 @@ def make_handler(app):
                     if b is None or len(b) < 4 or b[:2] != SOI:
                         self._err(400, "body must be a JPEG (max 8MB)")
                         return
+                    # chatbot publish path bypasses the scan subprocess — a
+                    # stale meta would draw a previous scan's boxes on it
+                    _quiet(lambda: os.remove(
+                        os.path.join(app.photo_dir, "panorama.meta.json")))
                     self._write_photo_file("panorama.jpg", b, {"ok": True, "bytes": len(b)})
                 elif p == "/pano_status":
                     st = (q.get("state") or [""])[0]

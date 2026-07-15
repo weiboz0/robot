@@ -22,6 +22,9 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  figure a{position:relative;display:block}
  figure img{width:100%;display:block;aspect-ratio:4/3;object-fit:cover}
  .obox{position:absolute;border:1px solid rgba(90,255,90,.95);pointer-events:none}
+ .hbox{position:absolute;border:1.5px solid rgba(120,200,255,.95);border-radius:4px;pointer-events:none;z-index:11}
+ .hbox span{position:absolute;left:-1px;top:100%;background:rgba(0,0,0,.75);color:#9cf;
+   font-size:11px;line-height:1.5;padding:0 4px;white-space:nowrap;border-radius:0 0 3px 3px}
  .obox span{position:absolute;right:-1px;top:100%;background:rgba(0,0,0,.6);color:#9f9;
    font-size:10px;line-height:1.4;padding:0 3px;white-space:nowrap;border-radius:0 0 3px 3px}
  .lb{position:fixed;inset:0;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;z-index:10}
@@ -114,6 +117,7 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
   <tr><td onclick="pick('relax')">relax / lock</td><td>relax / lock the gimbal servos (hand-position the camera)</td></tr>
   <tr><td onclick="pick('speed 0.15')">speed CAP</td><td>set the speed cap, 0..0.5 (max wheel magnitude)</td></tr>
   <tr><td onclick="pick('snapshot')">snapshot</td><td>take a photo</td></tr>
+  <tr><td onclick="pick('boxes on')">boxes on|off|all|NAMES</td><td>3D-view object boxes: toggle, show all, or filter (e.g. "boxes printer,suitcase")</td></tr>
  </table>
  <small>aliases: relax=gimbal_relax · lock=gimbal_lock · snap=snapshot · fwd=move_forward · back=move_back</small><br>
  <small>chatbot names also work: up/down/left/right = CAMERA nudge (wheels = spinl/spinr [S] or move_*) ·
@@ -215,7 +219,8 @@ async function pano3d(src){
    wrap.style.cssText='max-width:92vw;max-height:80vh;overflow:auto';
    img.style.maxHeight='78vh';wrap.appendChild(img);lb.appendChild(wrap);return;
   }
-  lb.appendChild(cv);
+  const cwrap=document.createElement('div');cwrap.style.position='relative';
+  cwrap.appendChild(cv);lb.appendChild(cwrap);
   const vs='attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}';
   const fs='precision mediump float;uniform sampler2D t;uniform vec2 res;'+
    'uniform float yaw,pitch,fov,vspan;'+
@@ -261,6 +266,50 @@ async function pano3d(src){
     t.style.cssText='position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.85);color:#fc6;padding:6px 12px;border-radius:6px;z-index:12';
     document.body.appendChild(t);setTimeout(()=>t.remove(),3500);};
    im2.src=url;};
+  // ── object boxes (plan 029): labeled overlays that track the view. Meta
+  // holds sphere directions; every draw() re-projects them with the EXACT
+  // inverse of the shader: undo yaw (Ry^T) FIRST, then pitch (Rx^T), cull
+  // behind-camera (z<=0) and outside the pano's vspan band.
+  let boxMeta=null;const boxEls=[];
+  const metaUrl=src?src.replace('/scans/','/scan_meta/'):'/pano_meta';
+  function boxesOn(){return localStorage.getItem('roverboxes:on')!=='0';}
+  function boxShown(o){if(!boxesOn())return false;
+   const f=(localStorage.getItem('roverboxes:filter')||'').trim().toLowerCase();
+   if(!f)return true;
+   return f.split(',').some(t=>o.name.toLowerCase().indexOf(t.trim())>=0);}
+  function drawBoxes(){
+   if(!boxMeta)return;
+   const k=2*Math.tan(fov/2),ar=cv.width/cv.height,ppr=cv.height/k;
+   const cyw=Math.cos(yaw),syw=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);
+   boxEls.forEach(bo=>{const o=bo[0],d=bo[1];
+    const lon=o.lon*Math.PI/180,lat=o.lat*Math.PI/180;
+    if(!boxShown(o)||Math.abs(lat)>vspan/2){d.style.display='none';return;}
+    const X=Math.sin(lon)*Math.cos(lat),Y=Math.sin(lat),Z=Math.cos(lon)*Math.cos(lat);
+    const x1=X*cyw - Z*syw, z1=X*syw + Z*cyw;      // Ry(yaw)^T
+    const y2=Y*cp + z1*sp,  z2=-Y*sp + z1*cp;      // Rx(pitch)^T
+    if(z2<=0.05){d.style.display='none';return;}
+    const u=x1/(z2*k*ar), v=y2/(z2*k);
+    if(Math.abs(u)>0.55||Math.abs(v)>0.55){d.style.display='none';return;}
+    const wpx=o.w*Math.PI/180*ppr, hpx=o.h*Math.PI/180*ppr;
+    d.style.display='';
+    d.style.left=((u+0.5)*cv.width-wpx/2)+'px';
+    d.style.top=((0.5-v)*cv.height-hpx/2)+'px';    // GL y-up → CSS y-down
+    d.style.width=wpx+'px';d.style.height=hpx+'px';
+   });
+  }
+  window.redrawBoxes=drawBoxes;
+  fetch(metaUrl).then(r=>r.ok?r.json():null).then(m=>{
+   if(!m||!m.objects||!m.objects.length)return;
+   boxMeta=m;
+   m.objects.forEach(o=>{const d=document.createElement('div');d.className='hbox';
+    const s=document.createElement('span');
+    s.textContent=o.name+(o.color?' · '+o.color:'');       // textContent: no XSS
+    d.appendChild(s);cwrap.appendChild(d);boxEls.push([o,d]);});
+   const tb=document.createElement('button');tb.textContent='◻ boxes';tb.id='boxtoggle';
+   tb.onclick=()=>{localStorage.setItem('roverboxes:on',boxesOn()?'0':'1');drawBoxes();};
+   bar.insertBefore(tb,x);
+   drawBoxes();
+  }).catch(()=>{});
   function draw(){
    gl.viewport(0,0,cv.width,cv.height);
    gl.uniform2f(gl.getUniformLocation(pr,'res'),cv.width,cv.height);
@@ -269,6 +318,7 @@ async function pano3d(src){
    gl.uniform1f(gl.getUniformLocation(pr,'fov'),fov);
    gl.uniform1f(gl.getUniformLocation(pr,'vspan'),vspan);
    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+   drawBoxes();
   }
   cv.onmousedown=e=>{drag=[e.clientX,e.clientY];cv.style.cursor='grabbing';};
   addEventListener('mouseup',()=>{drag=null;cv.style.cursor='grab';});
@@ -434,6 +484,13 @@ async function loadScans(){
   '<figcaption><span>'+n+'</span><button class="warn" onclick="delScan(\''+n+'\')">del</button></figcaption></figure>').join('')
   ||'<small style="grid-column:1/-1;text-align:center">no 3D views saved yet — press Start on the gamepad or run a scan</small>';}
 async function delScan(n){await fetch('/delete_scan/'+n,{method:'POST'});loadScans();}
+let scansSeen='';
+async function scansTick(){                 // 3D-views tab auto-refresh
+ if(gtab!=='scans')return;
+ try{const j=await(await fetch('/scans')).json();
+  const sig=(j.scans||[]).join(',');
+  if(sig!==scansSeen){scansSeen=sig;loadScans();}
+ }catch(e){}}
 async function clearAllScans(){const j=await(await fetch('/scans')).json();const ns=j.scans||[];
  if(!ns.length||!confirm('Delete all '+ns.length+' 3D views?'))return;
  for(const n of ns){await fetch('/delete_scan/'+n,{method:'POST'});}
@@ -510,8 +567,22 @@ function parseCmd(raw){
  }else return {error:'unknown command: '+t[0]};
  return {cmd:c,path:'/'+c+(qs?'?'+qs.toString():'')};
 }
+// 'boxes' is CLIENT-ONLY (controls the 3D viewer's object overlays) — it maps
+// to no endpoint, so it is intercepted BEFORE parseCmd.
+function boxesCmd(raw){
+ const parts=raw.trim().split(/\s+/);
+ if(parts[0].toLowerCase()!=='boxes')return false;
+ const arg=parts.slice(1).join(' ').toLowerCase()||'on';
+ if(arg==='on'||arg==='off'){localStorage.setItem('roverboxes:on',arg==='on'?'1':'0');}
+ else if(arg==='all'){localStorage.setItem('roverboxes:filter','');localStorage.setItem('roverboxes:on','1');}
+ else{localStorage.setItem('roverboxes:filter',arg);localStorage.setItem('roverboxes:on','1');}
+ if(window.redrawBoxes)window.redrawBoxes();
+ cout('✓ boxes '+(arg==='on'||arg==='off'?arg:(arg==='all'?'all shown':'filter: '+arg)));
+ return true;
+}
 // sendCommand: run one command; returns a Promise<bool ok> (awaited by the program).
 function sendCommand(raw,signal){
+ if(boxesCmd(raw))return Promise.resolve(true);
  const p=parseCmd(raw);
  if(p.error){cout('✗ '+p.error);return Promise.resolve(false);}
  cout('… '+raw);
@@ -625,7 +696,7 @@ async function panoStat(){try{
 async function health(){try{const h=await(await fetch('/healthz')).json();
  document.getElementById('health').innerHTML='<small>serial '+(h.serial.up?'✓':'✗')+
  ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad.up?'✓':'–')+'</small>';}catch(e){}}
-setInterval(()=>{load();health();panoStat();},2000);load();health();panoStat();initCap();renderProg();refreshSaved();
+setInterval(()=>{load();health();panoStat();scansTick();},2000);load();health();panoStat();initCap();renderProg();refreshSaved();
 
 // ── Mac-side gamepad: Gamepad API → existing HTTP endpoints (no server change).
 // Drive is in-flight-guarded and refreshed continuously while deflected (feeds

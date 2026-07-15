@@ -56,6 +56,9 @@ serial down → 503. CORS is open (any page/client can call it).
 | `POST /delete_scan/<name>` | delete an archived scan |
 | `GET /pose` | dead-reckoned `{"x","y","heading","pan","tilt","battery_v","fresh"}` in self-set coordinates (wheel-encoder odometry; shown in the page's top-right badge); always `200` — `fresh:false` when telemetry is stale |
 | `POST /pose_reset` | set the current spot as origin (0,0), heading 0° |
+| `POST /scan_cancel` | abort a running scan and discard it (⏹ button / gamepad STOP-SCAN, default button 8); `409` when idle or already publishing |
+| `GET /pano_meta` | objects identified in the live panorama `{"objects":[{name,color,lon,lat,w,h}]}` (404 if none) |
+| `GET /scan_meta/<name>` | objects identified in an archived scan (the 3D viewer draws these as boxes; `boxes on|off|all|<names>` in the web command box controls them) |
 
 ### Meta
 | Method · path | Does |
@@ -97,6 +100,7 @@ Two ways to use a gamepad; both go through the same server-side safety
 | **Y** | center camera |
 | **L3 / R3** | relax / lock gimbal |
 | **Start** | 3D scan (room panorama; e-stop or driving aborts it) |
+| **Guide/Select (btn 8)** | stop a running 3D scan and discard it |
 | **RB (hold)** | turbo |
 | **LT (hold)** ※ | precision / slow mode |
 | **RT (hold)** ※ | boost (max speed) |
