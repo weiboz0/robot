@@ -599,8 +599,226 @@ def trim_history(messages, limit=MAX_HISTORY):
     return messages
 
 
+HELP_TEXT = (
+    "rover camera: up/down/left/right [deg], cam P T, center, relax, lock\n"
+    "rover motors: drive L R [s], move L R, fwd/back/spinl/spinr [s], stop, estop\n"
+    "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear, demo, photo\n"
+    "rover meta:   speed [CAP 0..0.5], status, photos\n"
+    "website names also work: camera_up/..., camera_aim, camera_center, snapshot,\n"
+    "  gimbal_relax/lock, light_head|light_base [on|off], move_forward/back/left/right [MS]\n"
+    "  (note: drive/fwd/back keep CHATBOT units here — seconds, speeds -0.5..0.5)\n"
+    "autonomous:   find <object> / screwdriver / pen  (drives itself, stops +\n"
+    "  photographs when it sees the target; needs ROVER_FIND_ENABLE=1 + vision key)\n"
+    "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
+
+
+def dollar_command(rover, arm, cmd):
+    """One $-command → its output text (the REPL's former inline dispatch)."""
+    if cmd in ("help", ""):
+        return HELP_TEXT
+    if cmd.lower().startswith("dobot"):
+        raw = cmd[5:].strip()
+        if arm is None:
+            return "dobot not connected"
+        try:                    # a socket error must not kill the session
+            return str(arm.motion(raw) if raw.startswith("Mov") else arm.dashboard(raw))
+        except Exception as e:
+            return f"dobot error: {e}"
+    if cmd.lower() == "scan":
+        return str(scan_surroundings(rover))
+    if cmd.lower() == "record":
+        return str(record_room(rover))
+    if cmd.lower() == "detect":
+        return str(detect_compare(rover))
+    if cmd.lower() == "panotest":
+        return str(pano_compare(rover))
+    if cmd.lower() in FIND_SHORTCUTS or cmd.lower().startswith("find "):
+        target = FIND_SHORTCUTS.get(cmd.lower()) or cmd[5:].strip()
+        return str(autonomous_find(rover, target))
+    if rover is not None:
+        return str(rover_command(rover, cmd))
+    return "rover not connected"
+
+
+class ChatSession:
+    """One conversation: the REPL's turn logic, callable from anywhere.
+
+    handle(text) runs a FULL turn ($-dispatch or the LLM tool loop) and
+    returns the transcript text; `live(kind, text)` receives the same events
+    as they happen so the terminal REPL can keep its original formatting
+    (incl. its spinner — which is deliberately NOT part of the returned
+    transcript: \\r control hacks would render as garbage in a browser).
+    Error turns RETURN their message; they never raise. A lock serializes
+    turns — one conversation, exactly like the REPL."""
+
+    def __init__(self, rover, arm, client=None, tools=None):
+        import threading
+        self.rover, self.arm, self.client = rover, arm, client
+        self.tools = tools if tools is not None else build_tools(rover, arm)
+        self.messages = [{"role": "system", "content": SYSTEM}]
+        self.lock = threading.Lock()
+
+    def handle(self, user, live=lambda kind, text: None):
+        user = (user or "").strip()
+        out = []
+
+        def emit(kind, text):
+            out.append(text)
+            live(kind, text)
+        with self.lock:
+            if not user:
+                return ""
+            if user.startswith("$"):
+                cmd = user[1:].strip()
+                kind = "help" if cmd in ("help", "") else "dollar"
+                emit(kind, dollar_command(self.rover, self.arm, cmd))
+                return "\n".join(out)
+            if self.client is None:
+                emit("off", "chat off — use $ commands ($help)")
+                return "\n".join(out)
+            trim_history(self.messages)         # cap at the user-turn boundary
+            self.messages.append({"role": "user", "content": user})
+            try:
+                while True:
+                    live("thinking", "")
+                    resp = self.client.chat.completions.create(
+                        model=MODEL, messages=self.messages,
+                        tools=self.tools, max_tokens=8192)
+                    live("thought", "")
+                    msg = resp.choices[0].message
+                    content = strip_think(msg.content)
+                    am = {"role": "assistant", "content": content or None}
+                    if msg.tool_calls:
+                        am["tool_calls"] = [{"id": tc.id, "type": "function",
+                                             "function": {"name": tc.function.name,
+                                                          "arguments": tc.function.arguments}}
+                                            for tc in msg.tool_calls]
+                    self.messages.append(am)
+                    if content:
+                        emit("bot", content)
+                    if not msg.tool_calls:
+                        break
+                    for tc in msg.tool_calls:
+                        raw = tc.function.arguments or "{}"
+                        try:
+                            args = json.loads(raw)
+                        except json.JSONDecodeError:
+                            emit("tool", f"[{tc.function.name}: invalid JSON args]")
+                            self.messages.append(
+                                {"role": "tool", "tool_call_id": tc.id,
+                                 "content": f"error: arguments were not valid JSON: {raw}"})
+                            continue
+                        emit("tool", f"[{tc.function.name}({args})]")
+                        result = run_tool(self.rover, self.arm, tc.function.name, args)
+                        self.messages.append({"role": "tool", "tool_call_id": tc.id,
+                                              "content": str(result)})
+            except Exception as e:              # an LLM/network error ends the turn
+                emit("error", f"chat error: {e}")
+        return "\n".join(out)
+
+
+def serve(session, chat_status, port=8090):
+    """Async job model on loopback (plan 030): POST /chat submits a turn and
+    returns {"turn": N} immediately (409 while one runs); GET /chat_poll
+    fetches the result; GET /chat_status reports health. Binding the port is
+    the single-instance mutex — a second service dies on EADDRINUSE."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    state = {"turn": 0, "busy": False, "active": None, "results": {}}
+    slock = threading.Lock()
+
+    def submit(text):
+        with slock:
+            if state["busy"]:
+                return None
+            state["turn"] += 1
+            state["busy"] = True
+            state["active"] = state["turn"]
+            n = state["turn"]
+
+        def work():
+            try:
+                reply = session.handle(text)
+            except Exception as e:              # belt and braces: never wedge busy
+                reply = f"chat error: {e}"
+            with slock:
+                state["results"][n] = reply
+                state["busy"] = False
+                state["active"] = None
+                for k in sorted(state["results"])[:-20]:
+                    state["results"].pop(k, None)
+        threading.Thread(target=work, daemon=True).start()
+        return n
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _json(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            from urllib.parse import urlparse, parse_qs
+            u = urlparse(self.path)
+            if u.path == "/chat_status":
+                with slock:
+                    busy = state["busy"]
+                self._json(200, dict(chat_status, busy=busy))
+            elif u.path == "/chat_poll":
+                try:
+                    n = int((parse_qs(u.query).get("turn") or ["x"])[0])
+                except ValueError:
+                    self._json(400, {"error": "bad turn"})
+                    return
+                with slock:
+                    if n in state["results"]:
+                        self._json(200, {"done": True, "reply": state["results"][n]})
+                    elif n == state["active"]:
+                        self._json(200, {"done": False})
+                    else:               # never existed OR evicted by the cap —
+                        self._json(404, {"error": "unknown or expired turn"})
+            else:
+                self._json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path != "/chat":
+                self._json(404, {"error": "not found"})
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n) or b"{}")
+                text = str(data["text"])
+            except (ValueError, KeyError, TypeError):
+                self._json(400, {"error": "body must be JSON with a text field"})
+                return
+            turn = submit(text)
+            if turn is None:
+                self._json(409, {"busy": True})
+            else:
+                self._json(200, {"turn": turn})
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
+    print(f"chat service on http://127.0.0.1:{port} (submit/poll; Ctrl-C to quit)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return srv
+
+
 def main():
     load_dotenv()
+    if "--serve" in sys.argv:
+        # the served chat coexists with the controller on the same Pi — it
+        # must NEVER become a second serial writer; drive via the controller
+        os.environ["ROVER_NO_SERIAL"] = "1"
     print("detecting robots...")
     rover = detect_rover()
     arm = None
@@ -628,9 +846,45 @@ def main():
         chat_status = "chat OFF (set OPENCODE_API_KEY)"
     print(f"  {chat_status}")
     tools = build_tools(rover, arm)
+    session = ChatSession(rover, arm, client, tools)
+
+    if "--serve" in sys.argv:                   # website mode (plan 030)
+        try:
+            idx = sys.argv.index("--serve")
+            port = int(sys.argv[idx + 1]) if len(sys.argv) > idx + 1 else 8090
+        except (ValueError, IndexError):
+            port = 8090
+        try:
+            serve(session, {"ok": True, "model": MODEL if client else None,
+                            "rover": rover.where if rover else None,
+                            "dobot": bool(arm)}, port)
+        finally:
+            if rover is not None:
+                rover.close()
+            if arm is not None:
+                arm.close()
+        return
+
     print("Plain English to chat; $ for direct commands ($help). 'quit' to exit.\n")
 
-    messages = [{"role": "system", "content": SYSTEM}]
+    def live(kind, text):
+        """Reproduce the REPL's original formatting from session events."""
+        if kind == "thinking":
+            print("  (thinking…)", end="\r", flush=True)
+        elif kind == "thought":
+            print(" " * 14, end="\r")
+        elif kind == "help":
+            print(text)                 # $help printed bare, as it always was
+        elif kind == "dollar":
+            print(" ", text)
+        elif kind == "off":
+            print("  " + text)
+        elif kind == "bot":
+            print(f"\nbot> {text}\n")
+        elif kind == "tool":
+            print(f"  {text}")
+        elif kind == "error":
+            print(f"\n  {text}")
     try:
         while True:
             try:
@@ -641,85 +895,7 @@ def main():
                 continue
             if user.lower() in ("quit", "exit"):
                 break
-            if user.startswith("$"):
-                cmd = user[1:].strip()
-                if cmd in ("help", ""):
-                    print("rover camera: up/down/left/right [deg], cam P T, center, relax, lock\n"
-                          "rover motors: drive L R [s], move L R, fwd/back/spinl/spinr [s], stop, estop\n"
-                          "rover extras: light FRONT BASE (0-255), oled LINE TEXT, oledclear, demo, photo\n"
-                          "rover meta:   speed [CAP 0..0.5], status, photos\n"
-                          "website names also work: camera_up/..., camera_aim, camera_center, snapshot,\n"
-                          "  gimbal_relax/lock, light_head|light_base [on|off], move_forward/back/left/right [MS]\n"
-                          "  (note: drive/fwd/back keep CHATBOT units here — seconds, speeds -0.5..0.5)\n"
-                          "autonomous:   find <object> / screwdriver / pen  (drives itself, stops +\n"
-                          "  photographs when it sees the target; needs ROVER_FIND_ENABLE=1 + vision key)\n"
-                          "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
-                elif cmd.lower().startswith("dobot"):
-                    raw = cmd[5:].strip()
-                    if arm is None:
-                        print("  dobot not connected")
-                    else:
-                        try:                # a socket error must not kill the REPL
-                            print(" ", arm.motion(raw) if raw.startswith("Mov")
-                                  else arm.dashboard(raw))
-                        except Exception as e:
-                            print(f"  dobot error: {e}")
-                elif cmd.lower() == "scan":
-                    print(" ", scan_surroundings(rover))
-                elif cmd.lower() == "record":
-                    print(" ", record_room(rover))
-                elif cmd.lower() == "detect":
-                    print(" ", detect_compare(rover))
-                elif cmd.lower() == "panotest":
-                    print(" ", pano_compare(rover))
-                elif cmd.lower() in FIND_SHORTCUTS or cmd.lower().startswith("find "):
-                    target = FIND_SHORTCUTS.get(cmd.lower()) or cmd[5:].strip()
-                    print(" ", autonomous_find(rover, target))
-                elif rover is not None:
-                    print(" ", rover_command(rover, cmd))
-                else:
-                    print("  rover not connected")
-                continue
-            if client is None:
-                print("  chat off — use $ commands ($help)")
-                continue
-            trim_history(messages)              # P3: cap history at the user-turn boundary
-            messages.append({"role": "user", "content": user})
-            try:
-                while True:
-                    print("  (thinking…)", end="\r", flush=True)
-                    resp = client.chat.completions.create(
-                        model=MODEL, messages=messages, tools=tools, max_tokens=8192)
-                    print(" " * 14, end="\r")
-                    msg = resp.choices[0].message
-                    content = strip_think(msg.content)
-                    # P4: store None (not "") so providers that reject empty content don't choke
-                    am = {"role": "assistant", "content": content or None}
-                    if msg.tool_calls:
-                        am["tool_calls"] = [{"id": tc.id, "type": "function",
-                                             "function": {"name": tc.function.name,
-                                                          "arguments": tc.function.arguments}}
-                                            for tc in msg.tool_calls]
-                    messages.append(am)
-                    if content:
-                        print(f"\nbot> {content}\n")
-                    if not msg.tool_calls:
-                        break
-                    for tc in msg.tool_calls:
-                        raw = tc.function.arguments or "{}"
-                        try:
-                            args = json.loads(raw)
-                        except json.JSONDecodeError:
-                            # P5: tell the model what it sent so it can self-correct
-                            print(f"  [{tc.function.name}: invalid JSON args]")
-                            messages.append({"role": "tool", "tool_call_id": tc.id,
-                                             "content": f"error: arguments were not valid JSON: {raw}"})
-                            continue
-                        print(f"  [{tc.function.name}({args})]")
-                        out = run_tool(rover, arm, tc.function.name, args)
-                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(out)})
-            except Exception as e:             # P1: an LLM/network error returns to the prompt
-                print(f"\n  chat error: {e}")
+            session.handle(user, live)
     finally:
         if rover is not None:
             rover.close()

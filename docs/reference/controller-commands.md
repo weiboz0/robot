@@ -57,6 +57,10 @@ serial down → 503. CORS is open (any page/client can call it).
 | `GET /pose` | dead-reckoned `{"x","y","heading","pan","tilt","battery_v","fresh"}` in self-set coordinates (wheel-encoder odometry; shown in the page's top-right badge); always `200` — `fresh:false` when telemetry is stale |
 | `POST /pose_reset` | set the current spot as origin (0,0), heading 0° |
 | `POST /scan_cancel` | abort a running scan and discard it (⏹ button / gamepad STOP-SCAN, default button 8); `409` when idle or already publishing |
+| `POST /chat` | submit a chatbot turn `{"text":…}` → `{"turn":N}` immediately (`409 busy` while one runs); the chat service (agent_chat `--serve`, loopback :8090) runs it |
+| `GET /chat_poll?turn=N` | `{"done":false}` or `{"done":true,"reply":…}` — the page polls this; nothing ever blocks on the LLM |
+| `GET /chat_status` | chat service health (always `200`; `{"up":false}` when not running) |
+| `POST /chat_start` | launch the chat service detached (logs → `~/rover-chat.log`); `409` if already up |
 | `GET /pano_meta` | objects identified in the live panorama `{"objects":[{name,color,lon,lat,w,h}]}` (404 if none) |
 | `GET /scan_meta/<name>` | objects identified in an archived scan (the 3D viewer draws these as boxes; `boxes on|off|all|<names>` in the web command box controls them) |
 

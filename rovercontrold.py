@@ -741,6 +741,9 @@ SCAN_BUILD_TIMEOUT_S = 300.0   # stitcher subprocess hard kill
 PANO_VARIANT_NAMES = ("seamcut", "projector", "stitcher")  # scene.VARIANT_BUILDERS order
 IDENTIFY_TIMEOUT_S = 420.0     # identify subprocess hard kill (scan already safe;
                                # runs AFTER "done" — only the boxes arrive late)
+CHAT_PORT = 8090               # agent_chat --serve (loopback; controller proxies)
+CHAT_PROXY_TIMEOUT_S = 5.0     # submit/poll are instant server-side — no
+                               # controller thread ever waits on an LLM turn
 
 
 def safe_photo_name(name):
@@ -771,6 +774,8 @@ class App:
         self.identify_builder = self.identify_cmd   # None disables (tests)
         self._last_archived = None                  # under _pano_mu
         self._identify_proc = None                  # under _pano_mu
+        self._chat_mu = threading.Lock()            # /chat_start TOCTOU guard
+        self._chat_proc = None                      # under _chat_mu (reaped there)
         # any accepted drive or an e-stop aborts a running scan; the hooks fire
         # under Movement._mu so they only set the event — the scan thread does
         # the actual abort/killpg itself.
@@ -1127,6 +1132,47 @@ class App:
         proc.stderr.close()
         if tail:
             log(f"scan: identify said: {tail}")
+
+    def chat_cmd(self):
+        """argv + cwd for the chat service (separate for test pinning; tests
+        substitute a stub so no real chatbot/LLM ever launches in CI)."""
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "agent_chat.py")
+        return ([sys.executable, script, "--serve", str(CHAT_PORT)],
+                os.path.dirname(script))
+
+    def chat_start(self):
+        """Spawn the chat service (agent_chat --serve) detached. The lock
+        closes the check-then-spawn TOCTOU; the service's own port bind is
+        the cross-process mutex (a racing loser exits on EADDRINUSE).
+        Returns (ok, why-not)."""
+        import urllib.request
+        with self._chat_mu:
+            try:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{CHAT_PORT}/chat_status", timeout=1.5).read()
+                return False, "chat service already running"
+            except OSError:
+                pass
+            if self._chat_proc is not None and self._chat_proc.poll() is None:
+                # our child is alive but not yet listening (robot detection
+                # runs before the port binds — a real multi-second window):
+                # spawning again would orphan-overwrite a live service
+                return False, "chat service is starting — wait a moment"
+            argv, cwd = self.chat_cmd()
+            log_path = os.path.expanduser("~/rover-chat.log")
+            try:
+                with open(log_path, "ab") as logf:
+                    self._chat_proc = subprocess.Popen(
+                        argv, cwd=cwd, stdout=logf, stderr=logf,
+                        stdin=subprocess.DEVNULL, start_new_session=True)
+            except OSError as e:
+                return False, f"chat spawn failed: {e}"
+            time.sleep(1.2)                         # early-exit reporting
+            if self._chat_proc.poll() is not None:
+                return False, ("chat service exited at startup — "
+                               "see ~/rover-chat.log")
+            return True, ""
 
     def archive_scan(self, src):
         """Hard-link the just-published panorama into photos/scans/ with a
@@ -1817,6 +1863,33 @@ def make_handler(app):
                 return None
             return self.rfile.read(n) if n else b""
 
+        def _chat_proxy(self, method, path_q, body=None):
+            """Pass a request through to the loopback chat service. Every call
+            is a ≤5 s submit/poll — never a whole LLM turn (plan 030). Returns
+            False when the service is unreachable (caller picks the shape)."""
+            import urllib.request
+            import urllib.error
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{CHAT_PORT}{path_q}", data=body,
+                method=method, headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=CHAT_PROXY_TIMEOUT_S) as r:
+                    self._raw_json(r.status, r.read())
+                    return True
+            except urllib.error.HTTPError as e:      # 4xx pass through
+                self._raw_json(e.code, e.read())
+                return True
+            except OSError:
+                return False
+
+        def _raw_json(self, code, data):
+            self.send_response(code)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def _serve_file(self, path, ctype):
             try:
                 with open(path, "rb") as fh:
@@ -1878,6 +1951,12 @@ def make_handler(app):
                 pan, tilt = app.aim.get()
                 snap.update({"ok": True, "pan": pan, "tilt": tilt})
                 self._json(200, snap)
+            elif p == "/chat_status":
+                if not self._chat_proxy("GET", "/chat_status"):
+                    self._json(200, {"up": False})    # down is an answer
+            elif p == "/chat_poll":
+                if not self._chat_proxy("GET", "/chat_poll?" + u.query):
+                    self._err(503, "chat service not running")
             elif p == "/pano_meta":
                 self._serve_file(os.path.join(app.photo_dir, "panorama.meta.json"),
                                  "application/json")
@@ -2088,6 +2167,19 @@ def make_handler(app):
                 elif p == "/pose_reset":
                     app.pose.reset()
                     self._json(200, {"ok": True})
+                elif p == "/chat":
+                    b = self._read_body(64 << 10)
+                    if b is None:
+                        self._err(400, "chat body too large")
+                        return
+                    if not self._chat_proxy("POST", "/chat", b):
+                        self._err(503, "chat service not running — press start")
+                elif p == "/chat_start":
+                    ok, why = app.chat_start()
+                    if ok:
+                        self._json(200, {"ok": True})
+                    else:
+                        self._err(409, why)
                 elif p.startswith("/delete_scan/"):
                     name = p[len("/delete_scan/"):]
                     if not SCAN_NAME_RE.match(name):

@@ -291,11 +291,16 @@ def detect_rover(host: str = None, timeout: float = None):
     else None. host/timeout override the HTTP target (only affect the HTTP paths)."""
     # Serial first (on the Pi). A failed open (e.g. rovercontrol owns the port)
     # falls through — never fatal. stop_http_service() only stops legacy app.py.
-    try:
-        import rover_direct
-        port = rover_direct.detect_port()
-    except Exception:
-        port = None
+    # ROVER_NO_SERIAL=1 skips serial entirely: the web chat service runs ON
+    # the Pi while the controller owns the port — a second serial writer
+    # would interleave bytes on the wire (plan 030 live catch).
+    port = None
+    if not os.environ.get("ROVER_NO_SERIAL", "").strip():
+        try:
+            import rover_direct
+            port = rover_direct.detect_port()
+        except Exception:
+            port = None
     if port and os.path.exists(port):
         try:
             return RoverCtl("serial", port=port)

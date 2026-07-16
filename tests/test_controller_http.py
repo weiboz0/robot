@@ -3,6 +3,7 @@ fake serial link, covering every endpoint family the Go tests pinned."""
 import http.client
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -333,6 +334,182 @@ class ScansHTTPTest(HTTPBase):
         self.assertNotIn(name, j["photos"])
 
 
+class FakeChatUpstream:
+    """Tiny loopback chat service double with a configurable poll delay."""
+    def __init__(self, poll_delay=0.0):
+        from http.server import BaseHTTPRequestHandler
+        delay = poll_delay
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _j(self, code, obj):
+                b = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                if self.path.startswith("/chat_status"):
+                    self._j(200, {"ok": True, "model": "fake", "rover": None,
+                                  "dobot": False, "busy": False})
+                elif self.path.startswith("/chat_poll"):
+                    if "turn=404" in self.path:
+                        self._j(404, {"error": "unknown or expired turn"})
+                        return
+                    time.sleep(delay)
+                    self._j(200, {"done": True, "reply": "fake reply"})
+                else:
+                    self._j(404, {"error": "nf"})
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                if self.path == "/chat":
+                    self._j(200, {"turn": 7})
+                else:
+                    self._j(404, {"error": "nf"})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class ChatBridgeTest(HTTPBase):
+    def _with_upstream(self, up):
+        self._old_port = rc.CHAT_PORT
+        rc.CHAT_PORT = up.port
+
+    def tearDown(self):
+        if hasattr(self, "_old_port"):
+            rc.CHAT_PORT = self._old_port
+
+    def test_proxy_roundtrip_and_status(self):
+        up = FakeChatUpstream()
+        self._with_upstream(up)
+        try:
+            s, j = self.jreq("POST", "/chat", json.dumps({"text": "hi"}).encode())
+            self.assertEqual((s, j["turn"]), (200, 7))
+            s, j = self.jreq("GET", "/chat_poll?turn=7")
+            self.assertEqual((s, j["reply"]), (200, "fake reply"))
+            s, j = self.jreq("GET", "/chat_poll?turn=404")   # upstream 404
+            self.assertEqual(s, 404)                          # passes through
+            self.assertIn("expired", j["error"])
+            s, j = self.jreq("GET", "/chat_status")
+            self.assertEqual((s, j["ok"]), (200, True))
+        finally:
+            up.close()
+
+    def test_service_down_mapping(self):
+        rc.CHAT_PORT = 1                          # nothing listens on port 1
+        self._old_port = 8090
+        s, j = self.jreq("GET", "/chat_status")
+        self.assertEqual((s, j["up"]), (200, False))   # down is a 200 answer
+        s, _ = self.jreq("POST", "/chat", b'{"text":"x"}')
+        self.assertEqual(s, 503)
+        s, _ = self.jreq("GET", "/chat_poll?turn=1")
+        self.assertEqual(s, 503)
+
+    def test_chat_start_409_when_up_and_cmd_pin(self):
+        up = FakeChatUpstream()
+        self._with_upstream(up)
+        try:
+            s, j = self.jreq("POST", "/chat_start")
+            self.assertEqual(s, 409)
+            self.assertIn("already running", j["error"])
+        finally:
+            up.close()
+        argv, cwd = self.app.chat_cmd()
+        self.assertEqual(argv[0], sys.executable)
+        self.assertIn("agent_chat.py", argv[1])
+        self.assertEqual(argv[2:], ["--serve", str(rc.CHAT_PORT)])
+
+    def test_chat_start_double_start_refused_while_child_boots(self):
+        # codex catch: the child takes seconds before it listens (robot
+        # detection first) — a second start in that window must NOT spawn
+        # and orphan-overwrite the live child
+        rc.CHAT_PORT = 1
+        self._old_port = 8090
+        old_cmd = self.app.chat_cmd
+        try:
+            self.app.chat_cmd = lambda: (
+                [sys.executable, "-c", "import time; time.sleep(10)"], None)
+            s, _ = self.jreq("POST", "/chat_start")
+            self.assertEqual(s, 200)
+            first = self.app._chat_proc
+            s, j = self.jreq("POST", "/chat_start")
+            self.assertEqual(s, 409)
+            self.assertIn("starting", j["error"])
+            self.assertIs(self.app._chat_proc, first)   # not overwritten
+        finally:
+            self.app.chat_cmd = old_cmd
+            with self.app._chat_mu:
+                if self.app._chat_proc is not None:
+                    self.app._chat_proc.kill()
+                    self.app._chat_proc.wait()
+                    self.app._chat_proc = None
+
+    def test_chat_start_spawn_and_early_exit_reporting(self):
+        rc.CHAT_PORT = 1                          # probe finds nothing
+        self._old_port = 8090
+        old_cmd = self.app.chat_cmd
+        try:
+            self.app.chat_cmd = lambda: (
+                [sys.executable, "-c", "import time; time.sleep(5)"], None)
+            s, j = self.jreq("POST", "/chat_start")
+            self.assertEqual((s, j["ok"]), (200, True))
+            with self.app._chat_mu:               # clear phase 1's live child
+                self.app._chat_proc.kill()
+                self.app._chat_proc.wait()
+                self.app._chat_proc = None
+            self.app.chat_cmd = lambda: (
+                [sys.executable, "-c", "import sys; sys.exit(1)"], None)
+            s, j = self.jreq("POST", "/chat_start")
+            self.assertEqual(s, 409)
+            self.assertIn("exited at startup", j["error"])
+        finally:
+            self.app.chat_cmd = old_cmd
+            with self.app._chat_mu:
+                if self.app._chat_proc is not None:
+                    self.app._chat_proc.kill()
+                    self.app._chat_proc.wait()
+
+    def test_drive_stays_fast_under_chat_and_stream_load(self):
+        # plan 030 responsiveness guard: slow chat polls + live MJPEG streams
+        # must not delay a drive command
+        up = FakeChatUpstream(poll_delay=3.0)
+        self._with_upstream(up)
+        streams = []
+        try:
+            self.hub.publish(b"\xff\xd8JPEG")
+            for _ in range(2):                    # two live stream clients
+                c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+                c.request("GET", "/video_feed")
+                streams.append(c)
+            polls = [threading.Thread(
+                target=lambda: self.req("GET", "/chat_poll?turn=1"), daemon=True)
+                for _ in range(3)]
+            for t in polls:
+                t.start()
+            time.sleep(0.1)                       # polls are in flight
+            t0 = time.monotonic()
+            s, _ = self.jreq("POST", "/drive?l=0&r=0")
+            dt = time.monotonic() - t0
+            self.assertEqual(s, 200)
+            self.assertLess(dt, 1.0, f"drive took {dt:.2f}s under load")
+        finally:
+            for c in streams:
+                c.close()
+            up.close()
+
+
 class PhotoHTTPTest(HTTPBase):
     def test_snapshot_photos_delete_flow(self):
         self.hub.publish(b"\xff\xd8FRAME\xff\xd9")
@@ -461,7 +638,15 @@ class PageAndHealthTest(HTTPBase):
                        "/pano_meta", "/scan_meta/", "scansTick(",
                        "roverboxes:on", "roverboxes:filter", ".hbox",
                        "boxes on|off|all|NAMES",
-                       "Ry(yaw)^T", "Rx(pitch)^T"):
+                       "Ry(yaw)^T", "Rx(pitch)^T",
+                       # plan 030: dashboard + embedded chat
+                       'class="dash"', 'id="tabchat"', 'id="tabprog"',
+                       'id="chatpanel"', 'id="chatlog"', 'id="chatin"',
+                       'id="chatstartbtn"', 'id="progpanel"',
+                       "chatSend(", "chatStart(", "chatStatusTick(",
+                       "/chat_poll?turn=", "/chat_start",
+                       'onsubmit="chatSend();return false"',
+                       "showTab('chat')", 'id="posebadge"'):
             self.assertIn(marker, body, marker)
 
     def test_boxes_cmd_intercepted_before_parse(self):
