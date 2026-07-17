@@ -321,6 +321,51 @@ class ScansHTTPTest(HTTPBase):
         self.assertFalse(os.path.exists(os.path.join(
             self.app.scans_dir, "scan_20260714_130000.jpg.meta.json")))
 
+    def test_scan_identify_endpoint_validation_and_202(self):
+        os.makedirs(self.app.scans_dir, exist_ok=True)
+        with open(os.path.join(self.app.scans_dir,
+                               "scan_20260716_150000.jpg"), "wb") as f:
+            f.write(b"\xff\xd8P")
+        old = self.app.identify_pano_cmd
+        self.app.identify_pano_cmd = lambda p, o, f: (
+            [sys.executable, "-c", "pass"], None)
+        try:
+            s, _ = self.req("POST", "/scan_identify/../evil.jpg")
+            self.assertEqual(s, 400)
+            s, _ = self.jreq("POST", "/scan_identify/scan_20990101_000000.jpg")
+            self.assertEqual(s, 404)
+            s, j = self.jreq("POST",
+                             "/scan_identify/scan_20260716_150000.jpg?focus=books")
+            self.assertEqual((s, j["started"]), (202, True))
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                with self.app._pano_mu:
+                    if not self.app._ident_busy:
+                        break
+                time.sleep(0.05)
+        finally:
+            self.app.identify_pano_cmd = old
+
+    def test_auto_flash_flag_endpoints(self):
+        s, j = self.jreq("GET", "/auto_flash")
+        self.assertEqual((s, j["on"]), (200, True))          # default ON
+        s, j = self.jreq("POST", "/auto_flash?on=0")
+        self.assertEqual((s, j["on"]), (200, False))
+        s, j = self.jreq("GET", "/auto_flash")
+        self.assertFalse(j["on"])
+        s, j = self.jreq("POST", "/auto_flash?on=1")
+        self.assertTrue(j["on"])
+
+    def test_healthz_reports_lights(self):
+        s, j = self.jreq("GET", "/healthz")
+        self.assertEqual(s, 200)
+        self.assertIn("head", j["lights"])
+        self.assertIn("base", j["lights"])
+        self.jreq("POST", "/light_head?on=1")
+        s, j = self.jreq("GET", "/healthz")
+        self.assertTrue(j["lights"]["head"])
+        self.jreq("POST", "/light_head?on=0")
+
     def test_archive_name_matches_regex_and_photos_unpolluted(self):
         pano = os.path.join(self.tmp.name, "panorama.jpg")
         with open(pano, "wb") as f:
@@ -646,7 +691,11 @@ class PageAndHealthTest(HTTPBase):
                        "chatSend(", "chatStart(", "chatStatusTick(",
                        "/chat_poll?turn=", "/chat_start",
                        'onsubmit="chatSend();return false"',
-                       "showTab('chat')", 'id="posebadge"'):
+                       "showTab('chat')", 'id="posebadge"',
+                       # plan 031: identify old scans + auto-flash kill switch
+                       "identifyScan(", "/scan_identify/", "/scan_meta/",
+                       'id="autoflashbtn"', "toggleAutoFlash(",
+                       "autoFlashTick(", "/auto_flash?on="):
             self.assertIn(marker, body, marker)
 
     def test_boxes_cmd_intercepted_before_parse(self):

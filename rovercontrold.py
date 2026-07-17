@@ -774,6 +774,9 @@ class App:
         self.identify_builder = self.identify_cmd   # None disables (tests)
         self._last_archived = None                  # under _pano_mu
         self._identify_proc = None                  # under _pano_mu
+        self._ident_busy = False                    # under _pano_mu — ONE identify
+                                                    # at a time (either kind);
+                                                    # try-acquire, never wait
         self._chat_mu = threading.Lock()            # /chat_start TOCTOU guard
         self._chat_proc = None                      # under _chat_mu (reaped there)
         # any accepted drive or an e-stop aborts a running scan; the hooks fire
@@ -964,15 +967,32 @@ class App:
             # scan slot is free; identification is best-effort background work
             self._identify_frames(frames)
 
+    def _try_acquire_identify(self):
+        with self._pano_mu:
+            if self._ident_busy:
+                return False
+            self._ident_busy = True
+            return True
+
+    def _release_identify(self):
+        with self._pano_mu:
+            self._ident_busy = False
+
     def _identify_frames(self, frames):
         """Write the frames to a fresh temp dir, run the identify subprocess,
-        publish the meta (live + archive sidecar). Every failure just logs."""
+        publish the meta (live + archive sidecar). Every failure just logs.
+        SKIPS (never blocks) if another identify holds the flag — the scan is
+        already published; the user can press 🔍 later."""
         import shutil
         import tempfile
-        with self._pano_mu:
-            archived = self._last_archived
-        td = tempfile.mkdtemp(prefix=".identify-", dir=self.photo_dir)
-        try:
+        if not self._try_acquire_identify():
+            log("scan: identify busy — this scan gets no boxes; press 🔍 later")
+            return
+        td = None
+        try:                    # EVERYTHING after acquire is inside try —
+            with self._pano_mu:  # a mkdtemp failure must not wedge the flag
+                archived = self._last_archived
+            td = tempfile.mkdtemp(prefix=".identify-", dir=self.photo_dir)
             for pan, tilt, img in frames:
                 name = f"pan{int(pan):+04d}_t{int(tilt):+03d}.jpg"
                 with open(os.path.join(td, name), "wb") as fh:
@@ -988,7 +1008,77 @@ class App:
         except OSError as e:
             log(f"scan: meta publish failed ({e})")
         finally:
-            shutil.rmtree(td, ignore_errors=True)
+            if td is not None:
+                shutil.rmtree(td, ignore_errors=True)
+            self._release_identify()
+
+    def identify_pano_cmd(self, pano_path, out_json, focus):
+        """argv/cwd for the archived-scan identify (injectable for tests)."""
+        scene_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "scene.py")
+        argv = ["nice", "-n", "10", sys.executable, scene_py,
+                "identify-pano", pano_path, out_json]
+        if focus:
+            argv.append(focus)
+        return argv, dict(os.environ)
+
+    def start_scan_identify(self, name, focus=None):
+        """Identify objects in an ARCHIVED scan (plan 031). Returns
+        (ok, why-not); the work happens on a daemon worker with the same
+        killpg harness as the scan-time identify."""
+        pano = os.path.join(self.scans_dir, name)
+        if not os.path.exists(pano):
+            return False, "no such scan"
+        if not self._try_acquire_identify():
+            return False, "an identify is already running"
+        try:
+            threading.Thread(target=self._identify_archived,
+                             args=(name, focus), daemon=True).start()
+        except Exception as e:          # thread spawn failure must not wedge
+            self._release_identify()
+            return False, f"could not start identify: {e}"
+        return True, ""
+
+    def _identify_archived(self, name, focus):
+        import shutil
+        import tempfile
+        td = None
+        try:
+            td = tempfile.mkdtemp(prefix=".identpano-", dir=self.photo_dir)
+            out = os.path.join(td, "meta.json")
+            argv, env = self.identify_pano_cmd(
+                os.path.join(self.scans_dir, name), out, focus)
+            # cancel_event=None: drive/e-stop must not kill an ARCHIVED
+            # identify (the event stays set until the next scan clears it)
+            self._run_ident_proc(argv, env, cancel_event=None)
+            if not os.path.exists(out):
+                log(f"scan: identify of {name} produced no meta")
+                return
+            sidecar = os.path.join(self.scans_dir, name + ".meta.json")
+            live = os.path.join(self.photo_dir, "panorama.meta.json")
+            # commit-time decision in ONE lock hold (plan-review demand): the
+            # live meta is refreshed only if this scan is STILL the newest and
+            # no scan is mid-flight — an old scan's boxes must never describe
+            # a newer panorama
+            with self._pano_mu:
+                newest = (name == (self.list_scans() or [None])[0]
+                          and not self._scan_active)
+                try:
+                    if newest:
+                        os.replace(out, live)
+                        _quiet(lambda: os.remove(sidecar))
+                        os.link(live, sidecar)
+                    else:
+                        os.replace(out, sidecar)
+                except OSError as e:
+                    log(f"scan: identify meta publish failed ({e})")
+                    return
+            log(f"scan: identify of {name} done"
+                + (" (live view updated)" if newest else " (sidecar only)"))
+        finally:
+            if td is not None:
+                shutil.rmtree(td, ignore_errors=True)
+            self._release_identify()
 
     def pano_build_cmd(self, frames_dir, out_path):
         """argv + env for the stitcher subprocess: niced, thread-capped so the
@@ -1099,11 +1189,21 @@ class App:
             return True
 
     def _run_identify(self, frames_dir, out_json):
-        """Run the identification subprocess (own group, own timeout, cancel-
-        aware). Any failure just logs — the scan is already published. The
-        proc handle is stashed so a NEW scan kills a straggling identify
-        (its stale meta must never attach to the newer panorama)."""
+        """Scan-time identify: argv from the injectable builder, then the
+        shared subprocess harness. Watches _scan_cancel — a drive/e-stop
+        during THIS scan's identify phase should kill it."""
         argv, env = self.identify_builder(frames_dir, out_json)
+        self._run_ident_proc(argv, env, cancel_event=self._scan_cancel)
+
+    def _run_ident_proc(self, argv, env, cancel_event=None):
+        """Popen/watch/kill core shared by BOTH identify paths (own group,
+        IDENTIFY_TIMEOUT_S). cancel_event is watched ONLY when given: the
+        scan-time path passes _scan_cancel; the ARCHIVED path passes None —
+        drive/e-stop hooks set that event and nothing clears it until the
+        next scan, so honoring it here would kill every archived identify
+        after any joystick input (a code-review catch). The proc handle is
+        stashed so a NEW scan still kills a straggling identify of either
+        kind (its stale meta must never attach to the newer panorama)."""
         try:
             proc = subprocess.Popen(argv, env=env, start_new_session=True,
                                     stdout=subprocess.DEVNULL,
@@ -1116,7 +1216,8 @@ class App:
         try:
             deadline = time.monotonic() + IDENTIFY_TIMEOUT_S
             while proc.poll() is None:
-                if self._scan_cancel.is_set() or time.monotonic() > deadline:
+                cancelled = cancel_event is not None and cancel_event.is_set()
+                if cancelled or time.monotonic() > deadline:
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except OSError:
@@ -1132,6 +1233,21 @@ class App:
         proc.stderr.close()
         if tail:
             log(f"scan: identify said: {tail}")
+
+    def auto_flash_on(self):
+        """Kill switch (plan 031): marker file present = the chatbot may NOT
+        auto-enable lights. Missing dir counts as marker-absent = ON."""
+        return not os.path.exists(
+            os.path.join(self.photo_dir, ".auto_flash_off"))
+
+    def set_auto_flash(self, on):
+        marker = os.path.join(self.photo_dir, ".auto_flash_off")
+        if on:
+            _quiet(lambda: os.remove(marker))
+        else:
+            os.makedirs(self.photo_dir, exist_ok=True)   # may not exist yet
+            with open(marker, "w") as f:
+                f.write("auto-flash disabled from the web UI\n")
 
     def chat_cmd(self):
         """argv + cwd for the chat service (separate for test pinning; tests
@@ -1930,11 +2046,14 @@ def make_handler(app):
             elif p == "/healthz":
                 cam_up, cam_err = app.cam.status()
                 ser_up, ser_err = app.rover.status()
+                with app._light_mu:
+                    lights = {"head": app.head_on, "base": app.base_on}
                 self._json(200, {"ok": True,
                                  "serial": {"up": ser_up, "err": ser_err},
                                  "camera": {"up": cam_up, "err": cam_err},
                                  "gamepad": {"up": app.gamepad_present(),
-                                             "mapping": app.map_source}})
+                                             "mapping": app.map_source},
+                                 "lights": lights})
             elif p == "/speed":
                 self._json(200, {"ok": True, "cap": app.move.get_cap()})
             elif p == "/video_feed":
@@ -1951,6 +2070,8 @@ def make_handler(app):
                 pan, tilt = app.aim.get()
                 snap.update({"ok": True, "pan": pan, "tilt": tilt})
                 self._json(200, snap)
+            elif p == "/auto_flash":
+                self._json(200, {"on": app.auto_flash_on()})
             elif p == "/chat_status":
                 if not self._chat_proxy("GET", "/chat_status"):
                     self._json(200, {"up": False})    # down is an answer
@@ -2174,6 +2295,27 @@ def make_handler(app):
                         return
                     if not self._chat_proxy("POST", "/chat", b):
                         self._err(503, "chat service not running — press start")
+                elif p == "/auto_flash":
+                    v = (q.get("on") or ["1"])[0]
+                    app.set_auto_flash(v not in ("0", "false", "off"))
+                    self._json(200, {"ok": True, "on": app.auto_flash_on()})
+                elif p.startswith("/scan_identify/"):
+                    name = p[len("/scan_identify/"):]
+                    if not SCAN_NAME_RE.match(name):
+                        self._err(400, "bad scan name")
+                        return
+                    focus = (q.get("focus") or [""])[0][:100] or None
+                    ok, why = app.start_scan_identify(name, focus)
+                    if not ok:
+                        self._err(409 if "running" in why else 404, why)
+                        return
+                    self.send_response(202)
+                    self._cors()
+                    body = json.dumps({"ok": True, "started": True}).encode()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 elif p == "/chat_start":
                     ok, why = app.chat_start()
                     if ok:

@@ -196,6 +196,87 @@ class FrameOrderTest(unittest.TestCase):
         self.assertEqual(ordered[0][0], -60)               # pan-sorted within ring
 
 
+class StripMathTest(unittest.TestCase):
+    def test_center_of_first_strip(self):
+        # strip 0 starts at lon -180; a centered bbox → lon -135 (strip mid)
+        lon, lat, w, h = scene.strip_bbox_to_angles(
+            -180.0, [0.4, 0.4, 0.6, 0.6], 180.0)
+        self.assertAlmostEqual(lon, -135.0)
+        self.assertAlmostEqual(lat, 0.0)
+        self.assertAlmostEqual(w, 18.0)     # 0.2 × 90°
+        self.assertAlmostEqual(h, 36.0)     # 0.2 × 180°
+
+    def test_wraps_across_the_seam(self):
+        # last strip starts at 120° and spans to 210° → wraps to -150
+        lon, _, _, _ = scene.strip_bbox_to_angles(
+            120.0, [0.85, 0.4, 0.95, 0.6], 180.0)
+        self.assertAlmostEqual(lon, -159.0)  # 120 + 0.9·90 = 201 → -159
+        self.assertLessEqual(abs(lon), 180.0)
+
+    def test_non_2_to_1_pano_uses_viewer_vspan(self):
+        # a stitcher crop 4:1 → vspan 90°, NOT 180 (round-2 reviewer catch)
+        self.assertAlmostEqual(scene.pano_vspan_deg(500, 2000), 90.0)
+        _, lat, _, h = scene.strip_bbox_to_angles(
+            0.0, [0.4, 0.0, 0.6, 0.5], scene.pano_vspan_deg(500, 2000))
+        self.assertAlmostEqual(lat, 22.5)    # (0.5−0.25)·90
+        self.assertAlmostEqual(h, 45.0)      # 0.5·90
+
+    def test_full_sphere_vspan(self):
+        self.assertAlmostEqual(scene.pano_vspan_deg(1000, 2000), 180.0)
+
+
+@unittest.skipUnless(__import__("importlib").util.find_spec("cv2"), "opencv not installed")
+class IdentifyEquirectTest(unittest.TestCase):
+    def _pano(self, w=1440, h=720):
+        import cv2
+        import numpy as np
+        img = np.full((h, w, 3), 120, np.uint8)
+        return cv2.imencode(".jpg", img)[1].tobytes()
+
+    class VisCapture:
+        def __init__(self, per_strip=None):
+            self.calls = 0
+            self.prompts = []
+            self.per_strip = per_strip or {}
+
+        def describe(self, img, prompt, json_out=False, max_tokens=None):
+            self.prompts.append(prompt)
+            i = self.calls
+            self.calls += 1
+            return self.per_strip.get(i, {"objects": []})
+
+    def test_six_strips_and_focus_in_prompt(self):
+        v = self.VisCapture()
+        meta = scene.identify_equirect(v, self._pano(), focus="stack of books")
+        self.assertEqual(v.calls, 6)
+        self.assertIn("stack of books", v.prompts[0])
+        self.assertIsNone(meta)               # nothing found → None
+
+    def test_strip_zero_object_converts(self):
+        v = self.VisCapture({0: {"objects": [
+            {"name": "Books", "color": "multi", "bbox": [0.4, 0.4, 0.6, 0.6]}]}})
+        meta = scene.identify_equirect(v, self._pano())
+        o = meta["objects"][0]
+        self.assertEqual(o["name"], "books")
+        self.assertAlmostEqual(o["lon"], -135.0, delta=0.5)
+        self.assertAlmostEqual(o["lat"], 0.0, delta=0.5)
+
+    def test_seam_strip_dedup_across_overlap(self):
+        # same object seen in strips 4 (lon0=60) and 5 (lon0=120): a box at
+        # 130° appears at x≈0.78 in strip 4 and x≈0.11 in strip 5
+        v = self.VisCapture({
+            4: {"objects": [{"name": "bin", "color": "clear",
+                             "bbox": [0.72, 0.4, 0.84, 0.6]}]},
+            5: {"objects": [{"name": "bin", "color": "clear",
+                             "bbox": [0.05, 0.4, 0.17, 0.6]}]}})
+        meta = scene.identify_equirect(v, self._pano())
+        bins = [o for o in meta["objects"] if o["name"] == "bin"]
+        self.assertEqual(len(bins), 1)        # deduped across the overlap
+
+    def test_undecodable_pano_none(self):
+        self.assertIsNone(scene.identify_equirect(self.VisCapture(), b"junk"))
+
+
 class CliIdentifyTest(unittest.TestCase):
     def test_no_frames_exits_1(self):
         with tempfile.TemporaryDirectory() as d:

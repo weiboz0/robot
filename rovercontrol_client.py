@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -243,3 +244,35 @@ def healthz(timeout: float = 2.0) -> dict:
     """GET /healthz → parsed JSON (raises on unreachable / bad response)."""
     with urllib.request.urlopen(_base() + "/healthz", timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+def get_auto_flash(timeout: float = 2.0) -> bool:
+    """GET /auto_flash → whether the chatbot may auto-enable lights."""
+    with urllib.request.urlopen(_base() + "/auto_flash", timeout=timeout) as r:
+        return bool(json.loads(r.read().decode()).get("on", True))
+
+
+def list_scans(timeout: float = 3.0) -> list:
+    """GET /scans → archived 3D-scan names, newest first."""
+    with urllib.request.urlopen(_base() + "/scans", timeout=timeout) as r:
+        return json.loads(r.read().decode()).get("scans", [])
+
+
+def scan_meta(name: str, timeout: float = 3.0) -> "dict | None":
+    """GET /scan_meta/<name> → objects meta, or None when absent."""
+    try:
+        with urllib.request.urlopen(
+                _base() + "/scan_meta/" + urllib.parse.quote(name),
+                timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def identify_scan(name: str, focus: str = None, timeout: float = 5.0) -> None:
+    """POST /scan_identify/<name> — starts identification (202); raises the
+    HTTPError on 409 (busy) / 404 so callers can report it."""
+    q = ("?focus=" + urllib.parse.quote(focus)) if focus else ""
+    _post("/scan_identify/" + urllib.parse.quote(name) + q, timeout=timeout)
