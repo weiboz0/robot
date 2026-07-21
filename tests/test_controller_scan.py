@@ -356,7 +356,7 @@ class IdentifyArchivedTest(unittest.TestCase):
         t0 = time.monotonic()
         app.identify_builder = lambda d, m: (
             [sys.executable, "-c", "pass"], None)
-        app._identify_frames([(0, -5, b"x")])
+        app._identify_frames([(0, -5, b"x")], None)
         self.assertLess(time.monotonic() - t0, 1.0)  # skipped, not queued
         self.assertFalse(os.path.exists(
             os.path.join(app.photo_dir, "panorama.meta.json")))
@@ -396,7 +396,7 @@ class IdentifyArchivedTest(unittest.TestCase):
         _tf.mkdtemp = boom
         try:
             app.identify_builder = lambda d, m: ([sys.executable, "-c", "pass"], None)
-            app._identify_frames([(0, -5, b"x")])    # must not raise or wedge
+            app._identify_frames([(0, -5, b"x")], None)  # must not raise or wedge
         finally:
             _tf.mkdtemp = orig
         with app._pano_mu:
@@ -435,6 +435,188 @@ class IdentifyArchivedTest(unittest.TestCase):
         self.assertEqual(argv[:3], ["nice", "-n", "10"])
         self.assertIn("scene.py", argv[4])
         self.assertEqual(argv[5:], ["identify-pano", "/s.jpg", "/m.json", "books"])
+
+
+class ScanPoseStampTest(unittest.TestCase):
+    """Plan 032: archived scans carry the pose captured at scan START; the
+    identify publish merges (never clobbers or strands) it; re-identify
+    carries it over; the archive name binds by parameter, not singleton."""
+
+    def _wait_flag_clear(self, app, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with app._pano_mu:
+                if not app._ident_busy:
+                    return
+            time.sleep(0.02)
+        raise AssertionError("identify flag never released")
+
+    def _set_pose(self, app, x, y, heading):
+        with app.pose._mu:
+            app.pose.x, app.pose.y, app.pose.heading = x, y, heading
+
+    def _put_scan(self, app, name):
+        os.makedirs(app.scans_dir, exist_ok=True)
+        with open(os.path.join(app.scans_dir, name), "wb") as f:
+            f.write(b"\xff\xd8PANO")
+
+    def test_sidecar_pose_is_scan_start_pose(self):
+        app, _ = make_scan_app()
+        self._set_pose(app, 1.25, -0.5, 90.0)
+
+        def builder(frames):
+            # pose "drifts" after scan start — the stamp must NOT follow it
+            self._set_pose(app, 9.9, 9.9, 0.0)
+            src = os.path.join(app.photo_dir, "cap.jpg")
+            with open(src, "wb") as f:
+                f.write(b"\xff\xd8P")
+            archived = app.archive_scan(src)
+            with app._pano_mu:
+                app._last_archived = archived
+            return True
+        app.pano_builder = builder
+        self.assertTrue(app.start_scan()[0])
+        self.assertEqual(wait_scan_end(app), "done")
+        metas = [f for f in os.listdir(app.scans_dir)
+                 if f.endswith(".meta.json")]
+        self.assertEqual(len(metas), 1)
+        with open(os.path.join(app.scans_dir, metas[0])) as f:
+            meta = json.load(f)
+        self.assertEqual(meta["objects"], [])
+        self.assertIn("made", meta)
+        self.assertEqual(meta["pose"], {"x": 1.25, "y": -0.5, "heading": 90.0})
+
+    def test_identify_replaces_minimal_sidecar_keeps_pose(self):
+        # the plan-review blocker: a bare os.link over the pre-written minimal
+        # sidecar would FileExistsError and freeze the made-stamp forever
+        app, _ = make_scan_app()
+        name = "scan_20260720_120000.jpg"
+        self._put_scan(app, name)
+        with app._pano_mu:
+            app._scan_pose = {"x": 2.0, "y": 3.0, "heading": -45.0}
+        app._write_min_sidecar(name)
+        sidecar = os.path.join(app.scans_dir, name + ".meta.json")
+        with open(sidecar) as f:
+            before = json.load(f)["made"]
+        app.identify_builder = lambda d, m: (
+            [sys.executable, "-c",
+             f"import json;json.dump({{'objects':[{{'name':'sofa','lon':1,"
+             f"'lat':2,'w':3,'h':4}}],'made':'NEW'}}, open({m!r},'w'))"], None)
+        app._identify_frames([(0, -5, b"\xff\xd8F")], name)
+        with open(sidecar) as f:
+            meta = json.load(f)
+        self.assertEqual(meta["made"], "NEW")
+        self.assertNotEqual(meta["made"], before)     # advanced, not stranded
+        self.assertEqual(meta["objects"][0]["name"], "sofa")
+        self.assertEqual(meta["pose"], {"x": 2.0, "y": 3.0, "heading": -45.0})
+        live = os.path.join(app.photo_dir, "panorama.meta.json")
+        self.assertEqual(os.stat(sidecar).st_ino, os.stat(live).st_ino)
+
+    def test_meta_attaches_to_param_not_last_archived(self):
+        # back-to-back race: scan B owns _last_archived by the time scan A's
+        # identify publishes — A's meta must go to A (parameter binding)
+        app, _ = make_scan_app()
+        a, b = "scan_20260720_100000.jpg", "scan_20260720_110000.jpg"
+        self._put_scan(app, a)
+        self._put_scan(app, b)
+        with app._pano_mu:
+            app._last_archived = b
+        app.identify_builder = lambda d, m: (
+            [sys.executable, "-c",
+             f"import json;json.dump({{'objects':[],'made':'A'}},"
+             f"open({m!r},'w'))"], None)
+        app._identify_frames([(0, -5, b"\xff\xd8F")], a)
+        self.assertTrue(os.path.exists(
+            os.path.join(app.scans_dir, a + ".meta.json")))
+        self.assertFalse(os.path.exists(
+            os.path.join(app.scans_dir, b + ".meta.json")))
+        # and A (not newest) must NOT have described the live panorama
+        self.assertFalse(os.path.exists(
+            os.path.join(app.photo_dir, "panorama.meta.json")))
+
+    def test_reidentify_carries_pose_over(self):
+        app, _ = make_scan_app()
+        name = "scan_20260720_130000.jpg"
+        self._put_scan(app, name)
+        sidecar = os.path.join(app.scans_dir, name + ".meta.json")
+        with open(sidecar, "w") as f:
+            json.dump({"made": "t0", "objects": [],
+                       "pose": {"x": 7, "y": 8, "heading": 9}}, f)
+        app.identify_pano_cmd = lambda p, o, f: (
+            [sys.executable, "-c",
+             f"import json;json.dump({{'objects':[{{'name':'shelf','lon':0,"
+             f"'lat':0,'w':1,'h':1}}],'made':'t1'}}, open({o!r},'w'))"], None)
+        self.assertTrue(app.start_scan_identify(name)[0])
+        self._wait_flag_clear(app)
+        with open(sidecar) as f:
+            meta = json.load(f)
+        self.assertEqual(meta["pose"], {"x": 7, "y": 8, "heading": 9})
+        self.assertEqual(meta["made"], "t1")          # fresh identify won
+
+    def test_late_identify_sidecar_only_while_scan_active(self):
+        # codex code-review catch: scan A's straggling identify must never
+        # describe scan B's newer panorama — live commit is guarded
+        app, _ = make_scan_app()
+        name = "scan_20260720_150000.jpg"
+        self._put_scan(app, name)
+        with app._pano_mu:
+            app._scan_active = True                   # scan B mid-flight
+        app.identify_builder = lambda d, m: (
+            [sys.executable, "-c",
+             f"import json;json.dump({{'objects':[],'made':'late'}},"
+             f"open({m!r},'w'))"], None)
+        app._identify_frames([(0, -5, b"\xff\xd8F")], name)
+        with app._pano_mu:
+            app._scan_active = False
+        self.assertFalse(os.path.exists(
+            os.path.join(app.photo_dir, "panorama.meta.json")))
+        self.assertTrue(os.path.exists(
+            os.path.join(app.scans_dir, name + ".meta.json")))
+
+    def test_archive_failed_identify_no_live_when_newer_archived(self):
+        # archived=None (our archive failed) + someone archived since →
+        # live meta must stay untouched
+        app, _ = make_scan_app()
+        with app._pano_mu:
+            app._last_archived = "scan_20260720_160000.jpg"
+        app.identify_builder = lambda d, m: (
+            [sys.executable, "-c",
+             f"import json;json.dump({{'objects':[],'made':'x'}},"
+             f"open({m!r},'w'))"], None)
+        app._identify_frames([(0, -5, b"\xff\xd8F")], None)
+        self.assertFalse(os.path.exists(
+            os.path.join(app.photo_dir, "panorama.meta.json")))
+
+    def test_min_sidecar_write_failure_never_raises(self):
+        # "costs the pin, never the archive": a squatted temp path → OSError
+        # swallowed, no exception escapes toward archive_scan
+        app, _ = make_scan_app()
+        name = "scan_20260720_170000.jpg"
+        os.makedirs(os.path.join(app.scans_dir, name + ".meta.json.tmp"))
+        with app._pano_mu:
+            app._scan_pose = {"x": 0, "y": 0, "heading": 0}
+        app._write_min_sidecar(name)                  # must not raise
+        self.assertFalse(os.path.exists(
+            os.path.join(app.scans_dir, name + ".meta.json")))
+
+    def test_reidentify_legacy_and_corrupt_sidecars_stay_poseless(self):
+        for content in ('{"made": "t0", "objects": []}', "NOT JSON {"):
+            app, _ = make_scan_app()
+            name = "scan_20260720_140000.jpg"
+            self._put_scan(app, name)
+            sidecar = os.path.join(app.scans_dir, name + ".meta.json")
+            with open(sidecar, "w") as f:
+                f.write(content)
+            app.identify_pano_cmd = lambda p, o, f: (
+                [sys.executable, "-c",
+                 f"import json;json.dump({{'objects':[],'made':'t1'}},"
+                 f"open({o!r},'w'))"], None)
+            self.assertTrue(app.start_scan_identify(name)[0])
+            self._wait_flag_clear(app)
+            with open(sidecar) as f:
+                meta = json.load(f)                   # identify still landed
+            self.assertEqual(meta["made"], "t1")
+            self.assertNotIn("pose", meta)
 
 
 class AutoFlashFlagTest(unittest.TestCase):
@@ -548,12 +730,15 @@ class BuilderSubprocessTest(unittest.TestCase):
     def test_identify_meta_published_live_and_sidecar(self):
         app = self._app()
         os.makedirs(app.scans_dir, exist_ok=True)
-        app._last_archived = "scan_20260715_010101.jpg"
+        # the scan must exist and be newest — the live commit is guarded now
+        with open(os.path.join(app.scans_dir,
+                               "scan_20260715_010101.jpg"), "wb") as f:
+            f.write(b"\xff\xd8P")
         app.identify_builder = lambda d, m: (
             [sys.executable, "-c",
              f"import json;json.dump({{'objects':[{{'name':'bin','lon':1,"
              f"'lat':2,'w':3,'h':4}}]}}, open({m!r},'w'))"], None)
-        app._identify_frames([(0, -5, b"x")])
+        app._identify_frames([(0, -5, b"x")], "scan_20260715_010101.jpg")
         live = os.path.join(app.photo_dir, "panorama.meta.json")
         with open(live) as f:
             self.assertEqual(json.load(f)["objects"][0]["name"], "bin")
@@ -565,7 +750,7 @@ class BuilderSubprocessTest(unittest.TestCase):
         app = self._app()
         app.identify_builder = lambda d, m: (
             [sys.executable, "-c", "import sys; sys.exit(1)"], None)
-        app._identify_frames([(0, -5, b"x")])
+        app._identify_frames([(0, -5, b"x")], None)
         live = os.path.join(app.photo_dir, "panorama.meta.json")
         self.assertFalse(os.path.exists(live))
         old = rc.IDENTIFY_TIMEOUT_S
@@ -574,7 +759,7 @@ class BuilderSubprocessTest(unittest.TestCase):
             app.identify_builder = lambda d, m: (
                 [sys.executable, "-c", "import time; time.sleep(60)"], None)
             t0 = time.monotonic()
-            app._identify_frames([(0, -5, b"x")])
+            app._identify_frames([(0, -5, b"x")], None)
             self.assertLess(time.monotonic() - t0, 10)
         finally:
             rc.IDENTIFY_TIMEOUT_S = old

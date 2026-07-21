@@ -152,6 +152,7 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  <button id="tabphotos" onclick="showTab('photos')">📷 Photos</button>
  <button id="tabscans" onclick="showTab('scans')">🌍 3D views</button>
  <button id="tabprog" onclick="showTab('prog')">⚙ Program</button>
+ <button id="tabmap" onclick="showTab('map')">🗺 Map</button>
  <button class="warn" id="clearphotos" onclick="clearAll()" style="display:none">🗑 Clear all photos</button>
  <button class="warn" id="clearscans" onclick="clearAllScans()" style="display:none">🗑 Clear all 3D views</button>
 </div>
@@ -168,6 +169,10 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
 </div>
 <div class="grid" id="gallery" style="display:none"></div>
 <div class="grid" id="scangrid" style="display:none"></div>
+<div id="mappanel" style="display:none">
+ <canvas id="mapcanvas" style="width:100%;border-radius:8px;background:#0b0e14;cursor:pointer"></canvas>
+ <div style="padding:4px 2px"><small>driven trail from the wheel odometry · 📍 numbered pins are saved 3D views — click one to open it · grid = 1 m · ⌖ reset pose restarts the trail at (0,0)</small></div>
+</div>
 <div id="progpanel" style="display:none">
 <div class="bar">
  <b>Program</b>
@@ -509,8 +514,8 @@ async function clearAll(){const p=await(await fetch('/photos')).json();const ns=
 
 // ── side-panel tabs: Chat | Photos | 3D views | Program (plan 030) ───────────
 let gtab='chat';
-const TAB_PANELS={chat:'chatpanel',photos:'gallery',scans:'scangrid',prog:'progpanel'};
-const TAB_BTNS={chat:'tabchat',photos:'tabphotos',scans:'tabscans',prog:'tabprog'};
+const TAB_PANELS={chat:'chatpanel',photos:'gallery',scans:'scangrid',prog:'progpanel',map:'mappanel'};
+const TAB_BTNS={chat:'tabchat',photos:'tabphotos',scans:'tabscans',prog:'tabprog',map:'tabmap'};
 function showTab(t){gtab=t;
  for(const k in TAB_PANELS){const el=document.getElementById(TAB_PANELS[k]);
   if(el)el.style.display=(t===k)?'':'none';}
@@ -518,7 +523,8 @@ function showTab(t){gtab=t;
  document.getElementById('clearscans').style.display=t==='scans'?'':'none';
  for(const k in TAB_BTNS){const b=document.getElementById(TAB_BTNS[k]);
   if(b){b.style.background=(t===k)?'#08f':'';b.style.color=(t===k)?'#fff':'';}}
- if(t==='scans')loadScans();}
+ if(t==='scans')loadScans();
+ if(t==='map'){for(const k in mapMetas)if(mapMetas[k]==null)delete mapMetas[k];mapTick();}}
 
 // ── chat panel: submit + poll against the controller's chat bridge ──────────
 let chatBusy=false;
@@ -629,6 +635,71 @@ async function toggleAutoFlash(){try{
  paintAutoFlash(j.on);cout('auto-flash '+(j.on?'enabled':'disabled — the chatbot cannot turn lights on by itself'));
 }catch(e){}}
 setInterval(poseTick,500);poseTick();
+
+// ── Map tab: driven trail + clickable scan pins (plan 032) ───────────────────
+let mapMetas={};   // name → meta | null (negative cache; nulls retried on tab revisit)
+let mapTrail=[],mapPose=null,mapPins=[];
+async function mapTick(){
+ if(gtab!=='map')return;
+ try{
+  const j=await(await fetch('/pose_trail')).json();
+  mapTrail=j.trail||[];mapPose=j.pose||null;
+  const s=await(await fetch('/scans')).json();const ns=s.scans||[];
+  for(const k of Object.keys(mapMetas))if(!ns.includes(k))delete mapMetas[k];
+  for(const n of ns){
+   if(n in mapMetas)continue;    // cached — even a 404 (legacy scan, no pin)
+   try{const m=await fetch('/scan_meta/'+n);mapMetas[n]=m.ok?await m.json():null;}
+   catch(e){delete mapMetas[n];}  // network blip: retry next tick
+  }
+  drawMap(ns);
+ }catch(e){}}
+function drawMap(ns){
+ const c=document.getElementById('mapcanvas');if(!c)return;
+ const W=c.clientWidth||480,H=320;c.width=W;c.height=H;
+ const g=c.getContext('2d');g.fillStyle='#0b0e14';g.fillRect(0,0,W,H);
+ // world bounds over trail ∪ pins ∪ rover, min 2m span, padded
+ const pts=mapTrail.map(p=>[p[0],p[1]]);
+ if(mapPose)pts.push([mapPose.x,mapPose.y]);
+ const pinsW=[];
+ ns.forEach((n,i)=>{const m=mapMetas[n];
+  if(m&&m.pose&&typeof m.pose.x==='number'){pinsW.push({n,num:i+1,x:m.pose.x,y:m.pose.y});pts.push([m.pose.x,m.pose.y]);}});
+ if(!pts.length)pts.push([0,0]);
+ let minx=1/0,maxx=-1/0,miny=1/0,maxy=-1/0;
+ for(const[x,y]of pts){minx=Math.min(minx,x);maxx=Math.max(maxx,x);miny=Math.min(miny,y);maxy=Math.max(maxy,y);}
+ const span=Math.max(maxx-minx,maxy-miny,2),pad=28;
+ const s=Math.min((W-2*pad)/span,(H-2*pad)/span);
+ const cx=(minx+maxx)/2,cy=(miny+maxy)/2;
+ const X=x=>W/2+(x-cx)*s,Y=y=>H/2-(y-cy)*s;   // world +y up → canvas y down
+ // 1m grid
+ g.strokeStyle='#1c2333';g.lineWidth=1;g.beginPath();
+ for(let x=Math.floor(minx-1);x<=maxx+1;x++){g.moveTo(X(x),0);g.lineTo(X(x),H);}
+ for(let y=Math.floor(miny-1);y<=maxy+1;y++){g.moveTo(0,Y(y));g.lineTo(W,Y(y));}
+ g.stroke();
+ // origin cross
+ g.strokeStyle='#2d3a55';g.beginPath();g.moveTo(X(0)-6,Y(0));g.lineTo(X(0)+6,Y(0));g.moveTo(X(0),Y(0)-6);g.lineTo(X(0),Y(0)+6);g.stroke();
+ // trail
+ if(mapTrail.length>1){g.strokeStyle='#3b82f6';g.lineWidth=2;g.beginPath();
+  g.moveTo(X(mapTrail[0][0]),Y(mapTrail[0][1]));
+  for(const p of mapTrail)g.lineTo(X(p[0]),Y(p[1]));g.stroke();}
+ // scan pins (numbered, newest = 1); remember screen spots for click hit-test
+ mapPins=[];
+ for(const p of pinsW){const px=X(p.x),py=Y(p.y);
+  mapPins.push({n:p.n,px,py});
+  g.fillStyle='#f59e0b';g.beginPath();g.arc(px,py,9,0,7);g.fill();
+  g.fillStyle='#000';g.font='bold 10px sans-serif';g.textAlign='center';g.textBaseline='middle';
+  g.fillText(p.num,px,py);}
+ // rover: heading triangle
+ if(mapPose){const px=X(mapPose.x),py=Y(mapPose.y),a=-mapPose.heading*Math.PI/180;
+  g.save();g.translate(px,py);g.rotate(a);
+  g.fillStyle=mapPose.fresh?'#22c55e':'#556';
+  g.beginPath();g.moveTo(10,0);g.lineTo(-6,5.5);g.lineTo(-6,-5.5);g.closePath();g.fill();
+  g.restore();}}
+function mapClick(ev){
+ const r=ev.target.getBoundingClientRect();
+ const mx=ev.clientX-r.left,my=ev.clientY-r.top;
+ for(const p of mapPins)
+  if(Math.hypot(mx-p.px,my-p.py)<=12){showTab('scans');pano3d('/scans/'+p.n);return;}}
+document.getElementById('mapcanvas').addEventListener('click',mapClick);
 
 // ── speed cap: slider + number input + live value, synced from the server ────
 function syncCap(v){v=Number(v);const c=document.getElementById('cap'),n=document.getElementById('capNum'),
@@ -816,7 +887,7 @@ async function panoStat(){try{
 async function health(){try{const h=await(await fetch('/healthz')).json();
  document.getElementById('health').innerHTML='<small>serial '+(h.serial.up?'✓':'✗')+
  ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad.up?'✓':'–')+'</small>';}catch(e){}}
-setInterval(()=>{load();health();panoStat();scansTick();chatStatusTick();autoFlashTick();},2000);
+setInterval(()=>{load();health();panoStat();scansTick();chatStatusTick();autoFlashTick();mapTick();},2000);
 showTab('chat');load();health();panoStat();chatStatusTick();autoFlashTick();initCap();renderProg();refreshSaved();
 
 // ── Mac-side gamepad: Gamepad API → existing HTTP endpoints (no server change).

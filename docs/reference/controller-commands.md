@@ -55,14 +55,15 @@ serial down → 503. CORS is open (any page/client can call it).
 | `GET /scans/<name>` | serve an archived scan (`scan_YYYYmmdd_HHMMSS[_N].jpg`) |
 | `POST /delete_scan/<name>` | delete an archived scan |
 | `GET /pose` | dead-reckoned `{"x","y","heading","pan","tilt","battery_v","fresh"}` in self-set coordinates (wheel-encoder odometry; shown in the page's top-right badge); always `200` — `fresh:false` when telemetry is stale |
-| `POST /pose_reset` | set the current spot as origin (0,0), heading 0° |
+| `POST /pose_reset` | set the current spot as origin (0,0), heading 0° (also restarts the map trail) |
+| `GET /pose_trail` | `{"trail":[[x,y],…],"pose":{…}}` — driven path (bounded, ≥5 cm spacing, origin-seeded) + the same dict `/pose` serves; the 🗺 Map tab draws this |
 | `POST /scan_cancel` | abort a running scan and discard it (⏹ button / gamepad STOP-SCAN, default button 8); `409` when idle or already publishing |
 | `POST /chat` | submit a chatbot turn `{"text":…}` → `{"turn":N}` immediately (`409 busy` while one runs); the chat service (agent_chat `--serve`, loopback :8090) runs it |
 | `GET /chat_poll?turn=N` | `{"done":false}` or `{"done":true,"reply":…}` — the page polls this; nothing ever blocks on the LLM |
 | `GET /chat_status` | chat service health (always `200`; `{"up":false}` when not running) |
 | `POST /chat_start` | launch the chat service detached (logs → `~/rover-chat.log`); `409` if already up |
 | `GET /pano_meta` | objects identified in the live panorama `{"objects":[{name,color,lon,lat,w,h}]}` (404 if none) |
-| `GET /scan_meta/<name>` | objects identified in an archived scan (the 3D viewer draws these as boxes; `boxes on|off|all|<names>` in the web command box controls them) |
+| `GET /scan_meta/<name>` | objects identified in an archived scan (the 3D viewer draws these as boxes; `boxes on|off|all|<names>` in the web command box controls them); since plan 032 every new scan's meta also carries `"pose":{x,y,heading}` — where the rover stood when it scanned (the Map tab's 📍 pins) |
 | `POST /scan_identify/<name>[?focus=…]` | identify objects in a SAVED scan (202; runs in the background; 🔍 button per scan card; the chatbot's `rover_identify_scan` tool uses it — "add a box for the books on the 2nd-last 3D view") |
 | `GET/POST /auto_flash[?on=0\|1]` | the chatbot auto-flashlight kill switch (🔦 button); when off, the chatbot may never enable lights automatically; persists across restarts |
 

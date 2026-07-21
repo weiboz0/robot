@@ -262,5 +262,53 @@ class TelemetryReaderTest(unittest.TestCase):
         self.assertFalse(th.is_alive())
 
 
+class TrailTest(unittest.TestCase):
+    """Plan 032: the driven-path trail for the Map tab — origin-seeded,
+    jitter-suppressed, hard-bounded, cleared+re-seeded on reset."""
+
+    def test_origin_seeded_and_reset_reseeds(self):
+        p = rc.Pose()
+        self.assertEqual(p.trail_snapshot(), [[0.0, 0.0]])   # never empty
+        p.update(0, 0)
+        for i in range(1, 11):                     # 10 × 10 cm east
+            p.update(i * 10, i * 10)
+        self.assertEqual(len(p.trail_snapshot()), 11)
+        self.assertAlmostEqual(p.trail_snapshot()[-1][0], 1.0, places=2)
+        p.reset()
+        self.assertEqual(p.trail_snapshot(), [[0.0, 0.0]])
+
+    def test_min_step_suppresses_jitter(self):
+        p = rc.Pose()
+        p.update(0, 0)
+        for i in range(1, 5):                      # 1 cm/sample, 4 cm total
+            p.update(i, i)
+        self.assertEqual(len(p.trail_snapshot()), 1)   # under the 5 cm step
+        p.update(6, 6)                             # 6 cm from origin → record
+        self.assertEqual(len(p.trail_snapshot()), 2)
+
+    def test_trail_hard_bounded_evicts_oldest(self):
+        orig = rc.TRAIL_MAX
+        rc.TRAIL_MAX = 5
+        try:
+            p = rc.Pose()
+            p.update(0, 0)
+            for i in range(1, 21):                 # 20 recordable steps
+                p.update(i * 10, i * 10)
+            t = p.trail_snapshot()
+            self.assertEqual(len(t), 5)
+            self.assertNotIn([0.0, 0.0], t)        # origin evicted at the cap
+            self.assertAlmostEqual(t[-1][0], 2.0, places=2)
+        finally:
+            rc.TRAIL_MAX = orig
+
+    def test_rebaseline_jump_adds_no_trail_point(self):
+        p = rc.Pose()
+        p.update(0, 0)
+        p.update(10, 10)                           # 10 cm → recorded
+        n = len(p.trail_snapshot())
+        p.update(5000, 5000)                       # counter jump → re-baseline
+        self.assertEqual(len(p.trail_snapshot()), n)   # no teleport segment
+
+
 if __name__ == "__main__":
     unittest.main()

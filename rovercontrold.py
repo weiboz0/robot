@@ -22,6 +22,7 @@ Run:  python3 rovercontrold.py [-port 8080] [-photos DIR] [-serial /dev/ttyAMA0]
 from __future__ import annotations
 
 import argparse
+import collections
 import errno
 import fcntl
 import json
@@ -192,6 +193,8 @@ SKID_FACTOR = 1.0           # effective-width multiplier; skid-steer scrubs in
 ODOM_MAX_STEP_CM = 50.0     # per-sample plausibility bound: beyond this it's a
                             # counter reset/reboot → re-baseline, never integrate
 POSE_FRESH_S = 1.5          # /pose "fresh" horizon
+TRAIL_MIN_STEP_M = 0.05     # record a trail point every ≥5 cm of travel
+TRAIL_MAX = 2000            # trail hard bound (~100 m at 5 cm spacing)
 
 
 class Pose:
@@ -208,6 +211,9 @@ class Pose:
         self._seen = None
         self.battery_v = None
         self.servo_pan = self.servo_tilt = None
+        # driven-path trail for the Map tab; seeded with the origin so a
+        # stationary rover still draws a dot, never an empty map
+        self._trail = collections.deque([(0.0, 0.0)], maxlen=TRAIL_MAX)
 
     def rebaseline(self):
         """Link (re)published or counter jump: hold pose, restart deltas."""
@@ -218,6 +224,9 @@ class Pose:
         with self._mu:
             self.x = self.y = 0.0
             self.heading = 0.0
+            # the old trail is in the old frame — clear and re-seed the origin
+            self._trail.clear()
+            self._trail.append((0.0, 0.0))
 
     def update(self, odl, odr, now=None):
         now = time.monotonic() if now is None else now
@@ -240,6 +249,9 @@ class Pose:
                 rad = math.radians(self.heading)
                 self.x += fwd * math.cos(rad)
                 self.y += fwd * math.sin(rad)
+                lx, ly = self._trail[-1]
+                if math.hypot(self.x - lx, self.y - ly) >= TRAIL_MIN_STEP_M:
+                    self._trail.append((self.x, self.y))
 
     def set_aux(self, battery_v, pan, tilt):
         with self._mu:
@@ -255,6 +267,10 @@ class Pose:
                     "heading": round(self.heading, 1),
                     "battery_v": self.battery_v,
                     "fresh": self._seen is not None and now - self._seen < POSE_FRESH_S}
+
+    def trail_snapshot(self):
+        with self._mu:
+            return [[round(x, 3), round(y, 3)] for x, y in self._trail]
 
 
 def parse_feedback(line):
@@ -773,6 +789,8 @@ class App:
         self.pano_builder = self._build_pano_subprocess
         self.identify_builder = self.identify_cmd   # None disables (tests)
         self._last_archived = None                  # under _pano_mu
+        self._scan_pose = None                      # under _pano_mu — pose at
+                                                    # scan start (plan 032)
         self._identify_proc = None                  # under _pano_mu
         self._ident_busy = False                    # under _pano_mu — ONE identify
                                                     # at a time (either kind);
@@ -886,6 +904,10 @@ class App:
             self._scan_active = True
             self._scan_published = False
             self.pano_state, self.pano_state_at = "scanning", time.monotonic()
+            # wheels can't move during a scan, so the start pose IS the pose
+            # of the whole scan; only read while the scan slot is held
+            snap = self.pose.snapshot()
+            self._scan_pose = {k: snap[k] for k in ("x", "y", "heading")}
             self._scan_cancel.clear()
         # estop/drive that slipped in around the clear() (its cancel-event set
         # would have been erased) → re-check both and abort before any motion
@@ -951,6 +973,11 @@ class App:
             built = bool(self.pano_builder(frames))
             with self._pano_mu:
                 published = self._scan_published
+                # bind the archive name NOW, before _finish_scan releases the
+                # scan slot — read later, a back-to-back scan could have
+                # overwritten it and this scan's meta would attach to the
+                # wrong archive (plan-032 review catch)
+                archived = self._last_archived
             # once published, the scan IS done — a later e-stop/drive event
             # (which may land during the minutes-long identify phase) must
             # not flip the state to failed; before publish, a cancel still
@@ -965,7 +992,7 @@ class App:
             log("scan: 3D view updated" if ok else "scan: not completed")
         if ok and published and self.identify_builder is not None:
             # scan slot is free; identification is best-effort background work
-            self._identify_frames(frames)
+            self._identify_frames(frames, archived)
 
     def _try_acquire_identify(self):
         with self._pano_mu:
@@ -978,11 +1005,13 @@ class App:
         with self._pano_mu:
             self._ident_busy = False
 
-    def _identify_frames(self, frames):
+    def _identify_frames(self, frames, archived):
         """Write the frames to a fresh temp dir, run the identify subprocess,
         publish the meta (live + archive sidecar). Every failure just logs.
         SKIPS (never blocks) if another identify holds the flag — the scan is
-        already published; the user can press 🔍 later."""
+        already published; the user can press 🔍 later. `archived` is bound by
+        the caller while the scan slot was still held (never read from the
+        `_last_archived` singleton here — a newer scan may own it by now)."""
         import shutil
         import tempfile
         if not self._try_acquire_identify():
@@ -990,8 +1019,7 @@ class App:
             return
         td = None
         try:                    # EVERYTHING after acquire is inside try —
-            with self._pano_mu:  # a mkdtemp failure must not wedge the flag
-                archived = self._last_archived
+            # a mkdtemp failure must not wedge the flag
             td = tempfile.mkdtemp(prefix=".identify-", dir=self.photo_dir)
             for pan, tilt, img in frames:
                 name = f"pan{int(pan):+04d}_t{int(tilt):+03d}.jpg"
@@ -1000,11 +1028,38 @@ class App:
             src_meta = os.path.join(td, "meta.json")
             self._run_identify(td, src_meta)
             if os.path.exists(src_meta):
+                if archived:    # carry the archive-time pose into the boxes meta
+                    self._inject_pose(src_meta, self._sidecar_pose(archived))
                 live_meta = os.path.join(self.photo_dir, "panorama.meta.json")
-                os.replace(src_meta, live_meta)
-                if archived:
-                    os.link(live_meta,
-                            os.path.join(self.scans_dir, archived + ".meta.json"))
+                sidecar = (os.path.join(self.scans_dir, archived + ".meta.json")
+                           if archived else None)
+                # commit under _pano_mu with the same "still newest and no
+                # scan mid-flight" guard _identify_archived uses — a
+                # straggling identify from scan A must never describe scan
+                # B's newer panorama (code-review catch). When our archive
+                # failed (archived None) there is no name to compare, so
+                # publish live only while _last_archived is still None (a
+                # later scan would have overwritten it).
+                with self._pano_mu:
+                    if archived:
+                        newest = (archived == (self.list_scans() or [None])[0]
+                                  and not self._scan_active)
+                    else:
+                        newest = (self._last_archived is None
+                                  and not self._scan_active)
+                    if newest:
+                        os.replace(src_meta, live_meta)
+                        if sidecar:
+                            # the minimal pose sidecar already exists — a
+                            # bare link would FileExistsError and strand the
+                            # boxless meta, so unlink-then-link (same pattern
+                            # as _identify_archived)
+                            _quiet(lambda: os.remove(sidecar))
+                            os.link(live_meta, sidecar)
+                    elif sidecar:
+                        os.replace(src_meta, sidecar)
+                        log(f"scan: identify of {archived} landed late — "
+                            "sidecar only")
         except OSError as e:
             log(f"scan: meta publish failed ({e})")
         finally:
@@ -1055,6 +1110,9 @@ class App:
                 log(f"scan: identify of {name} produced no meta")
                 return
             sidecar = os.path.join(self.scans_dir, name + ".meta.json")
+            # re-identify replaces the sidecar wholesale — carry the original
+            # pose stamp over (legacy pose-less sidecars stay pose-less)
+            self._inject_pose(out, self._sidecar_pose(name))
             live = os.path.join(self.photo_dir, "panorama.meta.json")
             # commit-time decision in ONE lock hold (plan-review demand): the
             # live meta is refreshed only if this scan is STILL the newest and
@@ -1292,17 +1350,62 @@ class App:
 
     def archive_scan(self, src):
         """Hard-link the just-published panorama into photos/scans/ with a
-        collision-safe timestamp name. Returns the archived name."""
+        collision-safe timestamp name, then drop the pose-stamped minimal meta
+        sidecar (plan 032) so the map gets a pin even if identify never runs.
+        Returns the archived name."""
         os.makedirs(self.scans_dir, exist_ok=True)
         stamp = time.strftime("scan_%Y%m%d_%H%M%S")
         for n in range(1000):
             name = stamp + ("" if n == 0 else f"_{n}") + ".jpg"
             try:
                 os.link(src, os.path.join(self.scans_dir, name))
-                return name
             except FileExistsError:
                 continue
+            self._write_min_sidecar(name)
+            return name
         raise OSError(f"no free scan name for {stamp}*")
+
+    def _write_min_sidecar(self, name):
+        """made + zero objects + the scan-start pose. Best-effort: a failure
+        costs the pin, never the archive."""
+        with self._pano_mu:
+            pose = self._scan_pose
+        meta = {"made": time.strftime("%Y-%m-%dT%H:%M:%S"), "objects": []}
+        if pose:
+            meta["pose"] = pose
+        sidecar = os.path.join(self.scans_dir, name + ".meta.json")
+        try:
+            with open(sidecar + ".tmp", "w") as fh:
+                json.dump(meta, fh)
+            os.replace(sidecar + ".tmp", sidecar)
+        except OSError as e:
+            log(f"scan: pose sidecar write failed ({e})")
+
+    def _sidecar_pose(self, name):
+        """Pose recorded in an archived scan's sidecar, or None. Tolerates a
+        missing, unreadable, or corrupt sidecar — a legacy scan simply has no
+        pin, never an aborted identify."""
+        try:
+            with open(os.path.join(self.scans_dir, name + ".meta.json")) as fh:
+                pose = json.load(fh).get("pose")
+            return pose if isinstance(pose, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _inject_pose(self, meta_path, pose):
+        """Merge the pose key into an identify-produced meta file in place
+        (temp + replace). No pose or any failure → meta published as-is."""
+        if not pose:
+            return
+        try:
+            with open(meta_path) as fh:
+                d = json.load(fh)
+            d["pose"] = pose
+            with open(meta_path + ".tmp", "w") as fh:
+                json.dump(d, fh)
+            os.replace(meta_path + ".tmp", meta_path)
+        except (OSError, ValueError) as e:
+            log(f"scan: pose inject failed ({e})")
 
     def list_scans(self):
         try:
@@ -2070,6 +2173,14 @@ def make_handler(app):
                 pan, tilt = app.aim.get()
                 snap.update({"ok": True, "pan": pan, "tilt": tilt})
                 self._json(200, snap)
+            elif p == "/pose_trail":
+                # one fetch per map tick: the driven trail + the same pose
+                # dict /pose serves
+                snap = app.pose.snapshot()
+                pan, tilt = app.aim.get()
+                snap.update({"ok": True, "pan": pan, "tilt": tilt})
+                self._json(200, {"trail": app.pose.trail_snapshot(),
+                                 "pose": snap})
             elif p == "/auto_flash":
                 self._json(200, {"on": app.auto_flash_on()})
             elif p == "/chat_status":
