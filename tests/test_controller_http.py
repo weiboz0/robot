@@ -224,6 +224,23 @@ class PoseHTTPTest(HTTPBase):
         s, j = self.jreq("GET", "/pose")
         self.assertEqual((j["x"], j["y"], j["heading"]), (0, 0, 0))
 
+    def test_pose_trail_endpoint(self):
+        # plan 032: one fetch serves the driven trail + the /pose dict
+        self.jreq("POST", "/pose_reset")
+        base = 5000
+        self.app.pose.update(base, base)            # counter jump: re-baseline
+        for i in range(1, 11):                      # then 1 m east
+            self.app.pose.update(base + i * 10, base + i * 10)
+        s, j = self.jreq("GET", "/pose_trail")
+        self.assertEqual(s, 200)
+        self.assertEqual(j["trail"][0], [0, 0])     # origin-seeded
+        self.assertEqual(len(j["trail"]), 11)
+        self.assertAlmostEqual(j["trail"][-1][0], 1.0, places=2)
+        for k in ("x", "y", "heading", "pan", "tilt", "fresh"):
+            self.assertIn(k, j["pose"])
+        self.assertAlmostEqual(j["pose"]["x"], 1.0, places=2)
+        self.jreq("POST", "/pose_reset")            # leave a clean pose behind
+
     def test_pose_200_not_503_when_serial_down(self):
         rover = rc.Rover()                              # no link
         app = rc.App(rover, rc.Movement(rover), rc.CameraAim(rover),
@@ -695,7 +712,14 @@ class PageAndHealthTest(HTTPBase):
                        # plan 031: identify old scans + auto-flash kill switch
                        "identifyScan(", "/scan_identify/", "/scan_meta/",
                        'id="autoflashbtn"', "toggleAutoFlash(",
-                       "autoFlashTick(", "/auto_flash?on="):
+                       "autoFlashTick(", "/auto_flash?on=",
+                       # plan 032: Map tab — trail + clickable scan pins
+                       'id="tabmap"', 'id="mappanel"', 'id="mapcanvas"',
+                       "mapTick(", "drawMap(", "mapClick(", "/pose_trail",
+                       "showTab('map')",
+                       "showTab('scans');pano3d('/scans/'+p.n)",
+                       "mapTick();},2000",
+                       "if(mapMetas[k]==null)delete mapMetas[k]"):
             self.assertIn(marker, body, marker)
 
     def test_boxes_cmd_intercepted_before_parse(self):
