@@ -1209,10 +1209,189 @@ def cli_build_pano(frames_dir, out_path, variants_dir=None):
     return 0
 
 
+# ─────────────────── object identification in saved scans ───────────────────
+# Plan 029: after a scan, notable objects are located in the CAPTURED frames
+# (flat pinhole images with known pan/tilt pose) and stored as directions on
+# the sphere, so the 3D viewer can overlay boxes that track the view.
+
+IDENTIFY_HFOV = 88.0          # frames are undistorted to this pinhole FOV
+IDENTIFY_BUDGET_S = 300.0     # soft wall-clock cap; partial results are kept
+IDENTIFY_DEDUP_LON = 15.0     # same-name+color within this window is ONE
+IDENTIFY_DEDUP_LAT = 12.0     # object (real cross-frame dups land within a few
+                              # degrees; twin printers side-by-side must NOT merge)
+# per-frame prompt: multi-image calls with a complex prompt were measured
+# 100 s..timeout on the live gateway; single-image /no_think calls are the
+# reliable fast path (measured 42.8 s vs a 181 s timeout on the same image)
+IDENTIFY_PROMPT = (
+    "/no_think List the notable objects fully or mostly visible in this photo "
+    "(furniture, luggage/suitcases, printers, bins/containers, appliances, "
+    "decor). Reply ONLY with COMPACT single-line JSON: "
+    '{"objects": [{"name": str, "color": str, "bbox": [x1, y1, x2, y2]}]} '
+    "with bbox as fractions of the image (0..1, x right, y down). Short "
+    'names (e.g. "suitcase", "printer"). Skip walls/floor/tiny background '
+    "items.")
+
+
+def bbox_to_angles(pan, tilt, bbox, aspect):
+    """Exact pinhole conversion of a bbox (fractions, y-down) in a frame
+    posed at (pan, tilt) → (lon, lat, w_deg, h_deg) on the sphere.
+
+    The bbox corner maps to a y-UP camera ray
+    [(2x−1)·tan(H/2), (1−2y)·tan(H/2)·aspect, 1], rotated by
+    Ry(pan)·Rx(−tilt) — the warper's y-down R(pan,tilt) conjugated into y-up
+    space (using it verbatim on a y-up ray negates the tilt and mirrors
+    upper-ring objects ~70° — plan-review catch, pinned by the warper
+    consistency test). aspect = frame h/w."""
+    import math
+    th = math.tan(math.radians(IDENTIFY_HFOV / 2))
+
+    def to_lonlat(x, y):
+        cx, cy, cz = (2 * x - 1) * th, (1 - 2 * y) * th * aspect, 1.0
+        p, t = math.radians(pan), math.radians(-tilt)
+        # Rx(−tilt) then Ry(pan)
+        y1 = cy * math.cos(t) - cz * math.sin(t)
+        z1 = cy * math.sin(t) + cz * math.cos(t)
+        x2 = cx * math.cos(p) + z1 * math.sin(p)
+        z2 = -cx * math.sin(p) + z1 * math.cos(p)
+        n = math.sqrt(x2 * x2 + y1 * y1 + z2 * z2)
+        return (math.degrees(math.atan2(x2, z2)),
+                math.degrees(math.asin(y1 / n)))
+    x1, y1_, x2, y2_ = bbox
+    lon1, lat1 = to_lonlat(x1, y1_)
+    lon2, lat2 = to_lonlat(x2, y2_)
+    lon, lat = to_lonlat((x1 + x2) / 2, (y1_ + y2_) / 2)
+    dlon = abs((lon2 - lon1 + 180.0) % 360.0 - 180.0)   # wrap-safe width
+    return ((lon + 180.0) % 360.0 - 180.0, lat, dlon, abs(lat1 - lat2))
+
+
+def identify_objects(vis, frames, log=lambda m: None):
+    """PER-FRAME LLM identification over scan frames → meta dict with angular
+    positions, deduplicated across overlapping frames. Frames are visited in
+    scan order (eye ring first — where the objects are) under a wall-clock
+    budget; partial results are kept. Returns None only with zero results."""
+    objects = []
+    t0 = time.monotonic()
+    done = 0
+    for i, (pan, tilt, img) in enumerate(frames):
+        if time.monotonic() - t0 > IDENTIFY_BUDGET_S:
+            log(f"identify: budget hit after {done}/{len(frames)} frames — "
+                "keeping partial results")
+            break
+        try:
+            out = vis.describe(_shrink(img, max_w=800), IDENTIFY_PROMPT,
+                               json_out=True, max_tokens=500)
+        except Exception as e:
+            log(f"identify: frame {i} failed ({e})")
+            continue
+        done += 1
+        aspect = _frame_aspect(img)
+        for o in out.get("objects", []) if isinstance(out, dict) else []:
+            try:
+                bbox = [float(v) for v in o["bbox"]]
+                if len(bbox) != 4 or not all(0 <= v <= 1 for v in bbox):
+                    continue
+                if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+                    continue
+                lon, lat, w, h = bbox_to_angles(pan, tilt, bbox, aspect)
+                objects.append({"name": str(o.get("name", "?"))[:40].lower(),
+                                "color": str(o.get("color", ""))[:24],
+                                "lon": round(lon, 1), "lat": round(lat, 1),
+                                "w": round(w, 1), "h": round(h, 1)})
+            except (KeyError, ValueError, TypeError):
+                continue
+    objects = _dedup_objects(objects)
+    log(f"identify: {len(objects)} objects from {done} frames")
+    if not objects:
+        return None
+    return {"objects": objects, "made": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+def _dedup_objects(objects):
+    """Overlapping frames see the same physical object: same name AND color
+    within the dedup window collapses to the LARGEST box (most complete
+    view). Color participates so twin objects (two printers) survive when
+    the model distinguishes them at all."""
+    kept = []
+    for o in sorted(objects, key=lambda o: o["w"] * o["h"], reverse=True):
+        dup = False
+        for k in kept:
+            if k["name"] != o["name"] or k["color"] != o["color"]:
+                continue
+            dlon = abs((o["lon"] - k["lon"] + 180.0) % 360.0 - 180.0)
+            if dlon < IDENTIFY_DEDUP_LON and abs(o["lat"] - k["lat"]) < IDENTIFY_DEDUP_LAT:
+                dup = True
+                break
+        if not dup:
+            kept.append(o)
+    return kept
+
+
+def _frame_aspect(jpeg):
+    """h/w from JPEG bytes without cv2 (SOF scan); falls back to 9/16."""
+    i = 2
+    data = jpeg
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            h = (data[i + 5] << 8) | data[i + 6]
+            w = (data[i + 7] << 8) | data[i + 8]
+            return h / w if w else 9 / 16
+        seg = (data[i + 2] << 8) | data[i + 3]
+        i += 2 + seg
+    return 9 / 16
+
+
+def order_frames_for_identify(frames):
+    """Eye-ring first (objects live at eye level), then upper ring, ceiling
+    last — the wall-clock budget should spend itself where it matters. (A
+    naive name sort puts the upper ring FIRST: '+' < '-' in ASCII.)"""
+    return sorted(frames, key=lambda f: (abs(f[1] - SCAN_TILT), f[0]))
+
+
+def cli_identify(frames_dir, out_json):
+    """Identify objects in a frames dir → meta JSON. Exit 0 wrote / 1 skip."""
+    import sys
+    frames = []
+    for n in sorted(os.listdir(frames_dir)):
+        pt = parse_frame_name(n)
+        if pt is None:
+            continue
+        with open(os.path.join(frames_dir, n), "rb") as f:
+            frames.append((pt[0], pt[1], f.read()))
+    if not frames:
+        print("identify: no frames", file=sys.stderr)
+        return 1
+    frames = order_frames_for_identify(frames)
+    try:
+        import llm_config
+        llm_config.load_dotenv()   # controller env has no key (systemd/nohup)
+        import vision
+        vis = vision.VisionModel(timeout=60)    # single-image calls run 12-25 s
+    except Exception as e:
+        print(f"identify: vision unavailable ({e})", file=sys.stderr)
+        return 1
+    meta = identify_objects(vis, frames,
+                            log=lambda m: print("build-pano: " + m, file=sys.stderr))
+    if not meta or not meta["objects"]:
+        return 1
+    with open(out_json, "w") as f:
+        json.dump(meta, f)
+    return 0
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) in (4, 5) and sys.argv[1] == "build-pano":
         sys.exit(cli_build_pano(*sys.argv[2:]))
-    print("usage: scene.py build-pano <frames_dir> <out.jpg> [variants_dir]",
+    if len(sys.argv) == 4 and sys.argv[1] == "identify":
+        # separate subcommand: the controller runs this in its OWN subprocess
+        # after the panorama is published, so identification can never cost
+        # a successful scan
+        sys.exit(cli_identify(sys.argv[2], sys.argv[3]))
+    print("usage: scene.py build-pano <frames_dir> <out.jpg> [variants_dir]\n"
+          "       scene.py identify <frames_dir> <out_meta.json>",
           file=sys.stderr)
     sys.exit(64)

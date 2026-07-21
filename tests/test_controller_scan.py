@@ -40,6 +40,7 @@ def make_scan_app(frame=b"\xff\xd8JPEG"):
     app = rc.App(rover, move, aim, hub, rc.Camera("off", "", 0, 0, 0), tmp.name)
     app._scan_tmp = tmp                 # keep the dir alive with the app
     app.scan_settle_s = 0               # tests: no gimbal settle wait
+    app.identify_builder = None         # tests must never spawn the LLM step
     return app, link
 
 
@@ -236,6 +237,19 @@ class ScanInterlockTest(unittest.TestCase):
         self.assertTrue(gate.wait(5))
         self.assertEqual(wait_scan_end(app), "done")  # published, not failed
 
+    def test_estop_during_identify_window_keeps_done(self):
+        # the identify phase can run minutes after publish — a drive/e-stop
+        # event then must not flip the (correct) done state to failed
+        app, _ = make_scan_app()
+
+        def builder(frames):
+            self.assertTrue(app._mark_published())       # pano published
+            app.move.do_estop()                          # event lands later
+            return True
+        app.pano_builder = builder
+        self.assertTrue(app.start_scan()[0])
+        self.assertEqual(wait_scan_end(app), "done")     # not "failed"
+
     def test_cancel_before_publish_point_discards(self):
         # cancel won the race: _mark_published must refuse the publish
         app, _ = make_scan_app()
@@ -281,6 +295,9 @@ class BuilderSubprocessTest(unittest.TestCase):
                                 "scene.py")
         self.assertEqual(argv, ["nice", "-n", "10", sys.executable, scene_py,
                                 "build-pano", "/f", "/o.jpg", "/f"])
+        iargv, _ = app.identify_cmd("/f", "/m.json")
+        self.assertEqual(iargv, ["nice", "-n", "10", sys.executable, scene_py,
+                                 "identify", "/f", "/m.json"])
         for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                   "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             self.assertEqual(env[k], "1")
@@ -352,6 +369,115 @@ class BuilderSubprocessTest(unittest.TestCase):
         self.assertTrue(app._build_pano_subprocess([(0, -5, b"x")]))
         with open(os.path.join(app.photo_dir, "panorama.jpg"), "rb") as f:
             self.assertEqual(f.read(), b"PANO")    # canonical unaffected
+
+    def test_identify_meta_published_live_and_sidecar(self):
+        app = self._app()
+        os.makedirs(app.scans_dir, exist_ok=True)
+        app._last_archived = "scan_20260715_010101.jpg"
+        app.identify_builder = lambda d, m: (
+            [sys.executable, "-c",
+             f"import json;json.dump({{'objects':[{{'name':'bin','lon':1,"
+             f"'lat':2,'w':3,'h':4}}]}}, open({m!r},'w'))"], None)
+        app._identify_frames([(0, -5, b"x")])
+        live = os.path.join(app.photo_dir, "panorama.meta.json")
+        with open(live) as f:
+            self.assertEqual(json.load(f)["objects"][0]["name"], "bin")
+        sidecar = os.path.join(app.scans_dir,
+                               "scan_20260715_010101.jpg.meta.json")
+        self.assertEqual(os.stat(live).st_ino, os.stat(sidecar).st_ino)
+
+    def test_identify_failure_or_timeout_writes_nothing_no_crash(self):
+        app = self._app()
+        app.identify_builder = lambda d, m: (
+            [sys.executable, "-c", "import sys; sys.exit(1)"], None)
+        app._identify_frames([(0, -5, b"x")])
+        live = os.path.join(app.photo_dir, "panorama.meta.json")
+        self.assertFalse(os.path.exists(live))
+        old = rc.IDENTIFY_TIMEOUT_S
+        rc.IDENTIFY_TIMEOUT_S = 0.4
+        try:
+            app.identify_builder = lambda d, m: (
+                [sys.executable, "-c", "import time; time.sleep(60)"], None)
+            t0 = time.monotonic()
+            app._identify_frames([(0, -5, b"x")])
+            self.assertLess(time.monotonic() - t0, 10)
+        finally:
+            rc.IDENTIFY_TIMEOUT_S = old
+
+    def test_scan_slot_free_during_identify_and_new_scan_kills_it(self):
+        # glm N1: back-to-back scans must not be refused while the previous
+        # scan's identify is still running — and the new scan kills it
+        app, _ = make_scan_app()
+        gate = threading.Event()
+
+        def builder(frames):
+            app._mark_published()
+            return True
+        app.pano_builder = builder
+        app.identify_builder = lambda d, m: (
+            [sys.executable, "-c", "import time; time.sleep(60)"], None)
+        self.assertTrue(app.start_scan()[0])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:                # wait for identify
+            with app._pano_mu:
+                if app._identify_proc is not None:
+                    break
+            time.sleep(0.02)
+        with app._pano_mu:
+            self.assertIsNotNone(app._identify_proc)
+        ok, why = app.start_scan()                        # slot must be FREE
+        self.assertTrue(ok, why)
+        deadline = time.monotonic() + 5                   # old identify dies
+        while time.monotonic() < deadline:
+            with app._pano_mu:
+                if app._identify_proc is None:
+                    break
+            time.sleep(0.05)
+        wait_scan_end(app)
+        del gate
+
+    def test_scan_without_meta_deletes_stale_live_meta(self):
+        app = self._app()
+        os.makedirs(app.photo_dir, exist_ok=True)
+        live = os.path.join(app.photo_dir, "panorama.meta.json")
+        with open(live, "w") as f:
+            f.write('{"objects":[]}')
+        app.pano_build_cmd = lambda d, o: (
+            [sys.executable, "-c", f"open({o!r},'wb').write(b'PANO')"], None)
+        self.assertTrue(app._build_pano_subprocess([(0, -5, b"x")]))
+        self.assertFalse(os.path.exists(live))     # old boxes never linger
+
+    def test_stale_meta_gone_the_moment_the_new_pano_publishes(self):
+        # identification takes minutes — the old meta must not describe the
+        # new pano even DURING that window (full start_scan flow)
+        app, _ = make_scan_app()
+        os.makedirs(app.photo_dir, exist_ok=True)
+        live = os.path.join(app.photo_dir, "panorama.meta.json")
+        with open(live, "w") as f:
+            f.write('{"objects":[{"name":"ghost"}]}')
+        seen = {}
+
+        def identify_probe(d, m):
+            seen["meta_during_identify"] = os.path.exists(live)
+            return [sys.executable, "-c", "pass"], None
+        app.pano_build_cmd = lambda d, o: (
+            [sys.executable, "-c", f"open({o!r},'wb').write(b'PANO')"], None)
+        app.identify_builder = identify_probe
+        self.assertTrue(app.start_scan()[0])
+        self.assertEqual(wait_scan_end(app), "done")
+        deadline = time.monotonic() + 5
+        while "meta_during_identify" not in seen and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(seen["meta_during_identify"])
+
+    def test_scan_stop_mapping_and_edge(self):
+        m = rc.default_mapping()
+        self.assertEqual(m["scan_stop"], {"kind": "button", "index": 8})
+        from tests.test_controller import FakeState
+        st = FakeState(buttons={8: True})
+        prev = rc.GpPrev()
+        self.assertTrue(rc.compute_joystick(m, st, prev)["scan_stop"])
+        self.assertFalse(rc.compute_joystick(m, st, prev)["scan_stop"])
 
     def test_success_archives_a_history_copy(self):
         app = self._app()
