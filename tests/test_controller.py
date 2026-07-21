@@ -64,9 +64,11 @@ class SerialEncodingTest(unittest.TestCase):
         self.assertEqual(link.all()[-2:], ['{"L":0,"R":0,"T":1}', '{"T":0}'])
 
     def test_init_link_sequence(self):
+        # echo-off MUST precede feedback-ON so the telemetry reader never
+        # sees echoed commands (plan 026)
         link = RecLink()
         rc.init_link(link)
-        self.assertEqual(link.all(), ['{"T":143,"cmd":0}', '{"T":131,"cmd":0}',
+        self.assertEqual(link.all(), ['{"T":143,"cmd":0}', '{"T":131,"cmd":1}',
                                       '{"T":4,"cmd":2}'])
 
     def test_send_without_link_raises(self):

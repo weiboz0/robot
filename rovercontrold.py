@@ -75,6 +75,8 @@ class TTYLink:
             attrs[3] = 0                                     # lflag: raw
             attrs[4] = speed
             attrs[5] = speed
+            attrs[6][termios.VMIN] = 0                       # reads never block…
+            attrs[6][termios.VTIME] = 1                      # …longer than 100ms
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
             flags = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)  # blocking writes
@@ -85,6 +87,9 @@ class TTYLink:
 
     def write(self, data: bytes):
         os.write(self.fd, data)
+
+    def read(self, n=4096):
+        return os.read(self.fd, n)
 
     def close(self):
         try:
@@ -112,6 +117,10 @@ class Rover:
     def ok(self):
         with self._mu:
             return self._link is not None
+
+    def link(self):
+        with self._mu:
+            return self._link
 
     def status(self):
         with self._mu:
@@ -158,10 +167,156 @@ class Rover:
 
 
 def init_link(link):
-    """Boot sequence (echo off, feedback off, Gimbal module — required for
-    pan/tilt) directly on a link before it is published."""
-    for cmd in ({"T": 143, "cmd": 0}, {"T": 131, "cmd": 0}, {"T": 4, "cmd": 2}):
+    """Boot sequence directly on a link before it is published: echo off
+    FIRST (so the telemetry reader never sees echoed commands), then
+    continuous feedback ON (T:1001 telemetry for pose tracking), then the
+    Gimbal module (required for pan/tilt)."""
+    for cmd in ({"T": 143, "cmd": 0}, {"T": 131, "cmd": 1}, {"T": 4, "cmd": 2}):
         link.write((json.dumps(cmd, separators=(",", ":"), sort_keys=True) + "\n").encode())
+
+
+# ─────────────────── telemetry: pose dead reckoning ─────────────────────────
+# The ESP32 (ugv_base_ros firmware) streams {"T":1001,...} at ~5 Hz with
+# cumulative wheel odometry in CENTIMETERS (odl/odr, signed), battery
+# (v = volts×100) and servo-reported gimbal angles. The stream's raw gyro is
+# BROKEN in this firmware (at rest gz reads 4..20495, stdev ~9200 — a DMP
+# FIFO parse bug), so heading comes from DIFFERENTIAL ODOMETRY instead:
+# dθ = (Δodr − Δodl) / track_width. Pose is DISPLAY-ONLY — it never feeds
+# motion decisions, and the reader shares no locks with the drive path.
+
+ODOM_SIGN = 1.0             # flip if the live calibration drive shows reversed
+HEADING_SIGN = 1.0
+TRACK_WIDTH_M = 0.172       # firmware's own constant for this chassis
+SKID_FACTOR = 1.0           # effective-width multiplier; skid-steer scrubs in
+                            # turns, so calibrate against a real 90°/360° spin
+ODOM_MAX_STEP_CM = 50.0     # per-sample plausibility bound: beyond this it's a
+                            # counter reset/reboot → re-baseline, never integrate
+POSE_FRESH_S = 1.5          # /pose "fresh" horizon
+
+
+class Pose:
+    """Dead-reckoned x/y (m) + heading (deg, CCW+, 0 = +X at reset) from the
+    T:1001 stream, all from the wheel encoders. Signed odometry integrates
+    both directions (reverse drives x backwards); a per-sample |Δ| bound
+    re-baselines across ESP32 reboots/reconnects instead of teleporting."""
+
+    def __init__(self):
+        self._mu = threading.Lock()
+        self.x = self.y = 0.0
+        self.heading = 0.0
+        self._odl = self._odr = None      # cumulative baselines (cm)
+        self._seen = None
+        self.battery_v = None
+        self.servo_pan = self.servo_tilt = None
+
+    def rebaseline(self):
+        """Link (re)published or counter jump: hold pose, restart deltas."""
+        with self._mu:
+            self._odl = self._odr = None
+
+    def reset(self):
+        with self._mu:
+            self.x = self.y = 0.0
+            self.heading = 0.0
+
+    def update(self, odl, odr, now=None):
+        now = time.monotonic() if now is None else now
+        with self._mu:
+            self._seen = now
+            if self._odl is None:
+                self._odl, self._odr = odl, odr
+                return
+            dl, dr = odl - self._odl, odr - self._odr
+            self._odl, self._odr = odl, odr
+            if abs(dl) > ODOM_MAX_STEP_CM or abs(dr) > ODOM_MAX_STEP_CM:
+                return                    # reset/reboot: re-baselined above
+            dl, dr = ODOM_SIGN * dl / 100.0, ODOM_SIGN * dr / 100.0   # cm → m
+            dth = HEADING_SIGN * math.degrees(
+                (dr - dl) / (TRACK_WIDTH_M * SKID_FACTOR))
+            if dth:
+                self.heading = (self.heading + dth + 180.0) % 360.0 - 180.0
+            fwd = (dl + dr) / 2.0
+            if fwd:
+                rad = math.radians(self.heading)
+                self.x += fwd * math.cos(rad)
+                self.y += fwd * math.sin(rad)
+
+    def set_aux(self, battery_v, pan, tilt):
+        with self._mu:
+            if battery_v is not None:
+                self.battery_v = battery_v
+            if pan is not None:
+                self.servo_pan, self.servo_tilt = pan, tilt
+
+    def snapshot(self, now=None):
+        now = time.monotonic() if now is None else now
+        with self._mu:
+            return {"x": round(self.x, 3), "y": round(self.y, 3),
+                    "heading": round(self.heading, 1),
+                    "battery_v": self.battery_v,
+                    "fresh": self._seen is not None and now - self._seen < POSE_FRESH_S}
+
+
+def parse_feedback(line):
+    """One serial line → T:1001 fields, or None (junk / other types)."""
+    try:
+        d = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(d, dict) or d.get("T") != 1001:
+        return None
+    try:
+        return {"odl": float(d["odl"]), "odr": float(d["odr"]),
+                "v": float(d["v"]) / 100.0 if "v" in d else None,
+                "pan": float(d["pan"]) if "pan" in d else None,
+                "tilt": float(d["tilt"]) if "tilt" in d else None}
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+TELEM_BUF_MAX = 65536
+
+
+def run_telemetry(rover, pose, stop_event):
+    """Daemon reader: select() with a timeout so it can never block across
+    close_link() at shutdown; re-baselines the pose whenever the link object
+    changes (reconnect); junk and partial lines are buffered with a hard cap.
+    Touches nothing in the drive path."""
+    buf = b""
+    last_link = None
+    while not stop_event.is_set():
+        link = rover.link()
+        if link is None:
+            last_link = None
+            if stop_event.wait(0.3):
+                return
+            continue
+        if link is not last_link:
+            pose.rebaseline()
+            buf = b""
+            last_link = link
+        try:
+            r, _, _ = select.select([link.fd], [], [], 0.25)
+            if not r:
+                continue
+            chunk = link.read()
+        except (OSError, ValueError):
+            last_link = None
+            if stop_event.wait(0.3):
+                return
+            continue
+        if not chunk:
+            continue
+        buf += chunk
+        if len(buf) > TELEM_BUF_MAX:
+            buf = b""                     # flood/garbage guard
+        while b"\n" in buf:
+            raw, buf = buf.split(b"\n", 1)
+            fb = parse_feedback(raw)
+            if fb is None:
+                continue
+            pose.update(fb["odl"], fb["odr"])
+            pose.set_aux(fb["v"], fb["pan"], fb["tilt"])
 
 
 # ─────────────────── movement arbitration + watchdog ───────────────────────
@@ -581,6 +736,7 @@ class CameraAim:
 
 SAFE_PHOTO_RE = re.compile(r"^[A-Za-z0-9._-]+\.jpg$")
 DET_NAME_RE = re.compile(r"^[a-z0-9_]{1,24}$")
+SCAN_NAME_RE = re.compile(r"^scan_\d{8}_\d{6}(_\d+)?\.jpg$")
 SCAN_BUILD_TIMEOUT_S = 300.0   # stitcher subprocess hard kill
 
 
@@ -612,6 +768,8 @@ class App:
         # the actual abort/killpg itself.
         move.on_nonzero_drive = self._scan_cancel.set
         move.on_estop = self._scan_cancel.set
+        self.pose = Pose()
+        self.scans_dir = os.path.join(photo_dir, "scans")
         self.mapping = None
         self.map_source = "default"
 
@@ -802,12 +960,40 @@ class App:
             if self._scan_cancel.is_set():   # cancel landed after proc exit
                 log("scan: cancelled — result discarded, not published")
                 return False
+            pano = os.path.join(self.photo_dir, "panorama.jpg")
             try:
-                os.replace(out, os.path.join(self.photo_dir, "panorama.jpg"))
+                os.replace(out, pano)
             except OSError as e:
                 log(f"scan: could not publish panorama ({e})")
                 return False
+            try:
+                self.archive_scan(pano)      # history copy; failure is not
+            except OSError as e:             # allowed to fail the scan
+                log(f"scan: archive failed ({e}) — latest panorama unaffected")
             return True
+
+    def archive_scan(self, src):
+        """Hard-link the just-published panorama into photos/scans/ with a
+        collision-safe timestamp name. Returns the archived name."""
+        os.makedirs(self.scans_dir, exist_ok=True)
+        stamp = time.strftime("scan_%Y%m%d_%H%M%S")
+        for n in range(1000):
+            name = stamp + ("" if n == 0 else f"_{n}") + ".jpg"
+            try:
+                os.link(src, os.path.join(self.scans_dir, name))
+                return name
+            except FileExistsError:
+                continue
+        raise OSError(f"no free scan name for {stamp}*")
+
+    def list_scans(self):
+        try:
+            entries = os.listdir(self.scans_dir)
+        except OSError:
+            return []
+        names = [e for e in entries if SCAN_NAME_RE.match(e)]
+        names.sort(reverse=True)
+        return names
 
 
 class ScanCancelled(RuntimeError):
@@ -1524,6 +1710,21 @@ def make_handler(app):
                 self._json(200, {"count": len(photos),
                                  "latest": photos[0] if photos else None,
                                  "outlined": len(app.outlined_photos())})
+            elif p == "/pose":
+                # ungated on purpose: last-known pose + fresh:false is the
+                # useful answer when serial is down (badge greys out)
+                snap = app.pose.snapshot()
+                pan, tilt = app.aim.get()
+                snap.update({"ok": True, "pan": pan, "tilt": tilt})
+                self._json(200, snap)
+            elif p == "/scans":
+                self._json(200, {"scans": app.list_scans()})
+            elif p.startswith("/scans/"):
+                name = p[len("/scans/"):]
+                if not SCAN_NAME_RE.match(name):
+                    self._err(400, "bad scan name")
+                    return
+                self._serve_file(os.path.join(app.scans_dir, name), "image/jpeg")
             elif p == "/photos":
                 self._json(200, {"photos": app.list_photos(),
                                  "outlined": app.outlined_photos()})
@@ -1706,6 +1907,16 @@ def make_handler(app):
                         return
                     _quiet(lambda: os.remove(os.path.join(app.photo_dir, name)))
                     _quiet(lambda: os.remove(os.path.join(app.photo_dir, name + ".meta.json")))
+                    self._json(200, {"ok": True})
+                elif p == "/pose_reset":
+                    app.pose.reset()
+                    self._json(200, {"ok": True})
+                elif p.startswith("/delete_scan/"):
+                    name = p[len("/delete_scan/"):]
+                    if not SCAN_NAME_RE.match(name):
+                        self._err(400, "bad scan name")
+                        return
+                    _quiet(lambda: os.remove(os.path.join(app.scans_dir, name)))
                     self._json(200, {"ok": True})
                 elif p.startswith("/photo_meta/"):
                     self._post_photo_meta(p[len("/photo_meta/"):])
@@ -1968,6 +2179,8 @@ def main(argv=None):
     if args.serial:
         threading.Thread(target=open_serial_with_retry,
                          args=(rover, args.serial, stop_event), daemon=True).start()
+        threading.Thread(target=run_telemetry,
+                         args=(rover, app.pose, stop_event), daemon=True).start()
     else:
         rover.set_status(None, "disabled")
         log("serial: disabled (-serial '')")

@@ -51,6 +51,11 @@ serial down → 503. CORS is open (any page/client can call it).
 | `GET /photos/<name>` | serve a photo file |
 | `POST /delete_photo/<name>` | delete a photo |
 | `POST /scan` | start a 3D room scan (gimbal sweep → panorama built on the Pi); `409` while one runs or the wheels are moving; e-stop or any drive input aborts it |
+| `GET /scans` | `{"scans":[…]}` archived 3D scans, newest first (every successful scan is kept) |
+| `GET /scans/<name>` | serve an archived scan (`scan_YYYYmmdd_HHMMSS[_N].jpg`) |
+| `POST /delete_scan/<name>` | delete an archived scan |
+| `GET /pose` | dead-reckoned `{"x","y","heading","pan","tilt","battery_v","fresh"}` in self-set coordinates (wheel-encoder odometry; shown in the page's top-right badge); always `200` — `fresh:false` when telemetry is stale |
+| `POST /pose_reset` | set the current spot as origin (0,0), heading 0° |
 
 ### Meta
 | Method · path | Does |

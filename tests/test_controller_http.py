@@ -179,6 +179,93 @@ class ScanHTTPTest(HTTPBase):
             self.move.stop()
 
 
+class PoseHTTPTest(HTTPBase):
+    def test_pose_shape_and_reset(self):
+        for i in range(11):                     # 10 steps × 10 cm = 1 m
+            self.app.pose.update(i * 10, i * 10)
+        s, j = self.jreq("GET", "/pose")
+        self.assertEqual(s, 200)
+        for k in ("x", "y", "heading", "pan", "tilt", "battery_v", "fresh"):
+            self.assertIn(k, j)
+        self.assertAlmostEqual(j["x"], 1.0)
+        self.assertTrue(j["fresh"])
+        s, _ = self.jreq("POST", "/pose_reset")
+        self.assertEqual(s, 200)
+        s, j = self.jreq("GET", "/pose")
+        self.assertEqual((j["x"], j["y"], j["heading"]), (0, 0, 0))
+
+    def test_pose_200_not_503_when_serial_down(self):
+        rover = rc.Rover()                              # no link
+        app = rc.App(rover, rc.Movement(rover), rc.CameraAim(rover),
+                     rc.Hub(), rc.Camera("off", "", 0, 0, 0), self.tmp.name)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), rc.make_handler(app))
+        server.daemon_threads = True
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", "/pose")
+            r = c.getresponse()
+            j = json.loads(r.read())
+            c.close()
+            self.assertEqual(r.status, 200)             # NOT 503
+            self.assertFalse(j["fresh"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class ScansHTTPTest(HTTPBase):
+    def _put_scan(self, name, data=b"\xff\xd8SCAN"):
+        os.makedirs(self.app.scans_dir, exist_ok=True)
+        with open(os.path.join(self.app.scans_dir, name), "wb") as f:
+            f.write(data)
+
+    def test_list_serve_delete_flow(self):
+        self._put_scan("scan_20260712_120000.jpg")
+        self._put_scan("scan_20260712_130000_1.jpg")    # collision suffix form
+        s, j = self.jreq("GET", "/scans")
+        self.assertEqual(s, 200)
+        self.assertLess(j["scans"].index("scan_20260712_130000_1.jpg"),
+                        j["scans"].index("scan_20260712_120000.jpg"))  # newest first
+        s, data = self.req("GET", "/scans/scan_20260712_120000.jpg")
+        self.assertEqual((s, data), (200, b"\xff\xd8SCAN"))
+        s, _ = self.jreq("POST", "/delete_scan/scan_20260712_120000.jpg")
+        self.assertEqual(s, 200)
+        s, j = self.jreq("GET", "/scans")
+        self.assertNotIn("scan_20260712_120000.jpg", j["scans"])
+
+    def test_scan_content_type(self):
+        self._put_scan("scan_20260712_140000.jpg")
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/scans/scan_20260712_140000.jpg")
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.getheader("Content-Type"), "image/jpeg")
+
+    def test_traversal_and_name_rejects(self):
+        for bad in ("../panorama.jpg", "..%2Fx.jpg", "scan_2026.jpg",
+                    "scan_20260712_120000.png", "panorama.jpg",
+                    "scan_20260712_120000_.jpg"):
+            s, _ = self.req("GET", "/scans/" + bad)
+            self.assertIn(s, (400, 404), bad)
+            s, _ = self.req("POST", "/delete_scan/" + bad)
+            self.assertEqual(s, 400, bad)
+
+    def test_archive_name_matches_regex_and_photos_unpolluted(self):
+        pano = os.path.join(self.tmp.name, "panorama.jpg")
+        with open(pano, "wb") as f:
+            f.write(b"\xff\xd8P")
+        name = self.app.archive_scan(pano)
+        self.assertRegex(name, rc.SCAN_NAME_RE)
+        name2 = self.app.archive_scan(pano)             # same second → suffix
+        self.assertNotEqual(name, name2)
+        self.assertRegex(name2, rc.SCAN_NAME_RE)
+        s, j = self.jreq("GET", "/photos")              # subdir never leaks
+        self.assertNotIn(name, j["photos"])
+
+
 class PhotoHTTPTest(HTTPBase):
     def test_snapshot_photos_delete_flow(self):
         self.hub.publish(b"\xff\xd8FRAME\xff\xd9")
@@ -290,8 +377,23 @@ class PageAndHealthTest(HTTPBase):
                        "detcmp(", "det_image", "Detectors",
                        "pano_variant", "setSrc", "no result for this method",
                        "up:'camera_up'", "photo:'snapshot'", "cam:'camera_aim'",
-                       "c==='spinl'", "c==='light'", "chatbot names also work"):
+                       "c==='spinl'", "c==='light'", "chatbot names also work",
+                       # plan 026: pose badge + scan history tabs + viewer prefs
+                       'id="posebadge"', 'id="posetext"', "poseReset(",
+                       "/pose_reset", "no telemetry", "setInterval(poseTick,500)",
+                       'id="tabphotos"', 'id="tabscans"', 'id="scangrid"',
+                       "showTab(", "loadScans(", "clearAllScans(",
+                       "Clear all 3D views", "delScan(", "/delete_scan/",
+                       "pano3d(\\'/scans/", "DEFAULTS TO THE CLEAREST",
+                       "markActive(", "'#08f'", "if(!avail[mv[0]])return;"):
             self.assertIn(marker, body, marker)
+
+    def test_viewer_archived_scans_have_no_variant_buttons(self):
+        s, data = self.req("GET", "/")
+        body = data.decode()
+        # variant buttons are built only inside the if(!src) branch
+        i = body.index("if(!src){\n  VARIANTS.forEach") if "if(!src){\n  VARIANTS.forEach" in body else body.index("if(!src){")
+        self.assertGreater(body.index("VARIANTS.forEach"), i)
 
     def test_video_feed_streams_frames(self):
         self.hub.publish(b"\xff\xd8LIVE\xff\xd9")
