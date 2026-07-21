@@ -738,6 +738,7 @@ SAFE_PHOTO_RE = re.compile(r"^[A-Za-z0-9._-]+\.jpg$")
 DET_NAME_RE = re.compile(r"^[a-z0-9_]{1,24}$")
 SCAN_NAME_RE = re.compile(r"^scan_\d{8}_\d{6}(_\d+)?\.jpg$")
 SCAN_BUILD_TIMEOUT_S = 300.0   # stitcher subprocess hard kill
+PANO_VARIANT_NAMES = ("seamcut", "projector", "stitcher")  # scene.VARIANT_BUILDERS order
 
 
 def safe_photo_name(name):
@@ -911,14 +912,16 @@ class App:
 
     def pano_build_cmd(self, frames_dir, out_path):
         """argv + env for the stitcher subprocess: niced, thread-capped so the
-        build gets at most half the Pi's cores. Separate for test pinning."""
+        build gets at most half the Pi's cores. Separate for test pinning.
+        The variants dir (= frames_dir, the temp dir) makes the child build
+        ALL merge methods; the best becomes out_path (plan 027)."""
         scene_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scene.py")
         env = dict(os.environ)
         for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                   "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             env[k] = "1"
         return (["nice", "-n", "10", sys.executable, scene_py,
-                 "build-pano", frames_dir, out_path], env)
+                 "build-pano", frames_dir, out_path, frames_dir], env)
 
     def _build_pano_subprocess(self, frames):
         """cv2 runs OUT of process (own process group) so a native crash or
@@ -954,8 +957,10 @@ class App:
                     time.sleep(0.1)
                 errf.seek(0)
                 tail = errf.read()[-400:].decode("utf-8", "replace").strip()
+            if tail:                          # variant successes/failures with
+                log(f"scan: builder said: {tail}")   # reasons — always surface
             if proc.returncode != 0:
-                log(f"scan: stitcher exited {proc.returncode}: {tail}")
+                log(f"scan: stitcher exited {proc.returncode}")
                 return False
             if self._scan_cancel.is_set():   # cancel landed after proc exit
                 log("scan: cancelled — result discarded, not published")
@@ -966,6 +971,20 @@ class App:
             except OSError as e:
                 log(f"scan: could not publish panorama ({e})")
                 return False
+            # debug variants: publish this run's, delete stale ones for
+            # methods that failed this run (a button must never show a
+            # previous scan's result). Failures here never fail the scan.
+            for name in PANO_VARIANT_NAMES:
+                var = "pano_var_" + name + ".jpg"
+                src = os.path.join(td, var)
+                dst = os.path.join(self.photo_dir, var)
+                try:
+                    if os.path.exists(src):
+                        os.replace(src, dst)
+                    else:
+                        _quiet(lambda: os.remove(dst))
+                except OSError as e:
+                    log(f"scan: variant {name} publish failed ({e})")
             try:
                 self.archive_scan(pano)      # history copy; failure is not
             except OSError as e:             # allowed to fail the scan

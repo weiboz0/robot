@@ -219,7 +219,7 @@ class BuilderSubprocessTest(unittest.TestCase):
         scene_py = os.path.join(os.path.dirname(os.path.abspath(rc.__file__)),
                                 "scene.py")
         self.assertEqual(argv, ["nice", "-n", "10", sys.executable, scene_py,
-                                "build-pano", "/f", "/o.jpg"])
+                                "build-pano", "/f", "/o.jpg", "/f"])
         for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                   "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             self.assertEqual(env[k], "1")
@@ -247,6 +247,50 @@ class BuilderSubprocessTest(unittest.TestCase):
         app.pano_build_cmd = lambda d, o: (
             [sys.executable, "-c", "import sys; sys.exit(3)"], None)
         self.assertFalse(app._build_pano_subprocess([(0, -5, b"x")]))
+
+    def test_variant_names_match_scene_builders(self):
+        import scene
+        self.assertEqual(rc.PANO_VARIANT_NAMES,
+                         tuple(n for n, _ in scene.VARIANT_BUILDERS))
+
+    def test_variants_published_and_stale_deleted(self):
+        app = self._app()
+        # a previous scan's stitcher variant lingers in photo_dir
+        os.makedirs(app.photo_dir, exist_ok=True)
+        stale = os.path.join(app.photo_dir, "pano_var_stitcher.jpg")
+        with open(stale, "wb") as f:
+            f.write(b"OLD")
+
+        def cmd(d, o):
+            # this run: seamcut + projector succeed, stitcher fails
+            code = (f"open({o!r},'wb').write(b'PANO');"
+                    f"import os;d={d!r};"
+                    "open(os.path.join(d,'pano_var_seamcut.jpg'),'wb').write(b'SEAM');"
+                    "open(os.path.join(d,'pano_var_projector.jpg'),'wb').write(b'PROJ')")
+            return [sys.executable, "-c", code], None
+        app.pano_build_cmd = cmd
+        self.assertTrue(app._build_pano_subprocess([(0, -5, b"x")]))
+        with open(os.path.join(app.photo_dir, "pano_var_seamcut.jpg"), "rb") as f:
+            self.assertEqual(f.read(), b"SEAM")
+        with open(os.path.join(app.photo_dir, "pano_var_projector.jpg"), "rb") as f:
+            self.assertEqual(f.read(), b"PROJ")
+        self.assertFalse(os.path.exists(stale))   # stale button removed
+
+    def test_variant_publish_failure_does_not_fail_scan(self):
+        app = self._app()
+        os.makedirs(app.photo_dir, exist_ok=True)
+        # a DIRECTORY where the variant file should go → os.replace fails
+        os.makedirs(os.path.join(app.photo_dir, "pano_var_seamcut.jpg"))
+
+        def cmd(d, o):
+            code = (f"open({o!r},'wb').write(b'PANO');"
+                    f"import os;d={d!r};"
+                    "open(os.path.join(d,'pano_var_seamcut.jpg'),'wb').write(b'SEAM')")
+            return [sys.executable, "-c", code], None
+        app.pano_build_cmd = cmd
+        self.assertTrue(app._build_pano_subprocess([(0, -5, b"x")]))
+        with open(os.path.join(app.photo_dir, "panorama.jpg"), "rb") as f:
+            self.assertEqual(f.read(), b"PANO")    # canonical unaffected
 
     def test_success_archives_a_history_copy(self):
         app = self._app()

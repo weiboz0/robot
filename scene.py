@@ -377,23 +377,44 @@ def _seamcut_pano(frames, max_width=4096):
             masks_w.append(mask_w)
             corners.append(corner)
             sizes.append((img_w.shape[1], img_w.shape[0]))
-        comp = cv2.detail.ExposureCompensator_createDefault(
-            cv2.detail.ExposureCompensator_GAIN_BLOCKS)
-        comp.feed(corners=corners, images=imgs_w, masks=masks_w)
-        for i, (im_, m_) in enumerate(zip(imgs_w, masks_w)):
-            comp.apply(i, corners[i], im_, m_)
         # graph-cut at ~0.25 scale (standard practice): seam QUALITY is about
         # path topology, not resolution — and full-res cuts took ~5 minutes.
         SEAM_SCALE = 0.25
+        small_u8 = [cv2.resize(im, None, fx=SEAM_SCALE, fy=SEAM_SCALE,
+                               interpolation=cv2.INTER_AREA) for im in imgs_w]
+        small_masks = [cv2.resize(m, (im.shape[1], im.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST)
+                       for m, im in zip(masks_w, small_u8)]
+        small_corners = [(int(c[0] * SEAM_SCALE), int(c[1] * SEAM_SCALE)) for c in corners]
+        # exposure compensation is FED at seam scale — the full-res feed tried
+        # to allocate >12 GB on the Pi, and the resulting cv2.error silently
+        # killed seamcut on every rover scan (the 027 root cause). apply()
+        # resizes the gain maps back up to each full-res image, exactly like
+        # OpenCV's own stitching pipeline. OOM → scalar GAIN → uncompensated.
+        for kind in (cv2.detail.ExposureCompensator_GAIN_BLOCKS,
+                     cv2.detail.ExposureCompensator_GAIN):
+            try:
+                comp = cv2.detail.ExposureCompensator_createDefault(kind)
+                comp.feed(corners=small_corners, images=small_u8, masks=small_masks)
+                # compensate COPIES and commit only after every image applied —
+                # a mid-loop failure must not leave imgs_w part-compensated for
+                # the next fallback to re-compensate
+                fixed = []
+                for i, (im_, m_) in enumerate(zip(imgs_w, masks_w)):
+                    im_c = im_.copy()
+                    res = comp.apply(i, corners[i], im_c, m_)
+                    fixed.append(res if res is not None else im_c)  # 4.6: in-place
+                imgs_w = fixed
+                break
+            except (cv2.error, MemoryError):
+                continue
         small = [cv2.resize(im, None, fx=SEAM_SCALE, fy=SEAM_SCALE,
                             interpolation=cv2.INTER_AREA).astype(np.float32)
                  for im in imgs_w]
-        small_masks = [cv2.resize(m, (im.shape[1], im.shape[0]),
-                                  interpolation=cv2.INTER_NEAREST)
-                       for m, im in zip(masks_w, small)]
-        small_corners = [(int(c[0] * SEAM_SCALE), int(c[1] * SEAM_SCALE)) for c in corners]
         finder = cv2.detail_GraphCutSeamFinder("COST_COLOR")
         seams = finder.find(small, small_corners, small_masks)
+        if seams is None:                      # cv2 4.6: in-place into masks
+            seams = small_masks
         seams = [m.get() if hasattr(m, "get") else m for m in seams]
         # dilate the upscaled cut masks a little so neighbors overlap — the
         # nearest-upscale otherwise leaves 1px cracks; multiband blends overlaps
@@ -1106,8 +1127,44 @@ def parse_frame_name(name):
     return float(m.group(1)), float(m.group(2))
 
 
-def cli_build_pano(frames_dir, out_path):
-    """Read pan/tilt-named JPEGs from frames_dir, write the panorama. Exit
+VARIANT_BUILDERS = (
+    # quality order — the user-confirmed clear one first; each is a method
+    # LEAF: `projector` runs build_panorama's equirect known-pose path only
+    # (at the sparse 60° scan spacing try_stitcher=False never re-enters
+    # seamcut/stitcher), so the variants never overlap.
+    ("seamcut", _seamcut_pano),
+    ("projector", lambda fr: build_panorama(fr, try_stitcher=False)),
+    ("stitcher", _stitcher_pano),
+)
+
+
+def build_pano_variants(frames, builders=VARIANT_BUILDERS, log=lambda m: None):
+    """Run every merge method; per-builder exceptions are swallowed. Returns
+    (best, {name: jpeg}) where best is the FIRST success in quality order —
+    the canonical result is never a silently-worse fallback while a better
+    method succeeded (this is the 027 fix)."""
+    best = None
+    out = {}
+    for name, fn in builders:
+        try:
+            pano = fn(frames)
+        except Exception as e:
+            log(f"{name}: failed ({e})")
+            continue
+        if pano:
+            out[name] = pano
+            if best is None:
+                best = pano
+            log(f"{name}: {len(pano) // 1024}KB")
+        else:
+            log(f"{name}: no result")
+    return best, out
+
+
+def cli_build_pano(frames_dir, out_path, variants_dir=None):
+    """Read pan/tilt-named JPEGs from frames_dir, write the panorama. With
+    variants_dir, build ALL merge variants (writing each success as
+    pano_var_<name>.jpg there) and make the best one the main output. Exit
     codes: 0 ok, 2 no usable frames, 3 build produced nothing."""
     import sys
     import cv2
@@ -1122,7 +1179,18 @@ def cli_build_pano(frames_dir, out_path):
     if not frames:
         print("build-pano: no pan±ddd_t±dd.jpg frames in " + frames_dir, file=sys.stderr)
         return 2
-    pano = build_panorama(frames)
+    if variants_dir is None:
+        pano = build_panorama(frames)
+    else:
+        pano, variants = build_pano_variants(
+            frames, log=lambda m: print("build-pano: " + m, file=sys.stderr))
+        for name, data in variants.items():
+            try:
+                with open(os.path.join(variants_dir, "pano_var_" + name + ".jpg"), "wb") as f:
+                    f.write(data)
+            except OSError as e:               # a variant write must never cost
+                print(f"build-pano: {name}: write failed ({e})", file=sys.stderr)
+                continue                       # the canonical result
     if not pano:
         print("build-pano: stitch produced no panorama", file=sys.stderr)
         return 3
@@ -1133,7 +1201,8 @@ def cli_build_pano(frames_dir, out_path):
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) == 4 and sys.argv[1] == "build-pano":
-        sys.exit(cli_build_pano(sys.argv[2], sys.argv[3]))
-    print("usage: scene.py build-pano <frames_dir> <out.jpg>", file=sys.stderr)
+    if len(sys.argv) in (4, 5) and sys.argv[1] == "build-pano":
+        sys.exit(cli_build_pano(*sys.argv[2:]))
+    print("usage: scene.py build-pano <frames_dir> <out.jpg> [variants_dir]",
+          file=sys.stderr)
     sys.exit(64)
