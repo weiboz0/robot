@@ -43,11 +43,22 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  .prog li.run{outline:2px solid #2d6cdf}
  .prog li span{flex:1;word-break:break-all}
  .prog li button{padding:2px 7px;font-size:12px}
+ /* ── dashboard layout (plan 030): two columns wide, one column narrow ── */
+ .dash{display:grid;grid-template-columns:minmax(420px,7fr) minmax(340px,5fr);
+   gap:12px;padding:12px;max-width:1500px;margin:0 auto;align-items:start}
+ .col{display:flex;flex-direction:column;gap:12px;min-width:0}
+ .card{background:#17181c;border:1px solid #26272c;border-radius:12px;padding:10px}
+ .card .live{max-width:100%;margin:0}
+ @media(max-width:979px){.dash{grid-template-columns:1fr}}
+ /* chat */
+ #chatlog{display:flex;flex-direction:column;gap:8px;min-height:300px;
+   max-height:62vh;overflow-y:auto;padding:6px}
+ .cmsg{padding:8px 10px;border-radius:10px;max-width:88%;white-space:pre-wrap;
+   word-break:break-word;font-size:14px;line-height:1.45}
+ .cmsg.you{align-self:flex-end;background:#2d6cdf}
+ .cmsg.bot{align-self:flex-start;background:#26272c}
+ .cmsg.sys{align-self:center;background:none;color:#889;font-size:12px}
 </style></head><body>
-<div id="posebadge" style="position:fixed;top:8px;right:8px;background:rgba(0,0,0,.7);padding:6px 10px;border-radius:8px;font:12px ui-monospace,monospace;z-index:9;text-align:right">
- <span id="posetext" style="color:#667">pose: …</span>
- <button onclick="poseReset()" title="set current spot as origin (0,0), heading 0°" style="margin-left:6px;padding:2px 8px;border:0;border-radius:6px;cursor:pointer">⌂ 0,0</button>
-</div>
 <header><h1>🤖 Rover controller</h1>
  <button class="warn" onclick="cmd('estop')">⛔ E-STOP</button>
  <button onclick="snap()">📸 Snapshot</button>
@@ -57,8 +68,15 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  <span id="panostat"><small></small></span>
  <span id="gp" style="font-size:12px;color:#999">🎮 none (press a button)</span>
  <span id="health"><small>…</small></span>
+ <div id="posebadge" style="margin-left:auto;background:rgba(0,0,0,.35);padding:4px 10px;border-radius:8px;font:12px ui-monospace,monospace;text-align:right">
+  <span id="posetext" style="color:#667">pose: …</span>
+  <button onclick="poseReset()" title="set current spot as origin (0,0), heading 0°" style="margin-left:6px;padding:2px 8px;border:0;border-radius:6px;cursor:pointer">⌂ 0,0</button>
+ </div>
 </header>
-<img class="live" src="/video_feed" alt="live view">
+<div class="dash">
+<section class="col">
+<div class="card"><img class="live" src="/video_feed" alt="live view"></div>
+<div class="card">
 <div class="pads">
  <div class="pad" aria-label="drive">
   <span class="sp"></span>
@@ -124,6 +142,32 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  cam P T · center · photo · light F B (&gt;0 = on) · move L R = ONE ~0.5s pulse, not continuous ·
  note: spinl/spinr and move_* run at the speed cap here (the chatbot's spins are gentler)</small>
 </div>
+</div>
+</section>
+<section class="col">
+<div class="card">
+<div class="bar" style="justify-content:flex-start">
+ <button id="tabchat" onclick="showTab('chat')">💬 Chat</button>
+ <button id="tabphotos" onclick="showTab('photos')">📷 Photos</button>
+ <button id="tabscans" onclick="showTab('scans')">🌍 3D views</button>
+ <button id="tabprog" onclick="showTab('prog')">⚙ Program</button>
+ <button class="warn" id="clearphotos" onclick="clearAll()" style="display:none">🗑 Clear all photos</button>
+ <button class="warn" id="clearscans" onclick="clearAllScans()" style="display:none">🗑 Clear all 3D views</button>
+</div>
+<div id="chatpanel">
+ <div id="chatlog"><div class="cmsg sys">talk to the rover in plain English — or $ commands ($help)</div></div>
+ <div id="chatstat"><small>checking chatbot…</small></div>
+ <button id="chatstartbtn" onclick="chatStart()" style="display:none;width:100%">▶ start chatbot</button>
+ <form class="bar" style="margin:0;padding:8px 0 0" onsubmit="chatSend();return false">
+  <input id="chatin" type="text" autocomplete="off" spellcheck="false"
+   placeholder="e.g. what do you see? · take a photo · $status"
+   style="flex:1;min-width:160px;padding:8px;border-radius:6px;border:0">
+  <button type="submit" id="chatsendbtn">Send</button>
+ </form>
+</div>
+<div class="grid" id="gallery" style="display:none"></div>
+<div class="grid" id="scangrid" style="display:none"></div>
+<div id="progpanel" style="display:none">
 <div class="bar">
  <b>Program</b>
  <button onclick="runProgram()">▶ Run</button>
@@ -136,15 +180,11 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  <span id="progstat"><small>empty — build a sequence with ＋ Add</small></span>
 </div>
 <ol id="program" class="prog"></ol>
-<div style="max-width:640px;margin:0 auto;padding:0 12px"><small>press ■ Stop to end a running program — E-STOP halts motion but the loop keeps going</small></div>
-<div class="bar">
- <button id="tabphotos" onclick="showTab('photos')">📷 Photos</button>
- <button id="tabscans" onclick="showTab('scans')">🌍 3D views</button>
- <button class="warn" id="clearphotos" onclick="clearAll()">🗑 Clear all photos</button>
- <button class="warn" id="clearscans" onclick="clearAllScans()" style="display:none">🗑 Clear all 3D views</button>
+<div style="padding:0 12px"><small>press ■ Stop to end a running program — E-STOP halts motion but the loop keeps going · build steps with ＋ Add in the command box</small></div>
 </div>
-<div class="grid" id="gallery"></div>
-<div class="grid" id="scangrid" style="display:none"></div>
+</div>
+</section>
+</div>
 <script>
 const cmd = (c,q='')=>fetch('/'+c+(q?'?'+q:''),{method:'POST'});
 let driving=false;
@@ -466,17 +506,67 @@ async function clearAll(){const p=await(await fetch('/photos')).json();const ns=
  for(const n of ns){await fetch('/delete_photo/'+encodeURIComponent(n),{method:'POST'});}
  seen='';load();}
 
-// ── gallery tabs: Photos ⇄ 3D views (archived scans) ─────────────────────────
-let gtab='photos';
+// ── side-panel tabs: Chat | Photos | 3D views | Program (plan 030) ───────────
+let gtab='chat';
+const TAB_PANELS={chat:'chatpanel',photos:'gallery',scans:'scangrid',prog:'progpanel'};
+const TAB_BTNS={chat:'tabchat',photos:'tabphotos',scans:'tabscans',prog:'tabprog'};
 function showTab(t){gtab=t;
- document.getElementById('gallery').style.display=t==='photos'?'':'none';
- document.getElementById('scangrid').style.display=t==='scans'?'':'none';
+ for(const k in TAB_PANELS){const el=document.getElementById(TAB_PANELS[k]);
+  if(el)el.style.display=(t===k)?'':'none';}
  document.getElementById('clearphotos').style.display=t==='photos'?'':'none';
  document.getElementById('clearscans').style.display=t==='scans'?'':'none';
- const tp=document.getElementById('tabphotos'),ts=document.getElementById('tabscans');
- tp.style.background=t==='photos'?'#08f':'';tp.style.color=t==='photos'?'#fff':'';
- ts.style.background=t==='scans'?'#08f':'';ts.style.color=t==='scans'?'#fff':'';
+ for(const k in TAB_BTNS){const b=document.getElementById(TAB_BTNS[k]);
+  if(b){b.style.background=(t===k)?'#08f':'';b.style.color=(t===k)?'#fff':'';}}
  if(t==='scans')loadScans();}
+
+// ── chat panel: submit + poll against the controller's chat bridge ──────────
+let chatBusy=false;
+function chatAdd(who,text){const d=document.createElement('div');
+ d.className='cmsg '+who;d.textContent=text;
+ const log=document.getElementById('chatlog');log.appendChild(d);
+ log.scrollTop=log.scrollHeight;return d;}
+async function chatStatusTick(){try{
+ const j=await(await fetch('/chat_status')).json();
+ const up=j.ok===true;
+ const sb=document.getElementById('chatstartbtn');if(sb)sb.style.display=up?'none':'';
+ const st=document.getElementById('chatstat');if(!st)return;
+ st.innerHTML=up
+  ?'<small>🟢 chatbot up · '+(j.model?j.model:'no LLM — $ commands only')+(j.busy?' · thinking…':'')+'</small>'
+  :'<small>⚪ chatbot not running — press start</small>';
+}catch(e){}}
+async function chatSend(){
+ if(chatBusy)return;
+ const inp=document.getElementById('chatin');const t=inp.value.trim();if(!t)return;
+ inp.value='';chatAdd('you',t);chatBusy=true;
+ const think=chatAdd('sys','thinking…');
+ try{
+  const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({text:t})});
+  const j=await r.json().catch(()=>({}));
+  if(r.status===409&&j.busy){think.textContent='a turn is already running — try again in a moment';}
+  else if(!r.ok){think.textContent=j.error||'chat service not running — press start';}
+  else{
+   for(;;){await new Promise(res=>setTimeout(res,1000));
+    const pr=await fetch('/chat_poll?turn='+j.turn);
+    if(!pr.ok){think.textContent='chat error: lost the turn ('+pr.status+')';break;}
+    const pj=await pr.json();
+    if(pj.done){think.remove();chatAdd('bot',pj.reply||'(no reply)');break;}
+   }
+  }
+ }catch(e){think.textContent='chat error: '+e;}
+ chatBusy=false;}
+async function chatStart(){
+ const b=document.getElementById('chatstartbtn');
+ b.disabled=true;b.textContent='starting…';
+ try{
+  const r=await fetch('/chat_start',{method:'POST'});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok&&j.error)chatAdd('sys',j.error);
+ }catch(e){chatAdd('sys','start failed: '+e);}
+ for(let i=0;i<25;i++){await new Promise(res=>setTimeout(res,1000));
+  try{const j=await(await fetch('/chat_status')).json();
+   if(j.ok){chatAdd('sys','chatbot started — say hi');break;}}catch(e){}}
+ b.disabled=false;b.textContent='▶ start chatbot';chatStatusTick();}
 async function loadScans(){
  const j=await(await fetch('/scans')).json();
  document.getElementById('scangrid').innerHTML=(j.scans||[]).map(n=>
@@ -696,7 +786,8 @@ async function panoStat(){try{
 async function health(){try{const h=await(await fetch('/healthz')).json();
  document.getElementById('health').innerHTML='<small>serial '+(h.serial.up?'✓':'✗')+
  ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad.up?'✓':'–')+'</small>';}catch(e){}}
-setInterval(()=>{load();health();panoStat();scansTick();},2000);load();health();panoStat();initCap();renderProg();refreshSaved();
+setInterval(()=>{load();health();panoStat();scansTick();chatStatusTick();},2000);
+showTab('chat');load();health();panoStat();chatStatusTick();initCap();renderProg();refreshSaved();
 
 // ── Mac-side gamepad: Gamepad API → existing HTTP endpoints (no server change).
 // Drive is in-flight-guarded and refreshed continuously while deflected (feeds
