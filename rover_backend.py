@@ -259,6 +259,57 @@ class RoverCtl:
             return rover_camera.take_photo(wait=True, host="127.0.0.1")
         return rover_camera.take_photo(wait=True, host=self._http_host, port=self._http_port)
 
+    # ── plan 031: auto-flash support + archived-scan identification ─────────
+    # All rovercontrol-only: the flash needs a READABLE light state (healthz)
+    # and the kill switch; other backends return None/raise-not-supported and
+    # the chatbot degrades gracefully (normal photo, no light touched).
+
+    def auto_flash_allowed(self):
+        """The controller-held kill switch; True when unknowable (no switch
+        to consult ≠ forbidden — but light_state() gates actual use)."""
+        if self.backend == "rovercontrol":
+            try:
+                return self._http.get_auto_flash()
+            except (OSError, ValueError):
+                return False               # can't confirm → don't touch lights
+        return True
+
+    def get_stream_frame(self):
+        """One JPEG frame from the controller's MJPEG stream (the auto-flash
+        luma probe). Only the rovercontrol backend can serve it — elsewhere
+        raise, and photo_with_autoflash skips cleanly (light_state() already
+        gates those backends anyway). A code-review catch: this method was
+        missing and the fake rover in tests masked it."""
+        if self.backend == "rovercontrol":
+            return self._http.get_stream_frame()
+        raise OSError("no frame stream on this backend")
+
+    def light_state(self):
+        """{'head': bool, 'base': bool} from the controller, or None when the
+        backend can't report it (then auto-flash must not run — restoring an
+        unknown state is guessing)."""
+        if self.backend == "rovercontrol":
+            try:
+                return dict(self._http.healthz().get("lights") or {})
+            except (OSError, ValueError):
+                return None
+        return None
+
+    def list_scans(self):
+        if self.backend == "rovercontrol":
+            return self._http.list_scans()
+        raise RuntimeError("saved 3D scans live on the controller")
+
+    def scan_meta(self, name):
+        if self.backend == "rovercontrol":
+            return self._http.scan_meta(name)
+        raise RuntimeError("saved 3D scans live on the controller")
+
+    def identify_scan(self, name, focus=None):
+        if self.backend == "rovercontrol":
+            return self._http.identify_scan(name, focus)
+        raise RuntimeError("saved 3D scans live on the controller")
+
     def demo(self):
         # motor + camera self-test (backend-agnostic, mirrors rover_direct.demo)
         import time

@@ -283,6 +283,181 @@ class ScanInterlockTest(unittest.TestCase):
         self.assertEqual(fired, ["estop", "drive"])
 
 
+class IdentifyArchivedTest(unittest.TestCase):
+    def _app_with_scan(self, name="scan_20260716_120000.jpg"):
+        app, _ = make_scan_app()
+        os.makedirs(app.scans_dir, exist_ok=True)
+        with open(os.path.join(app.scans_dir, name), "wb") as f:
+            f.write(b"\xff\xd8PANO")
+        return app, name
+
+    def _wait_flag_clear(self, app, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with app._pano_mu:
+                if not app._ident_busy:
+                    return
+            time.sleep(0.02)
+        raise AssertionError("identify flag never released")
+
+    def test_worker_writes_sidecar_and_live_when_newest(self):
+        app, name = self._app_with_scan()
+        app.identify_pano_cmd = lambda p, o, f: (
+            [sys.executable, "-c",
+             f"import json;json.dump({{'objects':[{{'name':'books','lon':1,"
+             f"'lat':2,'w':3,'h':4}}],'made':'t1'}}, open({o!r},'w'))"], None)
+        ok, why = app.start_scan_identify(name)
+        self.assertTrue(ok, why)
+        self._wait_flag_clear(app)
+        sidecar = os.path.join(app.scans_dir, name + ".meta.json")
+        live = os.path.join(app.photo_dir, "panorama.meta.json")
+        self.assertTrue(os.path.exists(sidecar))
+        self.assertEqual(os.stat(sidecar).st_ino, os.stat(live).st_ino)
+
+    def test_commit_race_older_name_writes_sidecar_only(self):
+        # a NEWER scan archives while the LLM runs → live meta untouched
+        app, old = self._app_with_scan("scan_20260716_110000.jpg")
+        with open(os.path.join(app.scans_dir, "scan_20260716_115000.jpg"), "wb") as f:
+            f.write(b"\xff\xd8NEWER")
+        live = os.path.join(app.photo_dir, "panorama.meta.json")
+        os.makedirs(app.photo_dir, exist_ok=True)
+        with open(live, "w") as f:
+            f.write('{"objects":[],"made":"newer-scan"}')
+        app.identify_pano_cmd = lambda p, o, f: (
+            [sys.executable, "-c",
+             f"import json;json.dump({{'objects':[{{'name':'old','lon':0,"
+             f"'lat':0,'w':1,'h':1}}],'made':'old'}}, open({o!r},'w'))"], None)
+        ok, _ = app.start_scan_identify(old)
+        self.assertTrue(ok)
+        self._wait_flag_clear(app)
+        self.assertTrue(os.path.exists(
+            os.path.join(app.scans_dir, old + ".meta.json")))
+        with open(live) as f:                       # live still the newer scan's
+            self.assertIn("newer-scan", f.read())
+
+    def test_single_flight_between_paths(self):
+        app, name = self._app_with_scan()
+        gate = threading.Event()
+
+        def slow_cmd(p, o, f):
+            return [sys.executable, "-c", "import time; time.sleep(5)"], None
+        app.identify_pano_cmd = slow_cmd
+        self.assertTrue(app.start_scan_identify(name)[0])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:          # wait until flag held
+            with app._pano_mu:
+                if app._ident_busy:
+                    break
+            time.sleep(0.01)
+        ok, why = app.start_scan_identify(name)     # archived vs archived
+        self.assertFalse(ok)
+        self.assertIn("running", why)
+        # scan-time path SKIPS (never blocks) while the flag is held
+        t0 = time.monotonic()
+        app.identify_builder = lambda d, m: (
+            [sys.executable, "-c", "pass"], None)
+        app._identify_frames([(0, -5, b"x")])
+        self.assertLess(time.monotonic() - t0, 1.0)  # skipped, not queued
+        self.assertFalse(os.path.exists(
+            os.path.join(app.photo_dir, "panorama.meta.json")))
+        with app._pano_mu:                           # kill the slow worker
+            if app._identify_proc is not None:
+                import os as _os
+                import signal as _sig
+                try:
+                    _os.killpg(app._identify_proc.pid, _sig.SIGKILL)
+                except OSError:
+                    pass
+        self._wait_flag_clear(app)
+        del gate
+
+    def test_stale_scan_cancel_does_not_kill_archived_identify(self):
+        # codex catch: drive/e-stop set _scan_cancel and nothing clears it
+        # until the next scan — an archived identify must ignore it
+        app, name = self._app_with_scan()
+        app._scan_cancel.set()                       # stale event from a drive
+        app.identify_pano_cmd = lambda p, o, f: (
+            [sys.executable, "-c",
+             "import time; time.sleep(0.5); "
+             f"import json;json.dump({{'objects':[{{'name':'x','lon':0,"
+             f"'lat':0,'w':1,'h':1}}],'made':'t'}}, open({o!r},'w'))"], None)
+        self.assertTrue(app.start_scan_identify(name)[0])
+        self._wait_flag_clear(app)
+        self.assertTrue(os.path.exists(
+            os.path.join(app.scans_dir, name + ".meta.json")))   # NOT killed
+
+    def test_flag_released_when_mkdtemp_fails(self):
+        import tempfile as _tf
+        app, _ = make_scan_app()
+        orig = _tf.mkdtemp
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+        _tf.mkdtemp = boom
+        try:
+            app.identify_builder = lambda d, m: ([sys.executable, "-c", "pass"], None)
+            app._identify_frames([(0, -5, b"x")])    # must not raise or wedge
+        finally:
+            _tf.mkdtemp = orig
+        with app._pano_mu:
+            self.assertFalse(app._ident_busy)        # flag released
+
+    def test_flag_released_on_worker_failure(self):
+        app, name = self._app_with_scan()
+        app.identify_pano_cmd = lambda p, o, f: (
+            [sys.executable, "-c", "import sys; sys.exit(1)"], None)
+        self.assertTrue(app.start_scan_identify(name)[0])
+        self._wait_flag_clear(app)                   # released despite no meta
+        self.assertTrue(app.start_scan_identify(name)[0])   # reusable
+        self._wait_flag_clear(app)
+
+    def test_missing_scan_404_reason(self):
+        app, _ = make_scan_app()
+        ok, why = app.start_scan_identify("scan_20990101_000000.jpg")
+        self.assertFalse(ok)
+        self.assertIn("no such scan", why)
+
+    def test_focus_reaches_cmd(self):
+        app, name = self._app_with_scan()
+        seen = {}
+
+        def cmd(p, o, f):
+            seen["focus"] = f
+            return [sys.executable, "-c", "pass"], None
+        app.identify_pano_cmd = cmd
+        self.assertTrue(app.start_scan_identify(name, "stack of books")[0])
+        self._wait_flag_clear(app)
+        self.assertEqual(seen["focus"], "stack of books")
+
+    def test_identify_pano_cmd_pin(self):
+        app, _ = make_scan_app()
+        argv, _ = app.identify_pano_cmd("/s.jpg", "/m.json", "books")
+        self.assertEqual(argv[:3], ["nice", "-n", "10"])
+        self.assertIn("scene.py", argv[4])
+        self.assertEqual(argv[5:], ["identify-pano", "/s.jpg", "/m.json", "books"])
+
+
+class AutoFlashFlagTest(unittest.TestCase):
+    def test_default_on_even_without_photo_dir(self):
+        app, _ = make_scan_app()
+        import shutil
+        shutil.rmtree(app.photo_dir, ignore_errors=True)   # fresh deploy
+        self.assertTrue(app.auto_flash_on())
+
+    def test_off_persists_across_app_instances(self):
+        app, _ = make_scan_app()
+        import shutil
+        shutil.rmtree(app.photo_dir, ignore_errors=True)
+        app.set_auto_flash(False)                    # creates the dir + marker
+        self.assertFalse(app.auto_flash_on())
+        rover = rc.Rover()
+        app2 = rc.App(rover, rc.Movement(rover), rc.CameraAim(rover),
+                      rc.Hub(), rc.Camera("off", "", 0, 0, 0), app.photo_dir)
+        self.assertFalse(app2.auto_flash_on())       # marker survived
+        app2.set_auto_flash(True)
+        self.assertTrue(app.auto_flash_on())
+
+
 class BuilderSubprocessTest(unittest.TestCase):
     def _app(self):
         app, _ = make_scan_app()

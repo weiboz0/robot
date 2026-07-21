@@ -453,6 +453,17 @@ def build_tools(rover, arm):
              "description": "Recall the most recent 360° scene memory (use when asked about "
                             "the surroundings and no scan result is in the conversation).",
              "parameters": {"type": "object", "properties": {}}},
+            {"name": "rover_identify_scan",
+             "description": "Identify objects in a SAVED 3D scan and add "
+                            "labeled boxes to its viewer. which=1 is the "
+                            "NEWEST scan, which=2 the second-newest (so 'the "
+                            "2nd last 3D view' means which=2), and so on. "
+                            "Optional focus names something specific to look "
+                            "for (e.g. 'stack of books'). Takes a few "
+                            "minutes; returns the list of boxed objects.",
+             "parameters": {"type": "object", "properties": {
+                 "which": {"type": "integer"},
+                 "focus": {"type": "string"}}, "required": ["which"]}},
             {"name": "rover_find_object",
              "description": "Physically search for an object: the rover autonomously scans, "
                             "drives toward it in small safe steps, stops when found, and returns "
@@ -501,7 +512,38 @@ def run_tool(rover, arm, name, a):
                 rover.oled_default(); return "oled restored"
             rover.oled(a.get("line", 0), txt); return "oled updated"
         if name == "rover_photo":
-            p = rover.photo(); return f"photo saved to {p}" if p else "photo failed (camera busy?)"
+            p, flashed, restore_failed = photo_with_autoflash(rover)
+            note = " (dark — used the flashlight)" if flashed else ""
+            if restore_failed:
+                note += "; note: the lights may still be on (restore failed)"
+            return f"photo saved to {p}{note}" if p else f"photo failed (camera busy?){note}"
+        if name == "rover_identify_scan":
+            which = int(a.get("which", 1))
+            focus = (a.get("focus") or "").strip() or None
+            try:
+                names = rover.list_scans()
+            except Exception as e:
+                return f"cannot reach saved scans: {e}"
+            if not names:
+                return "no saved 3D scans yet — run a scan first"
+            if not 1 <= which <= len(names):
+                return f"which={which} is out of range — there are {len(names)} saved scans"
+            name_ = names[which - 1]
+            before = (rover.scan_meta(name_) or {}).get("made")
+            try:
+                rover.identify_scan(name_, focus)
+            except Exception as e:
+                return f"identify refused: {e}"
+            deadline = time.time() + 360           # holds this chat turn; accepted
+            while time.time() < deadline:
+                time.sleep(5)
+                meta = rover.scan_meta(name_)
+                if meta and meta.get("made") != before:
+                    found = sorted({o["name"] for o in meta.get("objects", [])})
+                    return (f"added boxes to {name_}: " + ", ".join(found)
+                            + " — open it in the 3D views tab")
+            return (f"identification of {name_} is still running (or found "
+                    "nothing new) — check the 3D views tab in a minute")
         if name == "rover_center_camera":
             rover.center(); return "camera centered"
         if name == "rover_gimbal_torque":
@@ -597,6 +639,53 @@ def trim_history(messages, limit=MAX_HISTORY):
         tail = []
     messages[:] = messages[:1] + tail
     return messages
+
+
+DARK_MEAN = 55.0            # 0..255 mean luma; below this the flash kicks in
+
+
+def _frame_mean(jpeg):
+    """Mean luma of a JPEG, or None (no cv2 / undecodable) — a None must
+    always mean 'do not touch the lights'."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_GRAYSCALE)
+    return float(img.mean()) if img is not None else None
+
+
+def photo_with_autoflash(rover):
+    """Take a photo; if the scene is dark AND the kill switch allows it AND
+    the prior light state is readable, flash the lights and restore the
+    EXACT prior state afterwards (finally-guaranteed). Returns
+    (path, flashed, restore_failed)."""
+    flashed = False
+    prior = None
+    try:
+        prior_state = rover.light_state()          # None → unknowable → skip
+        if prior_state is not None and rover.auto_flash_allowed():
+            frame = rover.get_stream_frame()
+            mean = _frame_mean(frame)
+            if mean is not None and mean < DARK_MEAN:
+                prior = prior_state
+                rover.lights(255, 255)
+                flashed = True
+                time.sleep(0.8)                    # let auto-exposure settle
+    except Exception:
+        flashed, prior = False, None               # measuring never blocks a photo
+    restore_failed = False
+    try:
+        path = rover.photo()
+    finally:
+        if flashed:
+            try:
+                rover.lights(255 if prior.get("head") else 0,
+                             255 if prior.get("base") else 0)
+            except Exception:
+                restore_failed = True
+    return path, flashed, restore_failed
 
 
 HELP_TEXT = (

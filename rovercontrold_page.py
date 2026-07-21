@@ -106,6 +106,7 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  <button onclick="cmd('light_base')">base light</button>
  <button onclick="cmd('gimbal_relax')">relax gimbal</button>
  <button onclick="cmd('gimbal_lock')">lock gimbal</button>
+ <button id="autoflashbtn" onclick="toggleAutoFlash()" title="when OFF, the chatbot may never turn lights on automatically">🔦 auto-flash …</button>
  <label>speed cap <input id="cap" type="range" min="0" max="0.5" step="0.01" value="0.25"
    oninput="document.getElementById('capNum').value=this.value" onchange="setCap(this.value)">
   <input id="capNum" type="number" min="0" max="0.5" step="0.01" value="0.25"
@@ -571,8 +572,26 @@ async function loadScans(){
  const j=await(await fetch('/scans')).json();
  document.getElementById('scangrid').innerHTML=(j.scans||[]).map(n=>
   '<figure><a href="/scans/'+n+'" onclick="pano3d(\'/scans/'+n+'\');return false"><img loading="lazy" src="/scans/'+n+'"></a>'+
-  '<figcaption><span>'+n+'</span><button class="warn" onclick="delScan(\''+n+'\')">del</button></figcaption></figure>').join('')
+  '<figcaption><span>'+n+'</span>'+
+  '<button onclick="identifyScan(this,\''+n+'\')" title="find objects in this saved view and add boxes">🔍</button>'+
+  '<button class="warn" onclick="delScan(\''+n+'\')">del</button></figcaption></figure>').join('')
   ||'<small style="grid-column:1/-1;text-align:center">no 3D views saved yet — press Start on the gamepad or run a scan</small>';}
+async function identifyScan(btn,n){
+ btn.disabled=true;btn.textContent='…';
+ try{
+  // baseline BEFORE submitting — a fast worker must not outrun the read
+  let before=null;
+  try{const m=await fetch('/scan_meta/'+n);if(m.ok)before=(await m.json()).made;}catch(e){}
+  const r=await fetch('/scan_identify/'+n,{method:'POST'});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){btn.textContent='🔍';btn.disabled=false;cout('✗ '+(j.error||'identify failed'));return;}
+  // poll the sidecar until its made-stamp changes (bounded ~6 min)
+  for(let i=0;i<72;i++){await new Promise(res=>setTimeout(res,5000));
+   try{const m=await fetch('/scan_meta/'+n);
+    if(m.ok){const meta=await m.json();
+     if(meta.made!==before){cout('✓ boxes added to '+n+' ('+meta.objects.length+' objects)');break;}}}catch(e){}}
+ }catch(e){cout('✗ identify: '+e);}
+ btn.textContent='🔍';btn.disabled=false;}
 async function delScan(n){await fetch('/delete_scan/'+n,{method:'POST'});loadScans();}
 let scansSeen='';
 async function scansTick(){                 // 3D-views tab auto-refresh
@@ -598,6 +617,17 @@ async function poseTick(){try{
 }catch(e){}}
 async function poseReset(){await fetch('/pose_reset',{method:'POST'});poseTick();}
 async function scanCancel(){await fetch('/scan_cancel',{method:'POST'});panoStat();}
+// ── auto-flash kill switch: OFF forbids the chatbot's automatic flashlight ──
+function paintAutoFlash(on){const b=document.getElementById('autoflashbtn');
+ if(!b)return;b.textContent='🔦 auto-flash '+(on?'ON':'OFF');
+ b.style.background=on?'':'#555';}
+async function autoFlashTick(){try{
+ const j=await(await fetch('/auto_flash')).json();paintAutoFlash(j.on);}catch(e){}}
+async function toggleAutoFlash(){try{
+ const cur=await(await fetch('/auto_flash')).json();
+ const j=await(await fetch('/auto_flash?on='+(cur.on?0:1),{method:'POST'})).json();
+ paintAutoFlash(j.on);cout('auto-flash '+(j.on?'enabled':'disabled — the chatbot cannot turn lights on by itself'));
+}catch(e){}}
 setInterval(poseTick,500);poseTick();
 
 // ── speed cap: slider + number input + live value, synced from the server ────
@@ -786,8 +816,8 @@ async function panoStat(){try{
 async function health(){try{const h=await(await fetch('/healthz')).json();
  document.getElementById('health').innerHTML='<small>serial '+(h.serial.up?'✓':'✗')+
  ' · cam '+(h.camera.up?'✓':'✗')+' · pad '+(h.gamepad.up?'✓':'–')+'</small>';}catch(e){}}
-setInterval(()=>{load();health();panoStat();scansTick();chatStatusTick();},2000);
-showTab('chat');load();health();panoStat();chatStatusTick();initCap();renderProg();refreshSaved();
+setInterval(()=>{load();health();panoStat();scansTick();chatStatusTick();autoFlashTick();},2000);
+showTab('chat');load();health();panoStat();chatStatusTick();autoFlashTick();initCap();renderProg();refreshSaved();
 
 // ── Mac-side gamepad: Gamepad API → existing HTTP endpoints (no server change).
 // Drive is in-flight-guarded and refreshed continuously while deflected (feeds

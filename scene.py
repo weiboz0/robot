@@ -1306,11 +1306,12 @@ def identify_objects(vis, frames, log=lambda m: None):
     return {"objects": objects, "made": time.strftime("%Y-%m-%dT%H:%M:%S")}
 
 
-def _dedup_objects(objects):
+def _dedup_objects(objects, lon_win=IDENTIFY_DEDUP_LON, lat_win=IDENTIFY_DEDUP_LAT):
     """Overlapping frames see the same physical object: same name AND color
     within the dedup window collapses to the LARGEST box (most complete
     view). Color participates so twin objects (two printers) survive when
-    the model distinguishes them at all."""
+    the model distinguishes them at all. The pano-strip path passes a wider
+    window (warped duplicates land farther apart than flat-frame ones)."""
     kept = []
     for o in sorted(objects, key=lambda o: o["w"] * o["h"], reverse=True):
         dup = False
@@ -1318,12 +1319,132 @@ def _dedup_objects(objects):
             if k["name"] != o["name"] or k["color"] != o["color"]:
                 continue
             dlon = abs((o["lon"] - k["lon"] + 180.0) % 360.0 - 180.0)
-            if dlon < IDENTIFY_DEDUP_LON and abs(o["lat"] - k["lat"]) < IDENTIFY_DEDUP_LAT:
+            if dlon < lon_win and abs(o["lat"] - k["lat"]) < lat_win:
                 dup = True
                 break
         if not dup:
             kept.append(o)
     return kept
+
+
+# ─────────────── identify objects in an ARCHIVED pano (plan 031) ─────────────
+# The scan frames are gone, but the archived panorama is what the viewer
+# renders — boxes are placed in the VIEWER'S OWN mapping, which is exact for
+# every pano shape (incl. non-2:1 stitcher crops): lon spans the full width,
+# lat spans the aspect-derived vspan the shader uses.
+
+STRIP_W_DEG = 90.0            # per-LLM-call strip width
+STRIP_STEP_DEG = 60.0         # 6 strips cover 360° with 30° overlap
+IDENTIFY_PANO_DEDUP_LON = 25.0   # wider than the flat-frame windows: warped
+IDENTIFY_PANO_DEDUP_LAT = 18.0   # duplicates land farther apart (tuning risk)
+
+
+def pano_vspan_deg(h, w):
+    """The vertical span the 3D viewer assigns this pano (shader: vspan =
+    min(pi, 2*pi*h/w)) — matching it makes box placement viewer-exact."""
+    return min(180.0, 360.0 * h / w) if w else 180.0
+
+
+def strip_bbox_to_angles(lon_left, bbox, vspan_deg):
+    """bbox fractions within a full-height strip starting at lon_left →
+    (lon, lat, w, h) in viewer coordinates. Equirect ⇒ linear is exact."""
+    x1, y1, x2, y2 = bbox
+    lon = lon_left + (x1 + x2) / 2.0 * STRIP_W_DEG
+    lat = (0.5 - (y1 + y2) / 2.0) * vspan_deg
+    return ((lon + 180.0) % 360.0 - 180.0, lat,
+            (x2 - x1) * STRIP_W_DEG, (y2 - y1) * vspan_deg)
+
+
+def identify_equirect(vis, pano_jpeg, focus=None, log=lambda m: None):
+    """Per-strip LLM identification over an archived panorama → meta dict in
+    viewer coordinates. Returns None only with zero results."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        log("identify-pano: opencv unavailable")
+        return None
+    img = cv2.imdecode(np.frombuffer(pano_jpeg, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        log("identify-pano: pano did not decode")
+        return None
+    H, W = img.shape[:2]
+    vspan = pano_vspan_deg(H, W)
+    prompt = IDENTIFY_PROMPT + (
+        f" Be sure to include, if visible: {focus}." if focus else "")
+    objects = []
+    t0 = time.monotonic()
+    done = 0
+    n_strips = int(round(360.0 / STRIP_STEP_DEG))
+    strip_px = max(1, int(round(STRIP_W_DEG / 360.0 * W)))
+    for i in range(n_strips):
+        if time.monotonic() - t0 > IDENTIFY_BUDGET_S:
+            log(f"identify-pano: budget hit after {done}/{n_strips} strips — "
+                "keeping partial results")
+            break
+        lon_left = -180.0 + i * STRIP_STEP_DEG
+        x0 = int(round((lon_left + 180.0) / 360.0 * W)) % W
+        x1 = x0 + strip_px
+        if x1 <= W:
+            strip = img[:, x0:x1]
+        else:                              # the ±180 seam: the pano is cyclic
+            strip = np.hstack([img[:, x0:], img[:, :x1 - W]])
+        ok, buf = cv2.imencode(".jpg", strip, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            continue
+        try:
+            out = vis.describe(_shrink(buf.tobytes(), max_w=800), prompt,
+                               json_out=True, max_tokens=500)
+        except Exception as e:
+            log(f"identify-pano: strip {i} failed ({e})")
+            continue
+        done += 1
+        for o in out.get("objects", []) if isinstance(out, dict) else []:
+            try:
+                bbox = [float(v) for v in o["bbox"]]
+                if len(bbox) != 4 or not all(0 <= v <= 1 for v in bbox):
+                    continue
+                if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+                    continue
+                lon, lat, w, h = strip_bbox_to_angles(lon_left, bbox, vspan)
+                objects.append({"name": str(o.get("name", "?"))[:40].lower(),
+                                "color": str(o.get("color", ""))[:24],
+                                "lon": round(lon, 1), "lat": round(lat, 1),
+                                "w": round(w, 1), "h": round(h, 1)})
+            except (KeyError, ValueError, TypeError):
+                continue
+    objects = _dedup_objects(objects, lon_win=IDENTIFY_PANO_DEDUP_LON,
+                             lat_win=IDENTIFY_PANO_DEDUP_LAT)
+    log(f"identify-pano: {len(objects)} objects from {done} strips")
+    if not objects:
+        return None
+    return {"objects": objects, "made": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+def cli_identify_pano(pano_path, out_json, focus=None):
+    """Identify objects in an archived pano → meta JSON. 0 wrote / 1 skip."""
+    import sys
+    try:
+        with open(pano_path, "rb") as f:
+            jpeg = f.read()
+    except OSError as e:
+        print(f"identify-pano: {e}", file=sys.stderr)
+        return 1
+    try:
+        import llm_config
+        llm_config.load_dotenv()
+        import vision
+        vis = vision.VisionModel(timeout=60)
+    except Exception as e:
+        print(f"identify-pano: vision unavailable ({e})", file=sys.stderr)
+        return 1
+    meta = identify_equirect(vis, jpeg, focus=focus,
+                             log=lambda m: print(m, file=sys.stderr))
+    if not meta or not meta["objects"]:
+        return 1
+    with open(out_json, "w") as f:
+        json.dump(meta, f)
+    return 0
 
 
 def _frame_aspect(jpeg):
@@ -1391,7 +1512,11 @@ if __name__ == "__main__":
         # after the panorama is published, so identification can never cost
         # a successful scan
         sys.exit(cli_identify(sys.argv[2], sys.argv[3]))
+    if len(sys.argv) >= 4 and sys.argv[1] == "identify-pano":
+        focus = " ".join(sys.argv[4:]).strip() or None
+        sys.exit(cli_identify_pano(sys.argv[2], sys.argv[3], focus))
     print("usage: scene.py build-pano <frames_dir> <out.jpg> [variants_dir]\n"
-          "       scene.py identify <frames_dir> <out_meta.json>",
+          "       scene.py identify <frames_dir> <out_meta.json>\n"
+          "       scene.py identify-pano <pano.jpg> <out_meta.json> [focus…]",
           file=sys.stderr)
     sys.exit(64)

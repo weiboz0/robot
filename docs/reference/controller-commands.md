@@ -63,6 +63,8 @@ serial down → 503. CORS is open (any page/client can call it).
 | `POST /chat_start` | launch the chat service detached (logs → `~/rover-chat.log`); `409` if already up |
 | `GET /pano_meta` | objects identified in the live panorama `{"objects":[{name,color,lon,lat,w,h}]}` (404 if none) |
 | `GET /scan_meta/<name>` | objects identified in an archived scan (the 3D viewer draws these as boxes; `boxes on|off|all|<names>` in the web command box controls them) |
+| `POST /scan_identify/<name>[?focus=…]` | identify objects in a SAVED scan (202; runs in the background; 🔍 button per scan card; the chatbot's `rover_identify_scan` tool uses it — "add a box for the books on the 2nd-last 3D view") |
+| `GET/POST /auto_flash[?on=0\|1]` | the chatbot auto-flashlight kill switch (🔦 button); when off, the chatbot may never enable lights automatically; persists across restarts |
 
 ### Meta
 | Method · path | Does |
