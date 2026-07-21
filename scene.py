@@ -1086,3 +1086,54 @@ def load_latest_scene(scenes_dir=SCENES_DIR):
             except (OSError, json.JSONDecodeError):
                 continue
     return None, None
+
+
+# ───────────────────────────── build-pano CLI ───────────────────────────────
+# Used by rovercontrold's gamepad scan: the controller writes frames to a dir
+# and stitches OUT of process so cv2 can never crash the safety controller.
+# (This block must stay at the true end of the file — earlier duplicate defs
+# are last-wins, and the CLI needs the winning definitions.)
+
+FRAME_NAME_RE_ = r"^pan([+-]\d{3,4})_t([+-]\d{2,3})\.jpg$"
+
+
+def parse_frame_name(name):
+    """Inverse of save_scene's pan±ddd_t±dd.jpg naming → (pan, tilt) or None."""
+    import re
+    m = re.match(FRAME_NAME_RE_, name)
+    if not m:
+        return None
+    return float(m.group(1)), float(m.group(2))
+
+
+def cli_build_pano(frames_dir, out_path):
+    """Read pan/tilt-named JPEGs from frames_dir, write the panorama. Exit
+    codes: 0 ok, 2 no usable frames, 3 build produced nothing."""
+    import sys
+    import cv2
+    cv2.setNumThreads(2)                   # controller shares the Pi's 4 cores
+    frames = []
+    for n in sorted(os.listdir(frames_dir)):
+        pt = parse_frame_name(n)
+        if pt is None:
+            continue
+        with open(os.path.join(frames_dir, n), "rb") as f:
+            frames.append((pt[0], pt[1], f.read()))
+    if not frames:
+        print("build-pano: no pan±ddd_t±dd.jpg frames in " + frames_dir, file=sys.stderr)
+        return 2
+    pano = build_panorama(frames)
+    if not pano:
+        print("build-pano: stitch produced no panorama", file=sys.stderr)
+        return 3
+    with open(out_path, "wb") as f:
+        f.write(pano)
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 4 and sys.argv[1] == "build-pano":
+        sys.exit(cli_build_pano(sys.argv[2], sys.argv[3]))
+    print("usage: scene.py build-pano <frames_dir> <out.jpg>", file=sys.stderr)
+    sys.exit(64)
