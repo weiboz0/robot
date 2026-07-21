@@ -450,6 +450,7 @@ async function poseTick(){try{
   (p.battery_v?' 🔋'+p.battery_v.toFixed(1)+'V':'');
 }catch(e){}}
 async function poseReset(){await fetch('/pose_reset',{method:'POST'});poseTick();}
+async function scanCancel(){await fetch('/scan_cancel',{method:'POST'});panoStat();}
 setInterval(poseTick,500);poseTick();
 
 // ── speed cap: slider + number input + live value, synced from the server ────
@@ -614,7 +615,9 @@ const PANO_LABELS={scanning:'📷 scanning the room…',recording:'🎥 recordin
 async function panoStat(){try{
  const j=await(await fetch('/pano_status')).json();
  const el=document.getElementById('panostat');if(!el)return;
- if(PANO_LABELS[j.state])el.innerHTML='<small>'+PANO_LABELS[j.state]+'</small>';
+ if(PANO_LABELS[j.state])el.innerHTML='<small>'+PANO_LABELS[j.state]+'</small>'+
+  ((j.state==='scanning'||j.state==='stitching')?
+   ' <button class="warn" id="scanstop" onclick="scanCancel()" title="stop the 3D scan and discard it" style="padding:2px 8px;font-size:11px">⏹ stop</button>':'');
  else if(j.state==='done'&&j.age_s>=0&&j.age_s<60)el.innerHTML='<small>✅ 3D view updated</small>';
  else if(j.state==='failed'&&j.age_s>=0&&j.age_s<60)el.innerHTML='<small>⚠ 3D view failed</small>';
  else el.textContent='';
