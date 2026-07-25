@@ -276,3 +276,16 @@ def identify_scan(name: str, focus: str = None, timeout: float = 5.0) -> None:
     HTTPError on 409 (busy) / 404 so callers can report it."""
     q = ("?focus=" + urllib.parse.quote(focus)) if focus else ""
     _post("/scan_identify/" + urllib.parse.quote(name) + q, timeout=timeout)
+
+
+def get_objects(timeout: float = 3.0) -> list:
+    """GET /objects → all object sightings across pose-stamped scans,
+    newest scan first (plan 033)."""
+    with urllib.request.urlopen(_base() + "/objects", timeout=timeout) as r:
+        return json.loads(r.read().decode()).get("objects", [])
+
+
+def get_pose(timeout: float = 3.0) -> dict:
+    """GET /pose → current dead-reckoned pose dict (x, y, heading, fresh…)."""
+    with urllib.request.urlopen(_base() + "/pose", timeout=timeout) as r:
+        return json.loads(r.read().decode())

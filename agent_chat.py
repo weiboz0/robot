@@ -464,6 +464,16 @@ def build_tools(rover, arm):
              "parameters": {"type": "object", "properties": {
                  "which": {"type": "integer"},
                  "focus": {"type": "string"}}, "required": ["which"]}},
+            {"name": "rover_where_is",
+             "description": "Where was an object last seen? Searches the "
+                            "object memory built from all saved 3D scans and "
+                            "answers with which scan saw it, from where, and "
+                            "how far to turn from the rover's CURRENT heading "
+                            "to face it. Never moves the rover. Use for "
+                            "'where is the suitcase?'-style questions about "
+                            "things seen before.",
+             "parameters": {"type": "object", "properties": {
+                 "name": {"type": "string"}}, "required": ["name"]}},
             {"name": "rover_find_object",
              "description": "Physically search for an object: the rover autonomously scans, "
                             "drives toward it in small safe steps, stops when found, and returns "
@@ -492,6 +502,34 @@ def build_tools(rover, arm):
                  "required": ["x", "y", "z", "r"]}},
         ]
     return [{"type": "function", "function": t} for t in tools]
+
+
+def relative_turn(bearing, heading):
+    """Human turn phrase (plan 033): both angles CCW-positive, so a positive
+    delta means the target is to the LEFT of the current heading."""
+    d = (bearing - heading + 180.0) % 360.0 - 180.0
+    if abs(d) <= 10:
+        return "roughly ahead"
+    return f"~{abs(round(d))}° {'left' if d > 0 else 'right'}"
+
+
+def _match_objects(objs, query):
+    """Tiered fuzzy match over object sightings: exact name → substring
+    (queries ≥4 chars only — 'car' must not ghost-match 'cardboard') →
+    shared word ≥4 chars. First tier with hits wins; order preserved
+    (newest scan first)."""
+    q = query.strip().lower()
+    named = [(o, str(o.get("name", "")).strip().lower()) for o in objs]
+    exact = [o for o, n in named if n == q]
+    if exact:
+        return exact
+    if len(q) >= 4:
+        sub = [o for o, n in named if q in n or (len(n) >= 4 and n in q)]
+        if sub:
+            return sub
+    qw = {w for w in q.split() if len(w) >= 4}
+    return [o for o, n in named
+            if qw & {w for w in n.split() if len(w) >= 4}]
 
 
 def run_tool(rover, arm, name, a):
@@ -544,6 +582,50 @@ def run_tool(rover, arm, name, a):
                             + " — open it in the 3D views tab")
             return (f"identification of {name_} is still running (or found "
                     "nothing new) — check the 3D views tab in a minute")
+        if name == "rover_where_is":
+            query = str(a.get("name", "")).strip()
+            if not query:
+                return "rover_where_is needs an object name"
+            try:
+                objs = rover.get_objects()
+            except Exception as e:
+                return f"cannot reach the object memory: {e}"
+            if not objs:
+                return ("the object memory is empty — only scans made after "
+                        "pose tracking record places; run a scan, then ask "
+                        "again")
+            matches = _match_objects(objs, query)
+            if not matches:
+                return (f"no memory of a '{query}' in any saved 3D view — "
+                        "try another name, run a new scan, or identify a "
+                        "saved view with rover_identify_scan")
+            best = matches[0]
+            scans_seen = list(dict.fromkeys(o["scan"] for o in objs))
+            nth = scans_seen.index(best["scan"]) + 1
+            p = best["pose"]
+            out = (f"'{best['name']}' was seen in 3D view #{nth} (newest=1; "
+                   f"{best['scan']}, made {best.get('made') or '?'}) from "
+                   f"position ({p['x']:.2f}, {p['y']:.2f}); it lies toward "
+                   f"world bearing {best['bearing']:.0f}°")
+            try:
+                cur = rover.get_pose()
+            except Exception:
+                cur = None
+            if cur and cur.get("fresh") and isinstance(
+                    cur.get("heading"), (int, float)):
+                out += (f" — from the current heading turn "
+                        f"{relative_turn(best['bearing'], cur['heading'])} "
+                        "to face it")
+            else:
+                out += " (current heading unknown — telemetry stale)"
+            others = matches[1:]
+            if others:
+                same = sum(1 for m in others if m["scan"] == best["scan"])
+                older = len(others) - same
+                extra = ([f"{same} more in the same view"] if same else []) \
+                    + ([f"{older} in older views"] if older else [])
+                out += " (also: " + ", ".join(extra) + ")"
+            return out
         if name == "rover_center_camera":
             rover.center(); return "camera centered"
         if name == "rover_gimbal_torque":
@@ -698,6 +780,8 @@ HELP_TEXT = (
     "  (note: drive/fwd/back keep CHATBOT units here — seconds, speeds -0.5..0.5)\n"
     "autonomous:   find <object> / screwdriver / pen  (drives itself, stops +\n"
     "  photographs when it sees the target; needs ROVER_FIND_ENABLE=1 + vision key)\n"
+    "memory:       ask 'where is the <object>?' — recalls it from saved 3D\n"
+    "  scans and points relative to the current heading (never moves)\n"
     "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
 
 

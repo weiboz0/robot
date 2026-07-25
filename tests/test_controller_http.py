@@ -241,6 +241,30 @@ class PoseHTTPTest(HTTPBase):
         self.assertAlmostEqual(j["pose"]["x"], 1.0, places=2)
         self.jreq("POST", "/pose_reset")            # leave a clean pose behind
 
+    def test_objects_endpoint(self):
+        # plan 033: world object memory — empty case + one stamped sighting
+        s, j = self.jreq("GET", "/objects")
+        self.assertEqual(s, 200)
+        self.assertIsInstance(j["objects"], list)
+        os.makedirs(self.app.scans_dir, exist_ok=True)
+        name = "scan_20260721_090000.jpg"
+        with open(os.path.join(self.app.scans_dir, name), "wb") as f:
+            f.write(b"\xff\xd8P")
+        with open(os.path.join(self.app.scans_dir, name + ".meta.json"),
+                  "w") as f:
+            json.dump({"made": "t", "pose": {"x": 0, "y": 0, "heading": 45},
+                       "objects": [{"name": "bin", "lon": 45, "lat": 0}]}, f)
+        try:
+            s, j = self.jreq("GET", "/objects")
+            self.assertEqual(s, 200)
+            hit = [o for o in j["objects"] if o["scan"] == name]
+            self.assertEqual(len(hit), 1)
+            self.assertAlmostEqual(hit[0]["bearing"], 0.0)   # 45 − 45
+            self.assertEqual(hit[0]["id"], name + "#0")
+        finally:
+            os.remove(os.path.join(self.app.scans_dir, name))
+            os.remove(os.path.join(self.app.scans_dir, name + ".meta.json"))
+
     def test_pose_200_not_503_when_serial_down(self):
         rover = rc.Rover()                              # no link
         app = rc.App(rover, rc.Movement(rover), rc.CameraAim(rover),
@@ -719,7 +743,10 @@ class PageAndHealthTest(HTTPBase):
                        "showTab('map')",
                        "showTab('scans');pano3d('/scans/'+p.n)",
                        "mapTick();},2000",
-                       "if(mapMetas[k]==null)delete mapMetas[k]"):
+                       "if(mapMetas[k]==null)delete mapMetas[k]",
+                       # plan 033: object-memory overlay
+                       'id="mapobjbtn"', "toggleMapObj(", "mapShowObj",
+                       "fetch('/objects')", "o.pose.x+0.55*Math.cos(b)"):
             self.assertIn(marker, body, marker)
 
     def test_boxes_cmd_intercepted_before_parse(self):

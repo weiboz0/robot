@@ -57,6 +57,7 @@ serial down → 503. CORS is open (any page/client can call it).
 | `GET /pose` | dead-reckoned `{"x","y","heading","pan","tilt","battery_v","fresh"}` in self-set coordinates (wheel-encoder odometry; shown in the page's top-right badge); always `200` — `fresh:false` when telemetry is stale |
 | `POST /pose_reset` | set the current spot as origin (0,0), heading 0° (also restarts the map trail) |
 | `GET /pose_trail` | `{"trail":[[x,y],…],"pose":{…}}` — driven path (bounded, ≥5 cm spacing, origin-seeded) + the same dict `/pose` serves; the 🗺 Map tab draws this |
+| `GET /objects` | world object memory: every sighting in every pose-stamped scan, newest first — `{"objects":[{id,name,scan,made,lon,lat,pose,bearing,color?}]}`; NO dedup (two printers stay two printers); the Map tab's cyan dots and the chatbot's `rover_where_is` ("where is the suitcase?") read this |
 | `POST /scan_cancel` | abort a running scan and discard it (⏹ button / gamepad STOP-SCAN, default button 8); `409` when idle or already publishing |
 | `POST /chat` | submit a chatbot turn `{"text":…}` → `{"turn":N}` immediately (`409 busy` while one runs); the chat service (agent_chat `--serve`, loopback :8090) runs it |
 | `GET /chat_poll?turn=N` | `{"done":false}` or `{"done":true,"reply":…}` — the page polls this; nothing ever blocks on the LLM |

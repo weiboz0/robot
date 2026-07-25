@@ -105,11 +105,12 @@ class RealBackendSurfaceTest(unittest.TestCase):
         import rover_backend
         for m in ("light_state", "auto_flash_allowed", "get_stream_frame",
                   "lights", "photo", "list_scans", "scan_meta",
-                  "identify_scan"):
+                  "identify_scan", "get_objects", "get_pose"):
             self.assertTrue(hasattr(rover_backend.RoverCtl, m), m)
         import rovercontrol_client
         for f in ("get_auto_flash", "get_stream_frame", "healthz",
-                  "list_scans", "scan_meta", "identify_scan"):
+                  "list_scans", "scan_meta", "identify_scan",
+                  "get_objects", "get_pose"):
             self.assertTrue(hasattr(rovercontrol_client, f), f)
 
 
@@ -155,6 +156,94 @@ class IdentifyToolTest(unittest.TestCase):
                 return []
         out = ac.run_tool(Empty(), None, "rover_identify_scan", {"which": 1})
         self.assertIn("no saved 3D scans", out)
+
+
+class RelativeTurnTest(unittest.TestCase):
+    """Plan 033 phrasing signs incl. the wraparound cases codex demanded."""
+
+    def test_left_right_and_ahead(self):
+        self.assertEqual(ac.relative_turn(30, 0), "~30° left")
+        self.assertEqual(ac.relative_turn(-30, 0), "~30° right")
+        self.assertEqual(ac.relative_turn(5, 0), "roughly ahead")
+        self.assertEqual(ac.relative_turn(-10, 0), "roughly ahead")
+
+    def test_wraparound(self):
+        self.assertEqual(ac.relative_turn(-170, 170), "~20° left")
+        self.assertEqual(ac.relative_turn(170, -170), "~20° right")
+
+
+class WhereIsToolTest(unittest.TestCase):
+    OBJS = [   # newest scan first, as /objects serves them
+        {"id": "scan_b.jpg#0", "name": "printer", "scan": "scan_b.jpg",
+         "made": "t1", "lon": 30, "lat": 0, "bearing": 60.0,
+         "pose": {"x": 1.0, "y": 2.0, "heading": 90.0}},
+        {"id": "scan_b.jpg#1", "name": "printer", "scan": "scan_b.jpg",
+         "made": "t1", "lon": -50, "lat": 0, "bearing": 140.0,
+         "pose": {"x": 1.0, "y": 2.0, "heading": 90.0}},
+        {"id": "scan_b.jpg#2", "name": "black suitcase", "scan": "scan_b.jpg",
+         "made": "t1", "lon": 0, "lat": -5, "bearing": 90.0,
+         "pose": {"x": 1.0, "y": 2.0, "heading": 90.0}},
+        {"id": "scan_a.jpg#0", "name": "printer", "scan": "scan_a.jpg",
+         "made": "t0", "lon": 10, "lat": 0, "bearing": -10.0,
+         "pose": {"x": 0.0, "y": 0.0, "heading": 0.0}},
+        {"id": "scan_a.jpg#1", "name": "cardboard box", "scan": "scan_a.jpg",
+         "made": "t0", "lon": 20, "lat": 0, "bearing": -20.0,
+         "pose": {"x": 0.0, "y": 0.0, "heading": 0.0}},
+    ]
+
+    class MemRover:
+        def __init__(self, objs, pose):
+            self._objs, self._pose = objs, pose
+
+        def get_objects(self):
+            return list(self._objs)
+
+        def get_pose(self):
+            return dict(self._pose)
+
+    def _rover(self, heading=0.0, fresh=True):
+        return self.MemRover(self.OBJS,
+                             {"x": 0, "y": 0, "heading": heading,
+                              "fresh": fresh})
+
+    def test_exact_match_newest_and_candidates(self):
+        out = ac.run_tool(self._rover(heading=0.0), None,
+                          "rover_where_is", {"name": "printer"})
+        self.assertIn("3D view #1", out)                # newest sighting wins
+        self.assertIn("scan_b.jpg", out)
+        self.assertIn("bearing 60", out)
+        self.assertIn("~60° left", out)                 # 60 − 0 → left
+        self.assertIn("1 more in the same view", out)   # the second printer
+        self.assertIn("1 in older views", out)          # scan_a's printer
+
+    def test_substring_match(self):
+        out = ac.run_tool(self._rover(), None,
+                          "rover_where_is", {"name": "suitcase"})
+        self.assertIn("black suitcase", out)
+
+    def test_short_query_never_ghost_matches(self):
+        out = ac.run_tool(self._rover(), None,
+                          "rover_where_is", {"name": "car"})
+        self.assertIn("no memory", out)                 # NOT "cardboard box"
+
+    def test_color_word_matches_by_word_overlap(self):
+        out = ac.run_tool(self._rover(), None,
+                          "rover_where_is", {"name": "black case"})
+        self.assertIn("black suitcase", out)
+
+    def test_stale_pose_omits_turn_phrase(self):
+        out = ac.run_tool(self._rover(fresh=False), None,
+                          "rover_where_is", {"name": "printer"})
+        self.assertIn("current heading unknown", out)
+        self.assertNotIn("turn ~", out)
+
+    def test_no_match_and_empty_memory(self):
+        out = ac.run_tool(self._rover(), None,
+                          "rover_where_is", {"name": "zeppelin"})
+        self.assertIn("no memory", out)
+        empty = self.MemRover([], {"heading": 0, "fresh": True})
+        out = ac.run_tool(empty, None, "rover_where_is", {"name": "printer"})
+        self.assertIn("object memory is empty", out)
 
 
 if __name__ == "__main__":
