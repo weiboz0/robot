@@ -464,6 +464,18 @@ def build_tools(rover, arm):
              "parameters": {"type": "object", "properties": {
                  "which": {"type": "integer"},
                  "focus": {"type": "string"}}, "required": ["which"]}},
+            {"name": "rover_scan_for",
+             "description": "Look around FROM HERE for an object: runs a "
+                            "fresh 3D scan (the camera/gimbal physically "
+                            "sweeps the room; the wheels NEVER move) and "
+                            "identifies the target in it — takes several "
+                            "minutes. Use ONLY when the user asks to look "
+                            "around / search from the current spot. For "
+                            "things seen before use rover_where_is (no "
+                            "motion at all); for a driving search use "
+                            "rover_find_object.",
+             "parameters": {"type": "object", "properties": {
+                 "target": {"type": "string"}}, "required": ["target"]}},
             {"name": "rover_where_is",
              "description": "Where was an object last seen? Searches the "
                             "object memory built from all saved 3D scans and "
@@ -502,6 +514,20 @@ def build_tools(rover, arm):
                  "required": ["x", "y", "z", "r"]}},
         ]
     return [{"type": "function", "function": t} for t in tools]
+
+
+SCANFOR_BUDGET_S = 600.0    # rover_scan_for total wall-clock cap
+SCANFOR_POLL_S = 2.0        # rover_scan_for poll cadence
+
+
+def _is_identify_busy(e):
+    """Retryable identify-busy? The real client raises urllib HTTPError
+    whose str() is just 'HTTP Error 409: Conflict' (reason only in the JSON
+    body) — so classify by .code first, message text second (plan 034)."""
+    if getattr(e, "code", None) == 409:
+        return True
+    s = str(e).lower()
+    return "running" in s or "busy" in s
 
 
 def relative_turn(bearing, heading):
@@ -582,6 +608,138 @@ def run_tool(rover, arm, name, a):
                             + " — open it in the 3D views tab")
             return (f"identification of {name_} is still running (or found "
                     "nothing new) — check the 3D views tab in a minute")
+        if name == "rover_scan_for":
+            target = str(a.get("target", "")).strip()
+            if not target:
+                return "rover_scan_for needs a target"
+            deadline = time.monotonic() + SCANFOR_BUDGET_S
+            try:
+                names = rover.list_scans()
+            except Exception as e:
+                return f"cannot reach the controller: {e}"
+            before = names[0] if names else None
+            try:
+                rover.start_scan()
+            except Exception as e:
+                return f"scan refused: {e}"
+            # sweep + stitch (cap 320s > the controller's 300s build timeout)
+            phase_end = time.monotonic() + 320
+            state = ""
+            while time.monotonic() < min(phase_end, deadline):
+                time.sleep(SCANFOR_POLL_S)
+                try:
+                    state = (rover.get_pano_status() or {}).get("state", "")
+                except Exception:
+                    continue
+                if state in ("done", "failed"):
+                    break
+            if state == "failed":
+                return "the scan failed or was cancelled — nothing to search"
+            if state != "done":
+                return ("the scan is taking too long — check the scan "
+                        "status on the website")
+            new = (rover.list_scans() or [None])[0]
+            if not new or new == before:
+                return ("the scan finished but no new 3D view was saved "
+                        "(archive failed) — nothing to search")
+
+            def newest_changed():
+                try:
+                    return (rover.list_scans() or [None])[0] != new
+                except Exception:
+                    return False
+
+            def meta_pair():
+                # None (no sidecar yet — the minimal write is best-effort)
+                # counts as "not yet"; completion is CONTENT change of the
+                # (made, objects) pair, never made alone (same-second stamps)
+                try:
+                    m = rover.scan_meta(new)
+                except Exception:
+                    return None
+                if not m:
+                    return None
+                return (m.get("made"),
+                        json.dumps(m.get("objects"), sort_keys=True))
+
+            def match_now():
+                try:
+                    objs = [o for o in rover.get_objects()
+                            if o.get("scan") == new]
+                except Exception:
+                    return []
+                return _match_objects(objs, target)
+
+            def wait_content_change(baseline, cap_s):
+                end = time.monotonic() + cap_s
+                while time.monotonic() < min(end, deadline):
+                    time.sleep(SCANFOR_POLL_S)
+                    if newest_changed():   # a newer scan killed our identify
+                        return "interrupted"
+                    cur = meta_pair()
+                    if cur is not None and cur != baseline:
+                        return "changed"
+                return "timeout"
+
+            def answer(matches):
+                best = matches[0]
+                out = (f"found '{best['name']}' in the new 3D view ({new}), "
+                       f"toward world bearing {best['bearing']:.0f}°")
+                try:
+                    cur = rover.get_pose()
+                except Exception:
+                    cur = None
+                if cur and cur.get("fresh") and isinstance(
+                        cur.get("heading"), (int, float)):
+                    out += (" — turn "
+                            f"{relative_turn(best['bearing'], cur['heading'])}"
+                            " to face it")
+                if len(matches) > 1:
+                    out += f" ({len(matches) - 1} more match in this view)"
+                return out + " — open the 3D views tab to see the box"
+            interrupted = ("a newer scan interrupted the search — ask "
+                           "again when it finishes")
+            # GENERAL pass: the automatic no-focus identify after every scan.
+            # Match first — it may already have landed.
+            m = match_now()
+            if m:
+                return answer(m)
+            res = wait_content_change(
+                meta_pair(), min(150.0, max(deadline - time.monotonic(), 0)))
+            if res == "interrupted":
+                return interrupted
+            m = match_now()
+            if m:
+                return answer(m)
+            # FOCUSED pass: name the target explicitly.
+            base2 = meta_pair()
+            busy = None
+            for _ in range(6):
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    rover.identify_scan(new, target)
+                    busy = None
+                    break
+                except Exception as e:
+                    if not _is_identify_busy(e):
+                        return f"focused identify refused: {e}"
+                    busy = e
+                    time.sleep(10)
+            if busy is not None:
+                return ("could not start the focused identify (still "
+                        "busy) — try again in a minute")
+            res = wait_content_change(
+                base2, min(240.0, max(deadline - time.monotonic(), 0)))
+            if res == "interrupted":
+                return interrupted
+            m = match_now()
+            if m:
+                return answer(m)
+            return (f"scanned from here and couldn't find '{target}' — it "
+                    "may be out of view; try driving somewhere else and "
+                    "scanning again (rover_find_object can search while "
+                    "driving)")
         if name == "rover_where_is":
             query = str(a.get("name", "")).strip()
             if not query:
@@ -782,6 +940,8 @@ HELP_TEXT = (
     "  photographs when it sees the target; needs ROVER_FIND_ENABLE=1 + vision key)\n"
     "memory:       ask 'where is the <object>?' — recalls it from saved 3D\n"
     "  scans and points relative to the current heading (never moves)\n"
+    "look around:  ask to 'scan for <object>' — fresh 3D scan + search from\n"
+    "  the current spot (camera sweeps the room; wheels never move)\n"
     "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
 
 

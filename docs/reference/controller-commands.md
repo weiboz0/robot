@@ -50,7 +50,7 @@ serial down → 503. CORS is open (any page/client can call it).
 | `GET /latest` | `{"count":N,"latest":"…jpg"}` (used by the gallery auto-refresh) |
 | `GET /photos/<name>` | serve a photo file |
 | `POST /delete_photo/<name>` | delete a photo |
-| `POST /scan` | start a 3D room scan (gimbal sweep → panorama built on the Pi); `409` while one runs or the wheels are moving; e-stop or any drive input aborts it |
+| `POST /scan` | start a 3D room scan (gimbal sweep → panorama built on the Pi); `409` while one runs or the wheels are moving; e-stop or any drive input aborts it — the chatbot's `rover_scan_for` ("scan for the suitcase") drives this + a focused identify and answers with the direction |
 | `GET /scans` | `{"scans":[…]}` archived 3D scans, newest first (every successful scan is kept) |
 | `GET /scans/<name>` | serve an archived scan (`scan_YYYYmmdd_HHMMSS[_N].jpg`) |
 | `POST /delete_scan/<name>` | delete an archived scan |

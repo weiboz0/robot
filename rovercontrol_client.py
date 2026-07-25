@@ -289,3 +289,28 @@ def get_pose(timeout: float = 3.0) -> dict:
     """GET /pose → current dead-reckoned pose dict (x, y, heading, fresh…)."""
     with urllib.request.urlopen(_base() + "/pose", timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+def start_scan(timeout: float = 5.0) -> None:
+    """POST /scan — start a gimbal-sweep 3D scan (wheels never move). On 409
+    the controller's reason ("wheels are moving", "scan already running")
+    lives ONLY in the JSON body's error field — str(HTTPError) is just
+    'HTTP Error 409: Conflict' — so re-raise it as RuntimeError(reason)."""
+    try:
+        _post("/scan", timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            try:
+                reason = json.loads(e.read().decode()).get("error") or "busy"
+            except Exception:
+                reason = "busy"
+            raise RuntimeError(reason) from None
+        raise
+
+
+def get_pano_status(timeout: float = 3.0) -> dict:
+    """GET /pano_status → {"state": "scanning|stitching|done|failed|…",
+    "age_s": seconds}."""
+    with urllib.request.urlopen(_base() + "/pano_status",
+                                timeout=timeout) as r:
+        return json.loads(r.read().decode())

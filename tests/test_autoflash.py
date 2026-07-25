@@ -105,12 +105,14 @@ class RealBackendSurfaceTest(unittest.TestCase):
         import rover_backend
         for m in ("light_state", "auto_flash_allowed", "get_stream_frame",
                   "lights", "photo", "list_scans", "scan_meta",
-                  "identify_scan", "get_objects", "get_pose"):
+                  "identify_scan", "get_objects", "get_pose",
+                  "start_scan", "get_pano_status"):
             self.assertTrue(hasattr(rover_backend.RoverCtl, m), m)
         import rovercontrol_client
         for f in ("get_auto_flash", "get_stream_frame", "healthz",
                   "list_scans", "scan_meta", "identify_scan",
-                  "get_objects", "get_pose"):
+                  "get_objects", "get_pose", "start_scan",
+                  "get_pano_status"):
             self.assertTrue(hasattr(rovercontrol_client, f), f)
 
 
