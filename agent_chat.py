@@ -487,14 +487,36 @@ def build_tools(rover, arm):
              "parameters": {"type": "object", "properties": {
                  "name": {"type": "string"}}, "required": ["name"]}},
             {"name": "rover_find_object",
-             "description": "Physically search for an object: the rover autonomously scans, "
-                            "drives toward it in small safe steps, stops when found, and returns "
-                            "a photo with the object outlined. Describe the object with its COLOR "
-                            "(e.g. 'a green pen', 'a yellow note') — color-named targets use fast "
-                            "local detection. Requires ROVER_FIND_ENABLE=1; refuses safely otherwise. "
-                            "Use ONLY when the user asks to find/look for/locate a physical object.",
+             "description": "Physically search for an object by sweeping the "
+                            "camera and rotating IN PLACE (no forward driving); "
+                            "stops when found and returns a photo with the "
+                            "object outlined. Describe the object with its COLOR "
+                            "(e.g. 'a green pen') — color-named targets use fast "
+                            "local detection. Requires ROVER_FIND_ENABLE=1; "
+                            "refuses safely otherwise. Use ONLY when the user "
+                            "explicitly asks to search around for an object.",
              "parameters": {"type": "object", "properties": {
                  "target": {"type": "string"}}, "required": ["target"]}},
+            {"name": "rover_go_to",
+             "description": "PHYSICALLY DRIVES the rover across the floor to an "
+                            "object it can currently see (tiny floor-checked "
+                            "forward pulses + gated turns), then optionally "
+                            "photographs a named detail of it (photo_of, e.g. "
+                            "'wheel'). Use ONLY when the user explicitly asks "
+                            "the rover to GO TO / DRIVE TO something — never "
+                            "for 'where is X' questions (use rover_where_is). "
+                            "Requires ROVER_GO_ENABLE=1; refuses safely "
+                            "otherwise. Takes minutes.",
+             "parameters": {"type": "object", "properties": {
+                 "target": {"type": "string"},
+                 "photo_of": {"type": "string"}}, "required": ["target"]}},
+            {"name": "rover_come_back",
+             "description": "PHYSICALLY DRIVES the rover back along its own "
+                            "recorded trail to where the last rover_go_to "
+                            "started. Use ONLY when the user explicitly asks "
+                            "it to come back / return. Requires "
+                            "ROVER_GO_ENABLE=1; refuses safely otherwise.",
+             "parameters": {"type": "object", "properties": {}}},
         ]
     if arm is not None:
         tools += [
@@ -518,6 +540,26 @@ def build_tools(rover, arm):
 
 SCANFOR_BUDGET_S = 600.0    # rover_scan_for total wall-clock cap
 SCANFOR_POLL_S = 2.0        # rover_scan_for poll cadence
+
+# plan 036: where the last rover_go_to started (pose + trail index) — what
+# rover_come_back returns to. One rover, one home.
+_NAV_HOME = {"pose": None, "trail_len": None}
+
+
+def _go_gate(rover):
+    """Consent gate for FLOOR DRIVING (rover_go_to / rover_come_back).
+    Deliberately a SEPARATE flag from ROVER_FIND_ENABLE, which only ever
+    consented to camera sweeps + in-place rotation (plan-036 review): a
+    user who allowed camera-find must not be silently opted into the rover
+    driving across the floor. Checked BEFORE any rover call."""
+    if os.environ.get("ROVER_GO_ENABLE", "").strip().lower() not in ("1", "true", "yes"):
+        return ("driving is DISABLED — this tool makes the rover DRIVE ACROSS "
+                "THE FLOOR on its own (forward pulses + turns). To allow it: "
+                "set ROVER_GO_ENABLE=1. (ROVER_FIND_ENABLE only covers camera "
+                "sweeps and turning in place, not floor driving.)")
+    if rover is None or getattr(rover, "backend", None) != "rovercontrol":
+        return "driving needs the rovercontrol backend (:8080)."
+    return None
 
 
 def _is_identify_busy(e):
@@ -608,6 +650,123 @@ def run_tool(rover, arm, name, a):
                             + " — open it in the 3D views tab")
             return (f"identification of {name_} is still running (or found "
                     "nothing new) — check the 3D views tab in a minute")
+        if name == "rover_go_to":
+            gate = _go_gate(rover)
+            if gate:
+                return gate
+            target = str(a.get("target", "")).strip()
+            if not target:
+                return "rover_go_to needs a target"
+            photo_of = str(a.get("photo_of") or "").strip() or None
+            import autodrive
+            import rovercontrol_client as client
+            try:
+                import vision as _vision
+                vm = _vision.VisionModel(timeout=45)
+            except Exception as e:
+                return f"driving needs the vision model for floor safety ({e})"
+            try:
+                pose = client.get_pose() or {}
+            except Exception as e:
+                return f"cannot read the pose: {e}"
+            if not pose.get("fresh"):
+                return "pose telemetry is stale — not driving blind"
+            try:
+                tlen = len((client.get_pose_trail() or {}).get("trail") or [])
+            except Exception as e:
+                return f"cannot read the trail: {e}"
+            # home = pose + trail INDEX, recorded BEFORE any motion
+            _NAV_HOME["pose"] = {k: pose[k] for k in ("x", "y", "heading")}
+            _NAV_HOME["trail_len"] = tlen
+
+            def capture():
+                return None, client.get_stream_frame()
+            driver = autodrive.SafeDriver(client)
+            try:
+                ok, obs, why = autodrive.approach_object(
+                    driver, vm, target, capture=capture,
+                    log=lambda m: print("   " + m))
+            except Exception as e:
+                return f"go-to aborted — rover stopped/safe: {e}"
+            try:
+                p2 = client.get_pose()
+                moved = ((p2["x"] - pose["x"]) ** 2
+                         + (p2["y"] - pose["y"]) ** 2) ** 0.5
+            except Exception:
+                moved = None
+            moved_txt = f" (drove ~{moved:.1f} m)" if moved is not None else ""
+            if not ok:
+                return (f"could not reach the {target}: {why}{moved_txt} — "
+                        "wheels stopped; say 'come back' to return")
+            # arrived: detail photo if asked (GIMBAL ONLY from here on)
+            shot = None
+            detail_note = ""
+            if photo_of:
+                phrase = f"the {photo_of} of the {target}"
+                looker = (lambda nm, im,
+                          p=phrase: autodrive.look_for(vm, im, p))
+                try:
+                    _, img = capture()
+                    o = looker(None, img)
+                    if o.get("seen") and o.get("bbox"):
+                        autodrive._refine_center(driver, looker, capture, o,
+                                                 lambda m: None)
+                        detail_note = f", centered on the {photo_of}"
+                    else:
+                        detail_note = (f" (couldn't make out the {photo_of} — "
+                                       "photographed the whole thing)")
+                except Exception:
+                    detail_note = ""
+            try:
+                shot = client.snapshot()
+            except Exception:
+                shot = None
+            photo_txt = (f"; photo saved → {shot}" if shot
+                         else "; the photo failed")
+            return (f"arrived at the {target}{moved_txt}{detail_note}"
+                    f"{photo_txt} — say 'come back' and I'll return to "
+                    "where I started")
+        if name == "rover_come_back":
+            gate = _go_gate(rover)
+            if gate:
+                return gate
+            if not _NAV_HOME.get("pose"):
+                return ("I haven't driven anywhere yet this session — "
+                        "nowhere to come back to")
+            import autodrive
+            import rovercontrol_client as client
+            try:
+                import vision as _vision
+                vm = _vision.VisionModel(timeout=45)
+            except Exception as e:
+                return f"driving needs the vision model for floor safety ({e})"
+            try:
+                trail = (client.get_pose_trail() or {}).get("trail") or []
+            except Exception as e:
+                return f"cannot read the trail: {e}"
+
+            def capture():
+                return None, client.get_stream_frame()
+            clearance = autodrive.make_llm_clearance(vm, capture)
+            home = {"pose": dict(_NAV_HOME["pose"]),
+                    "trail_len": _NAV_HOME.get("trail_len") or 0}
+            wps, _ = autodrive.plan_return_waypoints(trail, home)
+            driver = autodrive.SafeDriver(
+                client, max_steps=min(120, 24 + 10 * len(wps)),
+                max_seconds=300.0)
+            try:
+                ok, rem, why = autodrive.backtrack(
+                    driver, client.get_pose, trail, home,
+                    clearance=clearance, log=lambda m: print("   " + m))
+            except Exception as e:
+                return f"come-back aborted — rover stopped/safe: {e}"
+            rem_txt = (f"~{rem:.1f} m" if rem == rem else "an unknown distance")
+            if ok:
+                _NAV_HOME["pose"] = None
+                _NAV_HOME["trail_len"] = None
+                return f"back where I started ({rem_txt} off) — wheels stopped"
+            return (f"couldn't complete the return: {why} — stopped about "
+                    f"{rem_txt} from the start; say 'come back' again to retry")
         if name == "rover_scan_for":
             target = str(a.get("target", "")).strip()
             if not target:
@@ -737,9 +896,9 @@ def run_tool(rover, arm, name, a):
             if m:
                 return answer(m)
             return (f"scanned from here and couldn't find '{target}' — it "
-                    "may be out of view; try driving somewhere else and "
-                    "scanning again (rover_find_object can search while "
-                    "driving)")
+                    "may be out of view; drive the rover somewhere else and "
+                    "scan again, or ask it to go to a spot you name "
+                    "(rover_go_to, needs ROVER_GO_ENABLE=1)")
         if name == "rover_where_is":
             query = str(a.get("name", "")).strip()
             if not query:
@@ -838,9 +997,17 @@ SYSTEM = (
     "you can take a photo with the camera, list photos, center the camera, and "
     "lock/relax the gimbal. The speed cap (rover_set_speed, 0..0.5) is the safe "
     "way to slow all driving; on the Go controller it is shared with the gamepad. "
-    "Use rover_get_status to check what is connected. When the user asks you to "
-    "find/look for a physical object, use rover_find_object with a color in the "
-    "description (e.g. 'a green pen') — it drives itself and returns an outlined "
+    "Use rover_get_status to check what is connected. "
+    "MOTION ROUTING (strict): the wheel-motion tools — rover_go_to, "
+    "rover_come_back, rover_find_object — may be used ONLY when the user's "
+    "own message explicitly asks for travel ('go to X', 'drive to X', "
+    "'come back', 'find X by searching around'). Questions phrased as "
+    "'where is X' / 'can you see X' / 'look for X in the scans' are memory "
+    "or camera questions: answer them with rover_where_is or rover_scan_for "
+    "— NEVER with a driving tool. When the user asks you to "
+    "search for a physical object by moving, use rover_find_object with a "
+    "color in the description (e.g. 'a green pen') — it sweeps the camera "
+    "and rotates in place, then returns an outlined "
     "photo; report the result including the photo name. rover_record_tour records a smooth "
     "360-degree video tour for the website. rover_scan_surroundings "
     "builds a 360-degree memory of the room; AFTER a scan, answer questions about "
@@ -936,12 +1103,14 @@ HELP_TEXT = (
     "website names also work: camera_up/..., camera_aim, camera_center, snapshot,\n"
     "  gimbal_relax/lock, light_head|light_base [on|off], move_forward/back/left/right [MS]\n"
     "  (note: drive/fwd/back keep CHATBOT units here — seconds, speeds -0.5..0.5)\n"
-    "autonomous:   find <object> / screwdriver / pen  (drives itself, stops +\n"
-    "  photographs when it sees the target; needs ROVER_FIND_ENABLE=1 + vision key)\n"
+    "autonomous:   find <object> / screwdriver / pen  (sweeps the camera and\n"
+    "  turns in place, photographs the target; needs ROVER_FIND_ENABLE=1)\n"
     "memory:       ask 'where is the <object>?' — recalls it from saved 3D\n"
     "  scans and points relative to the current heading (never moves)\n"
     "look around:  ask to 'scan for <object>' — fresh 3D scan + search from\n"
     "  the current spot (camera sweeps the room; wheels never move)\n"
+    "navigate:     'go to the <object>' (+ 'take a photo of its <detail>')\n"
+    "  and 'come back' — DRIVES the rover; needs ROVER_GO_ENABLE=1\n"
     "dobot: $dobot <raw cmd>  e.g. $dobot GetPose() / $dobot EnableRobot()")
 
 

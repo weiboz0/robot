@@ -324,6 +324,11 @@ class RoverCtl:
             return self._http.get_pose()
         raise RuntimeError("pose tracking lives on the controller")
 
+    def get_pose_trail(self):
+        if self.backend == "rovercontrol":
+            return self._http.get_pose_trail()
+        raise RuntimeError("pose tracking lives on the controller")
+
     def start_scan(self):
         if self.backend == "rovercontrol":
             return self._http.start_scan()

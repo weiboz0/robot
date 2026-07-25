@@ -188,7 +188,7 @@ class ScanForTest(unittest.TestCase):
         r.meta_seq = [None]                            # nothing ever lands
         out = self._run(r)
         self.assertIn("couldn't find 'suitcase'", out)
-        self.assertIn("driving", out)
+        self.assertIn("drive the rover somewhere else", out)
 
     def test_stuck_scan_bounded(self):
         r = SeqRover()

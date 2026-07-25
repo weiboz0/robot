@@ -21,6 +21,7 @@ e-stop-latch fail-closed; cleanup in finally.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -41,6 +42,16 @@ MAX_SECONDS = 240.0   # wall-clock incl. vision latency (a slow gateway night ca
 WATCHDOG_MARGIN_S = 15.0
 FOUND_MIN_CONF = 0.5      # don't declare "found" on a low-confidence guess
 MAX_VISION_ERRORS = 4     # give up if the vision API keeps failing (don't spin)
+
+# plan 036 — go-to / come-back navigation
+TURN_VIEW_PAN = 40.0      # side view aim (deg) for turn clearance checks
+TURN_SURVEY_TTL_S = 10.0  # a 3-view turn-zone survey stays valid this long
+BODY_ALIGN_TOL = 10.0     # forward only when the sighting pan is within this
+ALIGN_MS_PER_DEG = 8.0    # turn pulse ms per degree of pan to zero out
+LOST_MAX = 3              # consecutive lost-sight looks → honest stop
+MIN_CAL_DELTA_DEG = 3.0   # smallest Δheading that proves a turn registered
+WP_SPACING_M = 0.4        # backtrack waypoint spacing along the trail
+ARRIVE_M = 0.3            # "I'm there" radius
 
 
 class SafetyLimit(RuntimeError):
@@ -76,6 +87,7 @@ class SafeDriver:
         self._wd = None
         self._entered = False
         self._aim = None      # gimbal (pan, tilt) cache — look() skips redundant aims
+        self._survey_at = None   # plan 036: last valid 3-view turn-zone survey
 
     # ---- lifecycle (context manager) ----
     def __enter__(self):
@@ -106,6 +118,7 @@ class SafeDriver:
         self._start = self._clock()
         self.steps = 0
         self._last_forward = -1e9
+        self._survey_at = None   # a prior run's turn survey must never leak
         # Independent watchdog: estop if the whole run overruns, even if the main
         # loop is wedged (hard caps only fire while code executes).
         self._wd = self._timer_cls(self.max_seconds + WATCHDOG_MARGIN_S, self._watchdog_fire)
@@ -197,6 +210,7 @@ class SafeDriver:
             self._sleep(self.forward_cooldown_s - gap)
         self._nudge_and_settle("forward", self.forward_ms)
         self._last_forward = self._clock()
+        self._survey_at = None   # motion changes the scene: turn survey is void
         return True
 
     def _nudge_and_settle(self, direction, ms):
@@ -218,6 +232,47 @@ class SafeDriver:
     # No back(): the camera can't see behind, so reversing can never be
     # look-where-you-drive safe. Turns are near-in-place on a differential rover
     # (minimal net translation) and kept tiny; forward is the gated path.
+
+    # ---- gated turns (plan 036): look-where-you-turn ----
+    # Geometry: an in-place turn sweeps ≈ the rover's own bounding circle.
+    # The camera can survey the FRONT half (three floor-tilt views); the rear
+    # half — including the rear corner swinging into the turn — is a
+    # permanent blind spot (same physical limit that forbids back()).
+    # Mitigations: tiny pulses at crawl cap, and the survey caught anything
+    # approaching from the front seconds earlier.
+
+    def _survey_ok(self):
+        return (self._survey_at is not None
+                and self._clock() - self._survey_at <= TURN_SURVEY_TTL_S)
+
+    def turn_survey(self, clearance):
+        """3-view turn-zone survey (pan −40/0/+40 at floor tilt) — ALL clear
+        or no turning. Valid TURN_SURVEY_TTL_S; any forward pulse voids it."""
+        for pan in (-TURN_VIEW_PAN, 0.0, TURN_VIEW_PAN):
+            self.look(pan, self.floor_tilt)
+            if not clearance():
+                self._survey_at = None
+                return False
+        self._survey_at = self._clock()
+        return True
+
+    def turn_gated(self, direction, ms, clearance):
+        """Bounded in-place turn behind a fresh floor check: a valid turn-zone
+        survey (run one if needed) + ONE fresh clearance on the turn-direction
+        view immediately before the nudge. Returns False (no motion) when any
+        view is dirty."""
+        if direction not in ("left", "right"):
+            raise ValueError(f"bad turn direction {direction!r}")
+        self._tick()
+        if not self._survey_ok() and not self.turn_survey(clearance):
+            return False
+        self.look(TURN_VIEW_PAN if direction == "right" else -TURN_VIEW_PAN,
+                  self.floor_tilt)
+        if not clearance():
+            self._survey_at = None
+            return False
+        self._nudge_and_settle(direction, min(600, max(0, int(ms))))
+        return True
 
     def halt(self):
         self._safe_stop()
@@ -383,6 +438,47 @@ ROTATE_MS = 550
 EARLY_ACCEPT_CONF = 0.85   # stop sweeping immediately on a very strong sighting
 
 
+def _sweep_for(driver, looker, capture, *, err, log=lambda m: None,
+               sweep_pans=SWEEP_PANS, sweep_tilts=SWEEP_TILTS):
+    """One gimbal sweep from the CURRENT spot → ("found", (conf, obs, pan,
+    tilt)) / ("none", None) / ("abort", None). Contract (plan 036): does NO
+    context management (the driver must already be entered) and NO base
+    rotation — the between-sweep rotation stays in find_object; a rotating
+    sweep would smuggle ungated turns past the gated-only guarantee.
+    `err` is a shared {"n": int} vision-error counter (find_object's
+    original consecutive-failure semantics, preserved across sweeps)."""
+    best = None
+    for tilt in sweep_tilts:
+        for pan in sweep_pans:
+            if driver.elapsed() >= driver.max_seconds:
+                log("time cap reached — stopping the search")
+                return "abort", None
+            driver.look(pan, tilt)
+            try:
+                _, img = capture()
+            except Exception as e:
+                log(f"capture failed ({e}); stopping")
+                return "abort", None
+            obs = looker(None, img)
+            if obs.get("error"):
+                err["n"] += 1
+                if err["n"] >= MAX_VISION_ERRORS:
+                    log(f"vision failing ({err['n']}x) — giving up")
+                    return "abort", None
+                continue
+            err["n"] = 0
+            conf = _num(obs.get("confidence"))
+            if obs.get("seen") and obs.get("bbox") and conf >= FOUND_MIN_CONF:
+                log(f"  spotted at pan={pan} tilt={tilt} conf={conf:.2f} "
+                    f"({str(obs.get('reason', ''))[:40]})")
+                cand = (conf, obs, pan, tilt)
+                if best is None or conf > best[0]:
+                    best = cand
+                if conf >= EARLY_ACCEPT_CONF:
+                    return "found", best
+    return ("found", best) if best else ("none", None)
+
+
 def find_object(driver, vision, target, *, capture, log=lambda m: None,
                 on_found=None, look=None, snap=None,
                 sweep_pans=SWEEP_PANS, sweep_tilts=SWEEP_TILTS,
@@ -414,41 +510,14 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
                 log(f"  (meta save failed: {e})")
         return shot
 
-    vision_errors = 0
+    err = {"n": 0}
     with driver:
         for rot in range(max_rotations + 1):
-            best = None
-            for tilt in sweep_tilts:
-                for pan in sweep_pans:
-                    if driver.elapsed() >= driver.max_seconds:
-                        log("time cap reached — stopping the search")
-                        return None
-                    driver.look(pan, tilt)
-                    try:
-                        _, img = capture()
-                    except Exception as e:
-                        log(f"capture failed ({e}); stopping")
-                        return None
-                    obs = looker(None, img)
-                    if obs.get("error"):
-                        vision_errors += 1
-                        if vision_errors >= MAX_VISION_ERRORS:
-                            log(f"vision failing ({vision_errors}x) — giving up")
-                            return None
-                        continue
-                    vision_errors = 0
-                    conf = _num(obs.get("confidence"))
-                    if obs.get("seen") and obs.get("bbox") and conf >= FOUND_MIN_CONF:
-                        log(f"  spotted at pan={pan} tilt={tilt} conf={conf:.2f} "
-                            f"({str(obs.get('reason', ''))[:40]})")
-                        cand = (conf, obs, pan, tilt)
-                        if best is None or conf > best[0]:
-                            best = cand
-                        if conf >= EARLY_ACCEPT_CONF:
-                            break
-                else:
-                    continue
-                break                       # early accept: fall through both loops
+            state, best = _sweep_for(driver, looker, capture, err=err, log=log,
+                                     sweep_pans=sweep_pans,
+                                     sweep_tilts=sweep_tilts)
+            if state == "abort":
+                return None
 
             if best:
                 _, obs, pan, tilt = best
@@ -474,3 +543,264 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
             "be occluded or out of view; move it into the open or say roughly "
             "where it is and I'll look again")
         return None
+
+
+# ───────────────────── go-to / come-back navigation (plan 036) ────────────────
+# Every wheel nudge below — forward AND turn — sits behind a fresh floor check
+# (forward() and turn_gated()). Pose reads used for motion decisions require
+# fresh:true (fail-closed). The chat tools gate all of this behind
+# ROVER_GO_ENABLE=1, a separate consent from ROVER_FIND_ENABLE's
+# rotation-only authorization.
+
+
+def _norm180(deg):
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def _fresh_pose(get_pose):
+    """Pose dict for a motion decision — stale/malformed → SafetyLimit."""
+    try:
+        p = get_pose() or {}
+    except Exception as e:
+        raise SafetyLimit(f"pose read failed ({e}) — refusing to navigate blind")
+    if not p.get("fresh"):
+        raise SafetyLimit("pose is stale — refusing to navigate blind")
+    if not all(isinstance(p.get(k), (int, float)) for k in ("x", "y", "heading")):
+        raise SafetyLimit("pose is malformed — refusing to navigate blind")
+    return p
+
+
+def make_llm_clearance(vision, capture):
+    """The standard floor gate: fresh frame at the current aim → fail-closed
+    floor_is_clear verdict."""
+    def clearance():
+        try:
+            _, img = capture()
+        except Exception:
+            return False
+        return floor_is_clear(vision, img)
+    return clearance
+
+
+def turn_to_heading(driver, get_pose, target_deg, *, clearance,
+                    tol_deg=12.0, max_pulses=10, sign_state=None):
+    """Closed-loop gated in-place turn to a pose-frame heading (CCW+).
+    HEADING_SIGN is uncalibrated on this rover, so the wheel→heading mapping
+    is detected at runtime and FAIL-CLOSED (plan-036 review spec):
+    calibration pulse at full turn_ms must move the heading ≥
+    MIN_CAL_DELTA_DEG (one 1.5× retry allowed), else SafetyLimit; the next
+    measured pulse must agree with the detected mapping, else SafetyLimit.
+    `sign_state` ({"left_is_plus": bool}) lets a caller reuse a mapping
+    across calls — the agreement check still runs. Returns True when within
+    tol_deg."""
+    state = sign_state if sign_state is not None else {}
+    h = _fresh_pose(get_pose)["heading"]
+    err = _norm180(target_deg - h)
+    if abs(err) <= tol_deg:
+        return True
+    left_is_plus = state.get("left_is_plus")
+    confirmed = False
+    pulses = 0
+    while pulses < max_pulses:
+        if abs(err) <= tol_deg:
+            return True
+        if left_is_plus is None:            # nominal: CCW+ means left = +
+            direction = "left" if err > 0 else "right"
+        else:
+            direction = "left" if ((err > 0) == left_is_plus) else "right"
+        ms = driver.turn_ms if abs(err) > 25 else int(driver.turn_ms * 0.6)
+        if not driver.turn_gated(direction, ms, clearance):
+            raise SafetyLimit("path blocked while turning")
+        pulses += 1
+        h2 = _fresh_pose(get_pose)["heading"]
+        delta = _norm180(h2 - h)
+        if left_is_plus is None:
+            if abs(delta) < MIN_CAL_DELTA_DEG:
+                # ONE bigger retry, then fail closed — a tiny/noisy delta
+                # must never lock in a wrong mapping. The retry consumes a
+                # pulse from the SAME budget: max_pulses is a hard cap on
+                # nudges, never exceeded (code-review catch).
+                if pulses >= max_pulses:
+                    raise SafetyLimit("pose isn't registering turns — "
+                                      "refusing to navigate blind")
+                if not driver.turn_gated(direction, int(driver.turn_ms * 1.5),
+                                         clearance):
+                    raise SafetyLimit("path blocked while turning")
+                pulses += 1
+                h2 = _fresh_pose(get_pose)["heading"]
+                delta = _norm180(h2 - h)
+                if abs(delta) < MIN_CAL_DELTA_DEG:
+                    raise SafetyLimit("pose isn't registering turns — "
+                                      "refusing to navigate blind")
+            left_is_plus = (delta > 0) if direction == "left" else (delta < 0)
+            state["left_is_plus"] = left_is_plus
+        elif not confirmed and abs(delta) >= MIN_CAL_DELTA_DEG:
+            moved_plus = delta > 0
+            expect_plus = (direction == "left") == left_is_plus
+            if moved_plus != expect_plus:
+                raise SafetyLimit("turn direction is inconsistent — stopping")
+            confirmed = True
+        h = h2
+        err = _norm180(target_deg - h)
+    return abs(err) <= tol_deg
+
+
+def approach_object(driver, vision, target, *, capture, log=lambda m: None,
+                    look=None, clearance=None):
+    """Drive TO a visible object (plan 036). Sight it with a gimbal sweep
+    from the current spot (NO base rotation), turn the BODY until the
+    sighting is dead ahead (|pan| ≤ BODY_ALIGN_TOL — a pan=50° sighting must
+    never trigger a body-forward pulse, that vector is wrong), then creep
+    forward, floor-gated per pulse, until the close criteria fire.
+    Returns (ok, obs, why). The driver context is entered HERE."""
+    looker = look if look is not None else (lambda nm, im: look_for(vision, im, target))
+    clearance = clearance or make_llm_clearance(vision, capture)
+    obs = None
+    with driver:
+        try:
+            err = {"n": 0}
+            state, best = _sweep_for(driver, looker, capture, err=err, log=log)
+            if state == "abort" or best is None:
+                return False, None, "target not visible from here"
+            _, obs, pan, tilt = best
+            lost = 0
+            while True:
+                if driver.elapsed() >= driver.max_seconds:
+                    return False, obs, "time budget reached"
+                if abs(pan) > BODY_ALIGN_TOL:
+                    # body alignment: rotate toward the sighting (gated), then
+                    # re-sight straight ahead
+                    direction = "right" if pan > 0 else "left"
+                    ms = min(driver.turn_ms,
+                             max(120, int(abs(pan) * ALIGN_MS_PER_DEG)))
+                    if not driver.turn_gated(direction, ms, clearance):
+                        return False, obs, "path blocked while turning"
+                    pan = 0.0
+                driver.look(pan, tilt)
+                try:
+                    _, img = capture()
+                except Exception as e:
+                    return False, obs, f"camera failed: {e}"
+                o2 = looker(None, img)
+                if not (o2.get("seen") and o2.get("bbox")):
+                    lost += 1
+                    if lost >= LOST_MAX:
+                        return False, obs, ("lost sight of it — stopped "
+                                            "where I am")
+                    continue
+                lost = 0
+                obs = o2
+                b = obs["bbox"]
+                cx = (b[0] + b[2]) / 2.0
+                if obs.get("close"):
+                    driver.halt()
+                    obs = _refine_center(driver, looker, capture, obs, log)
+                    return True, obs, "arrived"
+                if cx < BEAR_LEFT or cx > BEAR_RIGHT:
+                    direction = "right" if cx > 0.5 else "left"
+                    ms = min(driver.turn_ms,
+                             max(120, int(abs(cx - 0.5) * CAM_DEG_PER_FRAC
+                                          * ALIGN_MS_PER_DEG)))
+                    if not driver.turn_gated(direction, ms, clearance):
+                        return False, obs, "path blocked while turning"
+                    continue
+                # dead ahead + centered → ONE floor-gated forward pulse
+                if not driver.forward(clearance):
+                    return False, obs, "path blocked ahead"
+                pan = 0.0     # forward() snapped the gimbal to (0, floor_tilt)
+        except SafetyLimit as e:
+            return False, obs, f"stopped by the safety envelope: {e}"
+
+
+def plan_return_waypoints(trail, home, *, wp_spacing=WP_SPACING_M):
+    """Waypoints for the return trip (pure function, heavily tested).
+    Slices the trail by the INDEX recorded at go-to start — never
+    nearest-point matching (a path crossing near home would pick the wrong
+    segment) — reverses it, subsamples to wp_spacing, and always ends at
+    home. Returns (waypoints, evicted_note)."""
+    hp = home["pose"]
+    start = max(0, int(home.get("trail_len") or 0) - 1)
+    seg = list(trail[start:])
+    note = None
+    if seg and math.hypot(seg[0][0] - hp["x"], seg[0][1] - hp["y"]) > 0.5:
+        note = "trail partially evicted — following the surviving suffix"
+    wps = []
+    last = None
+    for x, y in reversed(seg):
+        if last is None or math.hypot(x - last[0], y - last[1]) >= wp_spacing:
+            wps.append((float(x), float(y)))
+            last = (x, y)
+    home_pt = (float(hp["x"]), float(hp["y"]))
+    if not wps or math.hypot(wps[-1][0] - home_pt[0],
+                             wps[-1][1] - home_pt[1]) > 1e-9:
+        wps.append(home_pt)
+    return wps, note
+
+
+def backtrack(driver, get_pose, trail, home, *, clearance,
+              wp_spacing=WP_SPACING_M, arrive_m=ARRIVE_M,
+              log=lambda m: None):
+    """Drive back along the recorded trail to home (plan 036): the path it
+    actually drove — known passable minutes ago — beats a straight line
+    through unknown floor. Turn-then-forward per waypoint, every nudge
+    floor-gated, every motion-decision pose read fresh-checked. Returns
+    (ok, remaining_m, why). The driver context is entered HERE."""
+    hp = home["pose"]
+
+    def remaining():
+        try:
+            p = get_pose() or {}
+            return math.hypot(hp["x"] - float(p.get("x") or 0.0),
+                              hp["y"] - float(p.get("y") or 0.0))
+        except Exception:
+            return float("nan")
+
+    wps, note = plan_return_waypoints(trail, home, wp_spacing=wp_spacing)
+    if note:
+        log(note)
+    sign_state = {}
+    with driver:
+        try:
+            for i, (wx, wy) in enumerate(wps):
+                final = i == len(wps) - 1
+                tol = arrive_m if final else max(arrive_m, wp_spacing / 2)
+                stalls = 0
+                while True:
+                    p = _fresh_pose(get_pose)
+                    dx, dy = wx - p["x"], wy - p["y"]
+                    dist = math.hypot(dx, dy)
+                    if dist <= tol:
+                        break
+                    bearing = math.degrees(math.atan2(dy, dx))
+                    if abs(_norm180(bearing - p["heading"])) > 20.0:
+                        # a non-converged turn must NOT be followed by a
+                        # forward pulse — misaligned forward motion is the
+                        # exact wrong-vector risk (code-review catch)
+                        if not turn_to_heading(driver, get_pose, bearing,
+                                               clearance=clearance,
+                                               sign_state=sign_state):
+                            return False, remaining(), \
+                                "couldn't align toward the path"
+                    if not driver.forward(clearance):
+                        return False, remaining(), "path blocked on the way back"
+                    p2 = _fresh_pose(get_pose)
+                    d2 = math.hypot(wx - p2["x"], wy - p2["y"])
+                    if d2 >= dist - 0.01:
+                        stalls += 1
+                        if stalls >= 3:   # driving but not getting closer
+                            if not turn_to_heading(
+                                    driver, get_pose,
+                                    math.degrees(math.atan2(wy - p2["y"],
+                                                            wx - p2["x"])),
+                                    clearance=clearance,
+                                    sign_state=sign_state):
+                                return False, remaining(), \
+                                    "couldn't align toward the path"
+                            stalls = 0
+                    else:
+                        stalls = 0
+            rem = remaining()
+            ok = rem == rem and rem <= arrive_m + 0.05   # NaN-safe
+            return ok, rem, "arrived" if ok else "ended near home"
+        except SafetyLimit as e:
+            return False, remaining(), f"stopped by the safety envelope: {e}"
