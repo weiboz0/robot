@@ -262,6 +262,32 @@ class TelemetryReaderTest(unittest.TestCase):
         self.assertFalse(th.is_alive())
 
 
+class BatteryEmaTest(unittest.TestCase):
+    """Plan 035: display smoothing — first sample as-is, None preserves,
+    store-time rounding, convergence."""
+
+    def test_first_sample_as_is_then_converges(self):
+        p = rc.Pose()
+        p.set_aux(12.0, None, None)
+        self.assertEqual(p.snapshot()["battery_v"], 12.0)
+        for _ in range(60):
+            p.set_aux(10.0, None, None)
+        self.assertAlmostEqual(p.snapshot()["battery_v"], 10.0, delta=0.05)
+
+    def test_none_sample_preserves_never_resets(self):
+        p = rc.Pose()
+        p.set_aux(12.0, None, None)
+        p.set_aux(None, 5.0, 6.0)                  # firmware omitted v
+        self.assertEqual(p.snapshot()["battery_v"], 12.0)
+        p.set_aux(10.0, None, None)                # EMA continues, no reset
+        self.assertAlmostEqual(p.snapshot()["battery_v"], 11.6)
+
+    def test_rounded_at_store(self):
+        p = rc.Pose()
+        p.set_aux(12.111111, None, None)
+        self.assertEqual(p.snapshot()["battery_v"], 12.11)
+
+
 class WorldBearingTest(unittest.TestCase):
     """Plan 033 sign pins: heading CCW+, lon pan+ (= right of forward) →
     bearing = heading − lon. A sign error here points the compass wrong."""

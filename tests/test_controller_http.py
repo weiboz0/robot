@@ -215,8 +215,11 @@ class PoseHTTPTest(HTTPBase):
             self.app.pose.update(i * 10, i * 10)
         s, j = self.jreq("GET", "/pose")
         self.assertEqual(s, 200)
-        for k in ("x", "y", "heading", "pan", "tilt", "battery_v", "fresh"):
+        for k in ("x", "y", "heading", "pan", "tilt", "battery_v", "fresh",
+                  "batt_warn", "batt_crit"):        # thresholds: plan 035
             self.assertIn(k, j)
+        self.assertEqual(j["batt_warn"], rc.BATT_WARN_V)
+        self.assertEqual(j["batt_crit"], rc.BATT_CRIT_V)
         self.assertAlmostEqual(j["x"], 1.0)
         self.assertTrue(j["fresh"])
         s, _ = self.jreq("POST", "/pose_reset")
@@ -236,7 +239,8 @@ class PoseHTTPTest(HTTPBase):
         self.assertEqual(j["trail"][0], [0, 0])     # origin-seeded
         self.assertEqual(len(j["trail"]), 11)
         self.assertAlmostEqual(j["trail"][-1][0], 1.0, places=2)
-        for k in ("x", "y", "heading", "pan", "tilt", "fresh"):
+        for k in ("x", "y", "heading", "pan", "tilt", "fresh",
+                  "batt_warn", "batt_crit"):        # plan 035: same dict
             self.assertIn(k, j["pose"])
         self.assertAlmostEqual(j["pose"]["x"], 1.0, places=2)
         self.jreq("POST", "/pose_reset")            # leave a clean pose behind
@@ -691,6 +695,7 @@ class PageAndHealthTest(HTTPBase):
         self.assertIn("up", j["serial"])
         self.assertIn("up", j["camera"])
         self.assertIn("mapping", j["gamepad"])
+        self.assertIn("battery_v", j)              # plan 035 (may be null)
 
     def test_page_serves_all_ui_markers(self):
         s, data = self.req("GET", "/")
@@ -746,7 +751,9 @@ class PageAndHealthTest(HTTPBase):
                        "if(mapMetas[k]==null)delete mapMetas[k]",
                        # plan 033: object-memory overlay
                        'id="mapobjbtn"', "toggleMapObj(", "mapShowObj",
-                       "fetch('/objects')", "o.pose.x+0.55*Math.cos(b)"):
+                       "fetch('/objects')", "o.pose.x+0.55*Math.cos(b)",
+                       # plan 035: battery thresholds come from the server
+                       "p.batt_crit", "p.batt_warn", "LOW BATTERY"):
             self.assertIn(marker, body, marker)
 
     def test_boxes_cmd_intercepted_before_parse(self):

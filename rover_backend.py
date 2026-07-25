@@ -218,13 +218,17 @@ class RoverCtl:
         """Stable shape across backends; unknown fields are explicit None."""
         st = {"backend": self.backend, "where": self.where,
               "serial": {"up": False}, "camera": {"up": None},
-              "gamepad": {"up": None}, "speed_cap": None}
+              "gamepad": {"up": None}, "speed_cap": None,
+              "battery_v": None}
         if self.backend == "rovercontrol":
             try:
                 h = self._http.healthz(timeout=2.0)
                 for k in ("serial", "camera", "gamepad"):
                     if isinstance(h.get(k), dict):
                         st[k] = h[k]
+                # scalar — the dict-gated loop above won't pick it up
+                if isinstance(h.get("battery_v"), (int, float)):
+                    st["battery_v"] = h["battery_v"]
             except Exception as e:
                 st["serial"] = {"up": False, "err": str(e)}
             try:    # a /speed hiccup must not downgrade an otherwise-good healthz

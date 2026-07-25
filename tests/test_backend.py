@@ -207,7 +207,8 @@ class StatusAndExtrasTest(unittest.TestCase):
         finally:
             sys.modules.pop("rover_direct", None)
         self.assertEqual(set(st), {"backend", "where", "serial", "camera",
-                                   "gamepad", "speed_cap"})
+                                   "gamepad", "speed_cap", "battery_v"})
+        self.assertIsNone(st["battery_v"])               # unknown on serial
         self.assertEqual(st["backend"], "serial")
         self.assertEqual(st["speed_cap"], 0.5)
         self.assertIsNone(st["camera"]["up"])            # unknown on serial
@@ -217,7 +218,8 @@ class StatusAndExtrasTest(unittest.TestCase):
         rcc = rover_backend.rovercontrol_client
         calls = []
         health = {"serial": {"up": True}, "camera": {"up": True},
-                  "gamepad": {"up": False, "mapping": "default"}}
+                  "gamepad": {"up": False, "mapping": "default"},
+                  "battery_v": 11.87}
         with mock.patch.object(rcc, "set_host", lambda h: None), \
              mock.patch.object(rcc, "healthz", return_value=health), \
              mock.patch.object(rcc, "get_speed", return_value=0.25), \
@@ -229,6 +231,7 @@ class StatusAndExtrasTest(unittest.TestCase):
         self.assertEqual(st["camera"], {"up": True})
         self.assertEqual(st["speed_cap"], 0.25)
         self.assertEqual(st["backend"], "rovercontrol")
+        self.assertEqual(st["battery_v"], 11.87)         # scalar copy (plan 035)
         self.assertEqual(calls, ["center"])              # codex blocker: real endpoint
 
     def test_http_status_serial_unknown(self):
