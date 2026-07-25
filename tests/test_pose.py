@@ -262,6 +262,27 @@ class TelemetryReaderTest(unittest.TestCase):
         self.assertFalse(th.is_alive())
 
 
+class WorldBearingTest(unittest.TestCase):
+    """Plan 033 sign pins: heading CCW+, lon pan+ (= right of forward) →
+    bearing = heading − lon. A sign error here points the compass wrong."""
+
+    def test_centered_object_bearing_is_heading(self):
+        for h in (0.0, 45.0, -120.0):
+            self.assertAlmostEqual(rc.world_bearing(h, 0.0), h)
+
+    def test_object_right_of_forward_is_negative_bearing(self):
+        self.assertAlmostEqual(rc.world_bearing(0.0, 30.0), -30.0)
+
+    def test_heading_plus_left_object(self):
+        self.assertAlmostEqual(rc.world_bearing(90.0, -40.0), 130.0)
+
+    def test_wraps_to_signed_180(self):
+        self.assertAlmostEqual(rc.world_bearing(-170.0, 20.0), 170.0)
+        self.assertAlmostEqual(rc.world_bearing(170.0, -20.0), -170.0)
+        self.assertAlmostEqual(rc.world_bearing(0.0, -180.0), -180.0)
+        self.assertAlmostEqual(rc.world_bearing(0.0, 180.0), -180.0)
+
+
 class TrailTest(unittest.TestCase):
     """Plan 032: the driven-path trail for the Map tab — origin-seeded,
     jitter-suppressed, hard-bounded, cleared+re-seeded on reset."""

@@ -619,6 +619,53 @@ class ScanPoseStampTest(unittest.TestCase):
             self.assertNotIn("pose", meta)
 
 
+class ListObjectsTest(unittest.TestCase):
+    """Plan 033: /objects aggregation — every sighting kept (no dedup),
+    newest scan first, stable ids, poseless/corrupt/non-numeric skipped."""
+
+    def _sidecar(self, app, name, meta):
+        os.makedirs(app.scans_dir, exist_ok=True)
+        with open(os.path.join(app.scans_dir, name), "wb") as f:
+            f.write(b"\xff\xd8P")
+        if meta is not None:
+            with open(os.path.join(app.scans_dir, name + ".meta.json"),
+                      "w") as f:
+                if isinstance(meta, str):
+                    f.write(meta)
+                else:
+                    json.dump(meta, f)
+
+    def test_aggregation_keeps_all_sightings(self):
+        app, _ = make_scan_app()
+        pose_c = {"x": 1.0, "y": 2.0, "heading": 90.0}
+        self._sidecar(app, "scan_20260721_030000.jpg", {   # newest
+            "made": "tC", "pose": pose_c, "objects": [
+                {"name": "printer", "lon": 30, "lat": 0},
+                {"name": "printer", "lon": -50, "lat": 0, "color": "white"},
+                {"name": "suitcase", "lon": 0, "lat": -10},
+                {"name": "ghost", "lon": "NaNish", "lat": 0}]})   # skipped
+        self._sidecar(app, "scan_20260721_020000.jpg", {   # older sighting
+            "made": "tB", "pose": {"x": 0, "y": 0, "heading": 0},
+            "objects": [{"name": "printer", "lon": 10, "lat": 5}]})
+        self._sidecar(app, "scan_20260721_010000.jpg", {   # legacy: no pose
+            "made": "tA", "objects": [{"name": "sofa", "lon": 1, "lat": 1}]})
+        self._sidecar(app, "scan_20260721_000000.jpg", "NOT JSON {")  # corrupt
+        out = app.list_objects()
+        self.assertEqual([o["name"] for o in out],
+                         ["printer", "printer", "suitcase", "printer"])
+        self.assertEqual(out[0]["id"], "scan_20260721_030000.jpg#0")
+        self.assertEqual(out[1]["color"], "white")
+        # bearing = heading − lon in the scan's pose frame
+        self.assertAlmostEqual(out[0]["bearing"], 60.0)    # 90 − 30
+        self.assertAlmostEqual(out[3]["bearing"], -10.0)   # 0 − 10
+        self.assertEqual(out[0]["pose"], pose_c)
+        self.assertEqual(out[3]["scan"], "scan_20260721_020000.jpg")
+
+    def test_empty_and_missing_dir(self):
+        app, _ = make_scan_app()
+        self.assertEqual(app.list_objects(), [])
+
+
 class AutoFlashFlagTest(unittest.TestCase):
     def test_default_on_even_without_photo_dir(self):
         app, _ = make_scan_app()

@@ -197,6 +197,13 @@ TRAIL_MIN_STEP_M = 0.05     # record a trail point every ≥5 cm of travel
 TRAIL_MAX = 2000            # trail hard bound (~100 m at 5 cm spacing)
 
 
+def world_bearing(heading, lon):
+    """World bearing of a pano object (plan 033): heading is CCW-positive,
+    pano lon is pan-positive = RIGHT of forward, so the object lies at
+    heading − lon, wrapped to [−180, 180)."""
+    return (heading - lon + 180.0) % 360.0 - 180.0
+
+
 class Pose:
     """Dead-reckoned x/y (m) + heading (deg, CCW+, 0 = +X at reset) from the
     T:1001 stream, all from the wheel encoders. Signed odometry integrates
@@ -1416,6 +1423,49 @@ class App:
         names.sort(reverse=True)
         return names
 
+    def list_objects(self):
+        """All object sightings across pose-stamped scan sidecars, newest
+        scan first (plan 033). Read-only and lock-free: each sidecar is read
+        tolerantly (missing / corrupt / mid-republish → skip that scan this
+        call; self-heals next call). NO dedup — distinct same-name physical
+        objects (e.g. two printers) must all survive; consumers pick."""
+        out = []
+        for scan in self.list_scans():
+            try:
+                with open(os.path.join(self.scans_dir,
+                                       scan + ".meta.json")) as fh:
+                    meta = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            pose = meta.get("pose")
+            if not (isinstance(pose, dict)
+                    and all(isinstance(pose.get(k), (int, float))
+                            for k in ("x", "y", "heading"))):
+                continue                    # legacy scan: no place, no entry
+            objs = meta.get("objects")
+            if not isinstance(objs, list):
+                continue
+            for i, obj in enumerate(objs):
+                if not isinstance(obj, dict):
+                    continue
+                lon, lat = obj.get("lon"), obj.get("lat")
+                if not (isinstance(lon, (int, float))
+                        and isinstance(lat, (int, float))):
+                    continue
+                entry = {"id": f"{scan}#{i}",
+                         "name": str(obj.get("name", "?")),
+                         "scan": scan, "made": meta.get("made"),
+                         "lon": lon, "lat": lat,
+                         "pose": {k: pose[k] for k in ("x", "y", "heading")},
+                         "bearing": round(
+                             world_bearing(pose["heading"], lon), 1)}
+                if obj.get("color"):
+                    entry["color"] = obj["color"]
+                out.append(entry)
+        return out
+
 
 class ScanCancelled(RuntimeError):
     pass
@@ -2181,6 +2231,10 @@ def make_handler(app):
                 snap.update({"ok": True, "pan": pan, "tilt": tilt})
                 self._json(200, {"trail": app.pose.trail_snapshot(),
                                  "pose": snap})
+            elif p == "/objects":
+                # world object memory: every sighting in every pose-stamped
+                # scan (no dedup — consumers pick)
+                self._json(200, {"objects": app.list_objects()})
             elif p == "/auto_flash":
                 self._json(200, {"on": app.auto_flash_on()})
             elif p == "/chat_status":

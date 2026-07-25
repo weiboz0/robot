@@ -171,7 +171,10 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
 <div class="grid" id="scangrid" style="display:none"></div>
 <div id="mappanel" style="display:none">
  <canvas id="mapcanvas" style="width:100%;border-radius:8px;background:#0b0e14;cursor:pointer"></canvas>
- <div style="padding:4px 2px"><small>driven trail from the wheel odometry · 📍 numbered pins are saved 3D views — click one to open it · grid = 1 m · ⌖ reset pose restarts the trail at (0,0)</small></div>
+ <div style="padding:4px 2px;display:flex;gap:8px;align-items:center">
+  <button id="mapobjbtn" onclick="toggleMapObj()" style="padding:2px 8px">👁 objects</button>
+  <small>driven trail from the wheel odometry · 📍 numbered pins are saved 3D views — click one to open it · cyan dots = remembered objects (direction seen from that pin) · grid = 1 m</small>
+ </div>
 </div>
 <div id="progpanel" style="display:none">
 <div class="bar">
@@ -638,12 +641,16 @@ setInterval(poseTick,500);poseTick();
 
 // ── Map tab: driven trail + clickable scan pins (plan 032) ───────────────────
 let mapMetas={};   // name → meta | null (negative cache; nulls retried on tab revisit)
-let mapTrail=[],mapPose=null,mapPins=[];
+let mapTrail=[],mapPose=null,mapPins=[],mapObjs=[],mapShowObj=true;
+function toggleMapObj(){mapShowObj=!mapShowObj;
+ const b=document.getElementById('mapobjbtn');if(b)b.style.background=mapShowObj?'':'#555';
+ mapTick();}
 async function mapTick(){
  if(gtab!=='map')return;
  try{
   const j=await(await fetch('/pose_trail')).json();
   mapTrail=j.trail||[];mapPose=j.pose||null;
+  if(mapShowObj){try{mapObjs=(await(await fetch('/objects')).json()).objects||[];}catch(e){}}
   const s=await(await fetch('/scans')).json();const ns=s.scans||[];
   for(const k of Object.keys(mapMetas))if(!ns.includes(k))delete mapMetas[k];
   for(const n of ns){
@@ -688,6 +695,16 @@ function drawMap(ns){
   g.fillStyle='#f59e0b';g.beginPath();g.arc(px,py,9,0,7);g.fill();
   g.fillStyle='#000';g.font='bold 10px sans-serif';g.textAlign='center';g.textBaseline='middle';
   g.fillText(p.num,px,py);}
+ // remembered objects: cyan dot 0.55m from the sighting pin along the world
+ // bearing — computed in WORLD coords through the same X()/Y() transform so
+ // the y-flip can't mirror bearings (plan 033)
+ if(mapShowObj)for(const o of mapObjs){
+  const b=o.bearing*Math.PI/180;
+  const ox=o.pose.x+0.55*Math.cos(b),oy=o.pose.y+0.55*Math.sin(b);
+  const px=X(ox),py=Y(oy);
+  g.fillStyle='#22d3ee';g.beginPath();g.arc(px,py,3,0,7);g.fill();
+  g.fillStyle='#9be8f4';g.font='9px sans-serif';g.textAlign='left';g.textBaseline='middle';
+  g.fillText(o.name,px+5,py);}
  // rover: heading triangle
  if(mapPose){const px=X(mapPose.x),py=Y(mapPose.y),a=-mapPose.heading*Math.PI/180;
   g.save();g.translate(px,py);g.rotate(a);

@@ -310,6 +310,16 @@ class RoverCtl:
             return self._http.identify_scan(name, focus)
         raise RuntimeError("saved 3D scans live on the controller")
 
+    def get_objects(self):
+        if self.backend == "rovercontrol":
+            return self._http.get_objects()
+        raise RuntimeError("object memory lives on the controller")
+
+    def get_pose(self):
+        if self.backend == "rovercontrol":
+            return self._http.get_pose()
+        raise RuntimeError("pose tracking lives on the controller")
+
     def demo(self):
         # motor + camera self-test (backend-agnostic, mirrors rover_direct.demo)
         import time
