@@ -291,6 +291,14 @@ def get_pose(timeout: float = 3.0) -> dict:
         return json.loads(r.read().decode())
 
 
+def get_pose_trail(timeout: float = 3.0) -> dict:
+    """GET /pose_trail → {"trail": [[x, y], …], "pose": {…}} (plan 036 —
+    the come-back tool follows this)."""
+    with urllib.request.urlopen(_base() + "/pose_trail",
+                                timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
 def start_scan(timeout: float = 5.0) -> None:
     """POST /scan — start a gimbal-sweep 3D scan (wheels never move). On 409
     the controller's reason ("wheels are moving", "scan already running")
