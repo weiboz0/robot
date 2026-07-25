@@ -197,6 +197,10 @@ TRAIL_MIN_STEP_M = 0.05     # record a trail point every ≥5 cm of travel
 TRAIL_MAX = 2000            # trail hard bound (~100 m at 5 cm spacing)
 
 
+BATT_WARN_V = 10.5          # 3S pack, 3.5 V/cell — amber with real runway
+BATT_CRIT_V = 9.6           # 3.2 V/cell — red, park it soon
+
+
 def world_bearing(heading, lon):
     """World bearing of a pano object (plan 033): heading is CCW-positive,
     pano lon is pan-positive = RIGHT of forward, so the object lies at
@@ -263,7 +267,14 @@ class Pose:
     def set_aux(self, battery_v, pan, tilt):
         with self._mu:
             if battery_v is not None:
-                self.battery_v = battery_v
+                # EMA (display-only): motor load dips the raw reading for a
+                # second; rounded at store so healthz/chat JSON stay tidy.
+                # A None sample (firmware omits v) keeps the last value.
+                if self.battery_v is None:
+                    self.battery_v = round(battery_v, 2)
+                else:
+                    self.battery_v = round(
+                        0.8 * self.battery_v + 0.2 * battery_v, 2)
             if pan is not None:
                 self.servo_pan, self.servo_tilt = pan, tilt
 
@@ -2206,7 +2217,9 @@ def make_handler(app):
                                  "camera": {"up": cam_up, "err": cam_err},
                                  "gamepad": {"up": app.gamepad_present(),
                                              "mapping": app.map_source},
-                                 "lights": lights})
+                                 "lights": lights,
+                                 "battery_v":
+                                     app.pose.snapshot()["battery_v"]})
             elif p == "/speed":
                 self._json(200, {"ok": True, "cap": app.move.get_cap()})
             elif p == "/video_feed":
@@ -2221,14 +2234,18 @@ def make_handler(app):
                 # useful answer when serial is down (badge greys out)
                 snap = app.pose.snapshot()
                 pan, tilt = app.aim.get()
-                snap.update({"ok": True, "pan": pan, "tilt": tilt})
+                snap.update({"ok": True, "pan": pan, "tilt": tilt,
+                             "batt_warn": BATT_WARN_V,
+                             "batt_crit": BATT_CRIT_V})
                 self._json(200, snap)
             elif p == "/pose_trail":
                 # one fetch per map tick: the driven trail + the same pose
                 # dict /pose serves
                 snap = app.pose.snapshot()
                 pan, tilt = app.aim.get()
-                snap.update({"ok": True, "pan": pan, "tilt": tilt})
+                snap.update({"ok": True, "pan": pan, "tilt": tilt,
+                             "batt_warn": BATT_WARN_V,
+                             "batt_crit": BATT_CRIT_V})
                 self._json(200, {"trail": app.pose.trail_snapshot(),
                                  "pose": snap})
             elif p == "/objects":

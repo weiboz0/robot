@@ -620,9 +620,13 @@ async function poseTick(){try{
  const el=document.getElementById('posetext');if(!el)return;
  if(!p.fresh){el.style.color='#667';el.textContent='pose: no telemetry';return;}
  el.style.color='#cde';
+ let batt='';
+ if(p.battery_v){batt=' 🔋'+p.battery_v.toFixed(1)+'V';
+  // thresholds come from the server (/pose) — no literals to drift
+  if(p.batt_crit&&p.battery_v<p.batt_crit){el.style.color='#f55';batt+=' ⚠ LOW BATTERY';}
+  else if(p.batt_warn&&p.battery_v<p.batt_warn){el.style.color='#fb3';}}
  el.textContent='('+p.x.toFixed(2)+', '+p.y.toFixed(2)+')m ⟲'+p.heading.toFixed(0)+
-  '° cam '+p.pan.toFixed(0)+'°/'+p.tilt.toFixed(0)+'°'+
-  (p.battery_v?' 🔋'+p.battery_v.toFixed(1)+'V':'');
+  '° cam '+p.pan.toFixed(0)+'°/'+p.tilt.toFixed(0)+'°'+batt;
 }catch(e){}}
 async function poseReset(){await fetch('/pose_reset',{method:'POST'});poseTick();}
 async function scanCancel(){await fetch('/scan_cancel',{method:'POST'});panoStat();}

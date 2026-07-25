@@ -54,7 +54,7 @@ serial down → 503. CORS is open (any page/client can call it).
 | `GET /scans` | `{"scans":[…]}` archived 3D scans, newest first (every successful scan is kept) |
 | `GET /scans/<name>` | serve an archived scan (`scan_YYYYmmdd_HHMMSS[_N].jpg`) |
 | `POST /delete_scan/<name>` | delete an archived scan |
-| `GET /pose` | dead-reckoned `{"x","y","heading","pan","tilt","battery_v","fresh"}` in self-set coordinates (wheel-encoder odometry; shown in the page's top-right badge); always `200` — `fresh:false` when telemetry is stale |
+| `GET /pose` | dead-reckoned `{"x","y","heading","pan","tilt","battery_v","fresh","batt_warn","batt_crit"}` in self-set coordinates (wheel-encoder odometry; shown in the page's top-right badge — amber under `batt_warn` 10.5 V, red + LOW BATTERY under `batt_crit` 9.6 V); always `200` — `fresh:false` when telemetry is stale |
 | `POST /pose_reset` | set the current spot as origin (0,0), heading 0° (also restarts the map trail) |
 | `GET /pose_trail` | `{"trail":[[x,y],…],"pose":{…}}` — driven path (bounded, ≥5 cm spacing, origin-seeded) + the same dict `/pose` serves; the 🗺 Map tab draws this |
 | `GET /objects` | world object memory: every sighting in every pose-stamped scan, newest first — `{"objects":[{id,name,scan,made,lon,lat,pose,bearing,color?}]}`; NO dedup (two printers stay two printers); the Map tab's cyan dots and the chatbot's `rover_where_is` ("where is the suitcase?") read this |
@@ -72,7 +72,7 @@ serial down → 503. CORS is open (any page/client can call it).
 | Method · path | Does |
 |---|---|
 | `GET /` | the built-in web UI (drive/camera/lights/video/gallery + browser gamepad) |
-| `GET /healthz` | `{"ok":true,"serial":{up,err},"camera":{up,err},"gamepad":{up,mapping}}` |
+| `GET /healthz` | `{"ok":true,"serial":{up,err},"camera":{up,err},"gamepad":{up,mapping},"lights":{head,base},"battery_v":<smoothed V or null>}` |
 
 ### curl examples
 ```bash
