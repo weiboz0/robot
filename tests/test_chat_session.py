@@ -1,6 +1,8 @@
 """ChatSession + --serve (plan 030) — golden-transcript turns with a fake LLM
 client and the async submit/poll HTTP contract. No LLM, no hardware."""
 import json
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -166,9 +168,16 @@ class ChatSessionTest(unittest.TestCase):
 class ServeTest(unittest.TestCase):
     def setUp(self):
         # serve() blocks in serve_forever, so capture the server instance by
-        # wrapping serve_forever — lets us learn the port-0 binding and stop it
+        # wrapping serve_forever — lets us learn the port-0 binding and stop it.
+        # hist_path is ALWAYS an explicit temp file (plan 038 review demand):
+        # no test may ever touch the real ~/rover-chat-history.jsonl.
         self.session, _ = make_session([FakeMsg(content="web hello")])
         self.session.client.msgs.append(FakeMsg(content="second"))
+        self._histdir = tempfile.TemporaryDirectory()
+        self.hist_path = os.path.join(self._histdir.name, "hist.jsonl")
+        self._start_serve()
+
+    def _start_serve(self):
         import agent_chat
         self._orig = ThreadingHTTPServer.serve_forever
         captured = {}
@@ -181,6 +190,7 @@ class ServeTest(unittest.TestCase):
             target=agent_chat.serve,
             args=(self.session, {"ok": True, "model": "fake",
                                  "rover": None, "dobot": False}, 0),
+            kwargs={"hist_path": self.hist_path},
             daemon=True)
         self.th.start()
         deadline = time.time() + 5
@@ -192,6 +202,7 @@ class ServeTest(unittest.TestCase):
     def tearDown(self):
         ThreadingHTTPServer.serve_forever = self._orig
         self.srv.shutdown()
+        self._histdir.cleanup()
 
     def _req(self, method, path, body=None):
         req = urllib.request.Request(
@@ -275,6 +286,111 @@ class ServeTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertFalse(j["busy"])
+
+
+class HistoryServeTest(ServeTest):
+    """Plan 038: the display transcript — recorded, bounded, persisted."""
+
+    def _turn(self, text):
+        s, j = self._req("POST", "/chat",
+                         json.dumps({"text": text}).encode())
+        self.assertEqual(s, 200)
+        n = j["turn"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            s, j = self._req("GET", f"/chat_poll?turn={n}")
+            if j.get("done"):
+                return j["reply"]
+            time.sleep(0.02)
+        raise AssertionError("turn never completed")
+
+    def _restart_serve(self, replies=("again",)):
+        self.srv.shutdown()
+        ThreadingHTTPServer.serve_forever = self._orig
+        self.session, _ = make_session([FakeMsg(content=r) for r in replies])
+        self._start_serve()
+
+    def test_turn_recorded_oldest_first_full_reply(self):
+        reply = self._turn("hi there")
+        s, j = self._req("GET", "/chat_history")
+        self.assertEqual(s, 200)
+        h = j["history"]
+        self.assertEqual([e["who"] for e in h], ["you", "bot"])
+        self.assertEqual(h[0]["text"], "hi there")
+        self.assertEqual(h[1]["text"], reply)          # the FULL turn reply
+        self.assertIn("ts", h[0])
+
+    def test_blank_user_text_not_recorded(self):
+        self._turn("")
+        s, j = self._req("GET", "/chat_history")
+        self.assertNotIn("you", [e["who"] for e in j["history"]])
+
+    def test_survives_service_restart(self):
+        self._turn("remember me")
+        self._restart_serve()
+        s, j = self._req("GET", "/chat_history")
+        texts = [e["text"] for e in j["history"]]
+        self.assertIn("remember me", texts)            # loaded from disk
+
+    def test_corrupt_lines_tolerated(self):
+        self._turn("good turn")
+        with open(self.hist_path, "a", encoding="utf-8") as f:
+            f.write('NOT JSON{\n{"who":"x","text":"badwho"}\n[1,2]\n')
+        self._restart_serve()
+        s, j = self._req("GET", "/chat_history")
+        texts = [e["text"] for e in j["history"]]
+        self.assertIn("good turn", texts)
+        self.assertNotIn("badwho", texts)
+
+    def test_env_var_resolution_when_no_param(self):
+        # param → env → default; here: no param, env set → env wins
+        self.srv.shutdown()
+        ThreadingHTTPServer.serve_forever = self._orig
+        env_path = os.path.join(self._histdir.name, "envhist.jsonl")
+        os.environ["ROVER_CHAT_HIST"] = env_path
+        try:
+            import agent_chat
+            self.session, _ = make_session([FakeMsg(content="env reply")])
+            self._orig = ThreadingHTTPServer.serve_forever
+            captured = {}
+
+            def capture(srv_self, *a, **k):
+                captured["srv"] = srv_self
+                return self._orig(srv_self, *a, **k)
+            ThreadingHTTPServer.serve_forever = capture
+            self.th = threading.Thread(
+                target=agent_chat.serve,
+                args=(self.session, {"ok": True, "model": "fake",
+                                     "rover": None, "dobot": False}, 0),
+                daemon=True)                            # NO hist_path param
+            self.th.start()
+            deadline = time.time() + 5
+            while "srv" not in captured and time.time() < deadline:
+                time.sleep(0.02)
+            self.srv = captured["srv"]
+            self.port = self.srv.server_address[1]
+            self._turn("env hello")
+            self.assertTrue(os.path.exists(env_path))  # env path was used
+        finally:
+            os.environ.pop("ROVER_CHAT_HIST", None)
+
+
+class HistFileHelpersTest(unittest.TestCase):
+    def test_prune_bounds_file_atomically(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "h.jsonl")
+            with open(p, "w") as f:
+                for i in range(1500):
+                    f.write(json.dumps({"who": "bot", "text": str(i)}) + "\n")
+            ac._hist_prune(p, keep=1000)
+            with open(p) as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 1000)
+            self.assertIn('"500"', lines[0])           # oldest kept = #500
+            self.assertFalse(os.path.exists(p + ".tmp"))
+
+    def test_load_missing_file_empty(self):
+        self.assertEqual(ac._hist_load("/nonexistent/x.jsonl"), [])
 
 
 if __name__ == "__main__":

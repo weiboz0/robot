@@ -62,6 +62,7 @@ serial down → 503. CORS is open (any page/client can call it).
 | `POST /chat` | submit a chatbot turn `{"text":…}` → `{"turn":N}` immediately (`409 busy` while one runs); the chat service (agent_chat `--serve`, loopback :8090) runs it |
 | `GET /chat_poll?turn=N` | `{"done":false}` or `{"done":true,"reply":…}` — the page polls this; nothing ever blocks on the LLM |
 | `GET /chat_status` | chat service health (always `200`; `{"up":false}` when not running) |
+| `GET /chat_history` | the persisted chat transcript `{"history":[{who,text,ts}…]}` oldest-first (bounded 200; stored on the rover in `~/rover-chat-history.jsonl`, survives reloads AND restarts); always `200` — empty list when the service is down |
 | `POST /chat_start` | launch the chat service detached (logs → `~/rover-chat.log`); `409` if already up |
 | `GET /pano_meta` | objects identified in the live panorama `{"objects":[{name,color,lon,lat,w,h}]}` (404 if none) |
 | `GET /scan_meta/<name>` | objects identified in an archived scan (the 3D viewer draws these as boxes; `boxes on|off|all|<names>` in the web command box controls them); since plan 032 every new scan's meta also carries `"pose":{x,y,heading}` — where the rover stood when it scanned (the Map tab's 📍 pins) |

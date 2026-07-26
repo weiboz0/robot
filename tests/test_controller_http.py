@@ -446,6 +446,10 @@ class FakeChatUpstream:
                 if self.path.startswith("/chat_status"):
                     self._j(200, {"ok": True, "model": "fake", "rover": None,
                                   "dobot": False, "busy": False})
+                elif self.path.startswith("/chat_history"):
+                    self._j(200, {"history": [
+                        {"who": "you", "text": "hi", "ts": 1},
+                        {"who": "bot", "text": "hello!", "ts": 2}]})
                 elif self.path.startswith("/chat_poll"):
                     if "turn=404" in self.path:
                         self._j(404, {"error": "unknown or expired turn"})
@@ -494,6 +498,12 @@ class ChatBridgeTest(HTTPBase):
             self.assertIn("expired", j["error"])
             s, j = self.jreq("GET", "/chat_status")
             self.assertEqual((s, j["ok"]), (200, True))
+            # plan 038: history passes through 1:1
+            s, j = self.jreq("GET", "/chat_history")
+            self.assertEqual(s, 200)
+            self.assertEqual([e["who"] for e in j["history"]],
+                             ["you", "bot"])
+            self.assertEqual(j["history"][1]["text"], "hello!")
         finally:
             up.close()
 
@@ -502,6 +512,8 @@ class ChatBridgeTest(HTTPBase):
         self._old_port = 8090
         s, j = self.jreq("GET", "/chat_status")
         self.assertEqual((s, j["up"]), (200, False))   # down is a 200 answer
+        s, j = self.jreq("GET", "/chat_history")
+        self.assertEqual((s, j["history"]), (200, []))  # down: empty answer
         s, _ = self.jreq("POST", "/chat", b'{"text":"x"}')
         self.assertEqual(s, 503)
         s, _ = self.jreq("GET", "/chat_poll?turn=1")
@@ -753,7 +765,11 @@ class PageAndHealthTest(HTTPBase):
                        'id="mapobjbtn"', "toggleMapObj(", "mapShowObj",
                        "fetch('/objects')", "o.pose.x+0.55*Math.cos(b)",
                        # plan 035: battery thresholds come from the server
-                       "p.batt_crit", "p.batt_warn", "LOW BATTERY"):
+                       "p.batt_crit", "p.batt_warn", "LOW BATTERY",
+                       # plan 038: chat history rebuild (non-empty-only flag)
+                       "loadChatHistory(", "/chat_history", "chatHistLoaded",
+                       "if(!h.length)return;", "loadChatHistory(true)",
+                       "— earlier messages —", 'id="chatgreet"'):
             self.assertIn(marker, body, marker)
 
     def test_boxes_cmd_intercepted_before_parse(self):

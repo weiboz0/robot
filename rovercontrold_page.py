@@ -157,7 +157,7 @@ PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
  <button class="warn" id="clearscans" onclick="clearAllScans()" style="display:none">🗑 Clear all 3D views</button>
 </div>
 <div id="chatpanel">
- <div id="chatlog"><div class="cmsg sys">talk to the rover in plain English — or $ commands ($help)</div></div>
+ <div id="chatlog"><div class="cmsg sys" id="chatgreet">talk to the rover in plain English — or $ commands ($help)</div></div>
  <div id="chatstat"><small>checking chatbot…</small></div>
  <button id="chatstartbtn" onclick="chatStart()" style="display:none;width:100%">▶ start chatbot</button>
  <form class="bar" style="margin:0;padding:8px 0 0" onsubmit="chatSend();return false">
@@ -535,6 +535,30 @@ function chatAdd(who,text){const d=document.createElement('div');
  d.className='cmsg '+who;d.textContent=text;
  const log=document.getElementById('chatlog');log.appendChild(d);
  log.scrollTop=log.scrollHeight;return d;}
+// ── chat history: rebuild the log from the rover's transcript (plan 038) ────
+let chatHistLoaded=false;
+async function loadChatHistory(force){
+ if(chatHistLoaded&&!force)return;
+ try{
+  const j=await(await fetch('/chat_history')).json();
+  const h=j.history||[];
+  if(!h.length)return;   // an empty answer (service down) never burns the flag
+  const log=document.getElementById('chatlog');
+  const old=document.getElementById('chathist');if(old)old.remove();
+  const greet=document.getElementById('chatgreet');if(greet)greet.remove();
+  const wrap=document.createElement('div');wrap.id='chathist';
+  wrap.style.display='contents';   // children join chatlog's flex layout
+                                   // (else .you bubbles lose right-align)
+  for(const e of h){const d=document.createElement('div');
+   d.className='cmsg '+(e.who==='you'?'you':'bot');d.textContent=e.text;
+   wrap.appendChild(d);}
+  const sep=document.createElement('div');sep.className='cmsg sys';
+  sep.textContent='— earlier messages —';wrap.appendChild(sep);
+  log.insertBefore(wrap,log.firstChild);   // PREPEND: live bubbles survive
+  log.scrollTop=log.scrollHeight;
+  chatHistLoaded=true;
+ }catch(e){}}
+loadChatHistory(false);
 async function chatStatusTick(){try{
  const j=await(await fetch('/chat_status')).json();
  const up=j.ok===true;
@@ -575,7 +599,8 @@ async function chatStart(){
  }catch(e){chatAdd('sys','start failed: '+e);}
  for(let i=0;i<25;i++){await new Promise(res=>setTimeout(res,1000));
   try{const j=await(await fetch('/chat_status')).json();
-   if(j.ok){chatAdd('sys','chatbot started — say hi');break;}}catch(e){}}
+   if(j.ok){chatAdd('sys','chatbot started — say hi');
+    loadChatHistory(true);break;}}catch(e){}}
  b.disabled=false;b.textContent='▶ start chatbot';chatStatusTick();}
 async function loadScans(){
  const j=await(await fetch('/scans')).json();
