@@ -408,6 +408,338 @@ class ApproachTest(unittest.TestCase):
         self.assertEqual(nudges(c), [])
 
 
+class BlockedForwardVoidsSurveyTest(unittest.TestCase):
+    def test_hazard_verdict_invalidates_cached_survey(self):
+        # plan-037 Opus B1: a blocked forward must void the turn survey so
+        # a following (detour) turn re-surveys instead of reusing views the
+        # hazard verdict just contradicted
+        c = NavClient()
+        d = make_driver(c)
+        cl = MarkedClearance(c, verdicts=[True] * 4 + [False] + [True])
+        with d:
+            self.assertTrue(d.turn_gated("left", 200, cl))   # survey + side
+            self.assertFalse(d.forward(cl))                  # blocked (5th)
+            n = cl.calls
+            self.assertTrue(d.turn_gated("left", 200, cl))
+        self.assertEqual(cl.calls, n + 4)   # FULL fresh survey, not reuse
+
+
+class SearchAroundTest(unittest.TestCase):
+    def _looker(self, driver, script):
+        return lambda nm, img: script((driver._aim or (0, 0))[0])
+
+    def test_target_behind_found_after_gated_rotations(self):
+        c = NavClient()
+        d = make_driver(c)
+        cl = MarkedClearance(c)
+
+        def script(pan):
+            turns = len([e for e in c.log
+                         if e[0] == "nudge" and e[1] == "left"])
+            if turns >= 3 and pan == 0:
+                return {"seen": True, "bbox": [0.4, 0.4, 0.6, 0.6],
+                        "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        with d:
+            best, why = ad.search_around(d, self._looker(d, script),
+                                         lambda: (None, b"img"), cl)
+        self.assertIsNotNone(best, why)
+        self.assertEqual(why, "sighted")
+        self.assertEqual(len(nudges(c)), 3)          # exactly 3 rotations
+        self.assertTrue(clear_before_every_nudge(c, None))
+
+    def test_dirty_turn_view_stops_search_zero_nudges(self):
+        c = NavClient()
+        d = make_driver(c)
+        cl = MarkedClearance(c, verdicts=[False])    # nothing is clear
+        never = lambda nm, img: {"seen": False, "bbox": None,
+                                 "confidence": 0.0}
+        with d:
+            best, why = ad.search_around(d, never,
+                                         lambda: (None, b"img"), cl)
+        self.assertIsNone(best)
+        self.assertIn("look further around", why)
+        self.assertEqual(nudges(c), [])
+
+    def test_phase_cap_bites_and_leaves_wall_budget(self):
+        t = {"now": 0.0}
+        c = NavClient()
+        d = make_driver(c, clock=lambda: t["now"], max_seconds=480.0)
+
+        def slow_looker(nm, img):
+            t["now"] += 90.0                          # slow vision looks
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        with d:
+            best, why = ad.search_around(d, slow_looker,
+                                         lambda: (None, b"img"),
+                                         MarkedClearance(c))
+        self.assertIsNone(best)
+        self.assertIn("time", why)
+        self.assertLess(t["now"], 480.0)              # approach budget left
+
+    def test_phase_cap_enforced_mid_sweep_rejects_post_cap_sighting(self):
+        # codex code-review catch: the deadline must be checked before
+        # EVERY look — a sighting the sweep would only reach after the cap
+        # is never accepted
+        t = {"now": 0.0}
+        c = NavClient()
+        d = make_driver(c, clock=lambda: t["now"], max_seconds=1e9)
+
+        def looker(nm, img):
+            # 90 s/look: look 3 STARTS in-budget (t=180) but its sighting
+            # lands post-cap (t=270) — must be discarded, not accepted
+            t["now"] += 90.0
+            pan = (d._aim or (0, 0))[0]
+            if pan == 50:
+                return {"seen": True, "bbox": [0.4, 0.4, 0.6, 0.6],
+                        "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        with d:
+            best, why = ad.search_around(d, looker,
+                                         lambda: (None, b"img"),
+                                         MarkedClearance(c))
+        self.assertIsNone(best)                 # …but the cap is authoritative
+        self.assertIn("time", why)
+
+    def test_never_sighted_exhausts_rotations_honest_why(self):
+        c = NavClient()
+        d = make_driver(c)
+        never = lambda nm, img: {"seen": False, "bbox": None,
+                                 "confidence": 0.0}
+        with d:
+            best, why = ad.search_around(d, never,
+                                         lambda: (None, b"img"),
+                                         MarkedClearance(c))
+        self.assertIsNone(best)
+        self.assertIn("without seeing it", why)
+        self.assertEqual(len(nudges(c)), 5)           # rotation cap
+
+
+class AimClearance:
+    """Clearance whose verdict depends on the CURRENT camera aim: the
+    forward path (pan 0 at floor tilt) consumes a scripted queue; all
+    other views (probes, survey, side checks) are clear."""
+
+    def __init__(self, driver, forward_verdicts):
+        self.driver = driver
+        self.q = list(forward_verdicts)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        self.driver.c.log.append(("clear",))
+        pan, tilt = self.driver._aim or (0.0, 0.0)
+        if pan == 0.0 and tilt == self.driver.floor_tilt:
+            return self.q.pop(0) if self.q else True
+        return True
+
+
+class DetourTest(unittest.TestCase):
+    def _approach(self, d, script, cl, detours=ad.DETOUR_MAX):
+        return ad.approach_object(
+            d, None, "bin", capture=lambda: (None, b"img"),
+            look=lambda nm, img: script((d._aim or (0, 0))[0]),
+            clearance=cl, detours=detours)
+
+    def _target_script(self, c):
+        """Centered-not-close until one forward lands post-detour, then
+        close. Off-view at pan 0 right after the detour turn; visible at
+        the reacquire sweep's biased first look."""
+        def script(pan):
+            fwds = len([e for e in c.log
+                        if e[0] == "nudge" and e[1] == "forward"])
+            if fwds >= 2:
+                if abs(pan) <= 55:
+                    return {"seen": True, "bbox": [0.3, 0.3, 0.7, 0.8],
+                            "close": True, "confidence": 0.9}
+                return {"seen": False, "bbox": None, "confidence": 0.0}
+            if pan == 0:
+                return {"seen": True, "bbox": [0.45, 0.4, 0.55, 0.5],
+                        "close": False, "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        return script
+
+    def test_static_obstacle_dead_ahead_stops_honestly(self):
+        # glm review catch: the detour's fresh survey re-checks the SAME
+        # view that just blocked — a static obstacle re-fails it and the
+        # honest outcome is "path blocked while turning", zero turn nudges
+        c = NavClient()
+        d = make_driver(c)
+        # forward view stays blocked forever (static hazard)
+        cl = AimClearance(d, forward_verdicts=[False])
+
+        class StaticBlock(AimClearance):
+            def __call__(self):
+                self.calls += 1
+                self.driver.c.log.append(("clear",))
+                pan, tilt = self.driver._aim or (0.0, 0.0)
+                if pan == 0.0 and tilt == self.driver.floor_tilt:
+                    return False          # dead ahead: blocked, stays blocked
+                return True
+        cl = StaticBlock(d, [])
+
+        def script(pan):
+            if pan == 0:
+                return {"seen": True, "bbox": [0.45, 0.4, 0.55, 0.5],
+                        "close": False, "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        ok, obs, why = self._approach(d, script, cl)
+        self.assertFalse(ok)
+        self.assertIn("blocked while turning", why)
+        self.assertEqual([e for e in nudges(c)
+                          if e[1] in ("left", "right")], [])
+
+    def test_transient_obstacle_detour_goes_around_and_arrives(self):
+        # the case detours genuinely help: the hazard MOVED between the
+        # block and the survey re-check (verdict legitimately flips) —
+        # e.g. the cat wandered off
+        c = NavClient()
+        d = make_driver(c, max_steps=100)
+        cl = AimClearance(d, forward_verdicts=[False, True, True, True])
+        ok, obs, why = self._approach(d, self._target_script(c), cl)
+        self.assertTrue(ok, why)
+        dirs = [e[1] for e in nudges(c)]
+        self.assertIn("forward", dirs)
+        self.assertTrue(any(x in ("left", "right") for x in dirs))
+        # ordering: after the blocked forward's False verdict, the next
+        # turn nudge must be preceded by a FULL fresh 3-view survey —
+        # find the block (first "clear" that returned False is the first
+        # forward check) then count clears before the next turn nudge
+        self.assertTrue(clear_before_every_nudge(c, None))
+        # the detour turn's survey re-ran: aims contain the -40/0/+40
+        # triple AFTER the first forward nudge attempt window
+        aims = [e[1] for e in c.log if e[0] == "aim"]
+        self.assertGreaterEqual(aims.count(-40.0) + aims.count(40.0), 4)
+
+    def test_boxed_in_no_nudges_after_block(self):
+        c = NavClient()
+        d = make_driver(c)
+
+        class AllDirty(AimClearance):
+            def __call__(self):
+                self.calls += 1
+                self.driver.c.log.append(("clear",))
+                pan, tilt = self.driver._aim or (0.0, 0.0)
+                if tilt == self.driver.floor_tilt:
+                    return False               # every floor view dirty
+                return True
+        cl = AllDirty(d, [])
+
+        def script(pan):
+            if pan == 0:
+                return {"seen": True, "bbox": [0.45, 0.4, 0.55, 0.5],
+                        "close": False, "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        ok, obs, why = self._approach(d, script, cl)
+        self.assertFalse(ok)
+        self.assertIn("boxed in", why)
+        self.assertEqual(nudges(c), [])
+
+    def test_detours_zero_keeps_v1_wording(self):
+        c = NavClient()
+        d = make_driver(c)
+        cl = AimClearance(d, forward_verdicts=[False])
+
+        def script(pan):
+            if pan == 0:
+                return {"seen": True, "bbox": [0.45, 0.4, 0.55, 0.5],
+                        "close": False, "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        ok, obs, why = self._approach(d, script, cl, detours=0)
+        self.assertFalse(ok)
+        self.assertEqual(why, "path blocked ahead")
+
+    def test_detour_budget_exhausts_honestly(self):
+        c = NavClient()
+        d = make_driver(c, max_steps=200)
+        # pan-0 floor views per detour cycle: block(F), survey-center(T),
+        # detour-forward(T); after 3 cycles the 4th block exhausts the
+        # budget (the fake can't tell a forward check from the survey's
+        # center view — same aim — so the queue scripts all of them)
+        cl = AimClearance(d,
+                          forward_verdicts=[False, True, True] * 3 + [False])
+
+        def script(pan):
+            if pan == 0:      # sighted straight ahead only — no align turns
+                return {"seen": True, "bbox": [0.45, 0.4, 0.55, 0.5],
+                        "close": False, "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        ok, obs, why = self._approach(d, script, cl)
+        self.assertFalse(ok)
+        self.assertIn("out of detour attempts", why)
+
+    def test_probe_advisory_gate_authoritative(self):
+        c = NavClient()
+        d = make_driver(c)
+
+        class ProbeLiar(AimClearance):
+            """Probes clear, but the turn's own survey/side checks dirty."""
+            def __call__(self):
+                self.calls += 1
+                self.driver.c.log.append(("clear",))
+                pan, tilt = self.driver._aim or (0.0, 0.0)
+                if pan == 0.0 and tilt == self.driver.floor_tilt:
+                    return self.q.pop(0) if self.q else True
+                # dirty from the moment the turn survey starts (after the
+                # two probe looks)
+                probes = len([e for e in self.driver.c.log
+                              if e[0] == "clear"])
+                return probes <= 3        # 1 fwd check + 2 probes pass
+        cl = ProbeLiar(d, forward_verdicts=[False])
+
+        def script(pan):
+            if pan == 0:
+                return {"seen": True, "bbox": [0.45, 0.4, 0.55, 0.5],
+                        "close": False, "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        ok, obs, why = self._approach(d, script, cl)
+        self.assertFalse(ok)
+        self.assertIn("blocked while turning", why)
+        self.assertEqual(nudges(c), [])   # probe said yes, gate said NO
+
+    def test_tie_break_toward_target(self):
+        for cx, want in ((0.42, "left"), (0.58, "right")):
+            c = NavClient()
+            d = make_driver(c, max_steps=100)
+            cl = AimClearance(d, forward_verdicts=[False, True])
+
+            def script(pan, cx=cx):
+                fwds = len([e for e in c.log
+                            if e[0] == "nudge" and e[1] == "forward"])
+                if fwds >= 1 and abs(pan) <= 55:
+                    return {"seen": True, "bbox": [0.3, 0.3, 0.7, 0.8],
+                            "close": True, "confidence": 0.9}
+                if pan == 0:
+                    return {"seen": True,
+                            "bbox": [cx - 0.05, 0.4, cx + 0.05, 0.5],
+                            "close": False, "confidence": 0.9}
+                return {"seen": False, "bbox": None, "confidence": 0.0}
+            ok, obs, why = self._approach(d, script, cl)
+            first_turn = next(e for e in nudges(c)
+                              if e[1] in ("left", "right"))
+            self.assertEqual(first_turn[1], want, (cx, why))
+
+    def test_reacquire_miss_stops_honestly(self):
+        c = NavClient()
+        d = make_driver(c, max_steps=100)
+        cl = AimClearance(d, forward_verdicts=[False, True])
+        state = {"gone": False}
+
+        def script(pan):
+            fwds = len([e for e in c.log
+                        if e[0] == "nudge" and e[1] == "forward"])
+            if fwds >= 1:
+                return {"seen": False, "bbox": None,   # vanished for good
+                        "confidence": 0.0}
+            if pan == 0:
+                return {"seen": True, "bbox": [0.45, 0.4, 0.55, 0.5],
+                        "close": False, "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        ok, obs, why = self._approach(d, script, cl)
+        self.assertFalse(ok)
+        self.assertIn("lost sight", why)
+
+
 class WaypointPlanTest(unittest.TestCase):
     def test_index_slice_beats_crossover(self):
         # pre-home wandering passes THROUGH home; the plan must use only the
@@ -609,6 +941,23 @@ class RoutingPinTest(unittest.TestCase):
         self.assertIn("GO TO / DRIVE TO", by_name["rover_go_to"]["description"])
         self.assertIn("ROVER_GO_ENABLE", by_name["rover_go_to"]["description"])
         self.assertIn("come back", by_name["rover_come_back"]["description"])
+        # plan 037: honest coverage + honest detour wording (glm catch: no
+        # "steers around obstacles" overclaim — static blocks stop it)
+        desc = by_name["rover_go_to"]["description"]
+        self.assertIn("approximately a full circle", desc)
+        self.assertIn("as time allows", desc)
+        self.assertIn("try to go around", desc)
+        self.assertIn("fixed obstacle dead ahead stops it", desc)
+        self.assertNotIn("guaranteed", desc)
+        self.assertNotIn("steering around obstacles", desc)
+
+    def test_go_budget_split_pinned(self):
+        # plan 037: search capped at half the wall budget
+        self.assertEqual(ac.GO_MAX_STEPS, 80)
+        self.assertEqual(ac.GO_MAX_SECONDS, 480.0)
+        import autodrive as ad2
+        self.assertEqual(ad2.SEARCH_PHASE_S, 240.0)
+        self.assertLessEqual(ad2.SEARCH_PHASE_S, ac.GO_MAX_SECONDS / 2)
 
 
 if __name__ == "__main__":
