@@ -53,6 +53,16 @@ MIN_CAL_DELTA_DEG = 3.0   # smallest Δheading that proves a turn registered
 WP_SPACING_M = 0.4        # backtrack waypoint spacing along the trail
 ARRIVE_M = 0.3            # "I'm there" radius
 
+# plan 037 — search-first + obstacle detours
+SEARCH_PANS = (-50, 0, 50)   # coarse grid: 3 looks/viewpoint (budget-real)
+SEARCH_TILTS = (-18,)
+SEARCH_PHASE_S = 240.0    # search sub-budget inside the go-to wall budget
+DETOUR_MAX = 3            # detour attempts per approach run
+DETOUR_TURN_MS = 350      # nominal ~45°; OPEN-LOOP — the true angle is a
+                          # guess on this uncalibrated rover; forward()
+                          # re-gates whatever heading results
+DETOUR_PROBE_PAN = 40.0   # side floor views probed before picking a side
+
 
 class SafetyLimit(RuntimeError):
     """A safety budget/precondition stopped the run."""
@@ -204,6 +214,10 @@ class SafeDriver:
         self._tick()
         self.look(0.0, self.floor_tilt)     # camera now reflects travel direction
         if not clearance():                 # fresh near-floor safety check
+            # evidence of a hazard invalidates every cached clearance —
+            # without this, a detour's turn could reuse a ≤TTL-old survey
+            # that this verdict just contradicted (plan-037 review catch)
+            self._survey_at = None
             return False
         gap = self._clock() - self._last_forward
         if gap < self.forward_cooldown_s:
@@ -439,32 +453,44 @@ EARLY_ACCEPT_CONF = 0.85   # stop sweeping immediately on a very strong sighting
 
 
 def _sweep_for(driver, looker, capture, *, err, log=lambda m: None,
-               sweep_pans=SWEEP_PANS, sweep_tilts=SWEEP_TILTS):
+               sweep_pans=SWEEP_PANS, sweep_tilts=SWEEP_TILTS,
+               deadline=None):
     """One gimbal sweep from the CURRENT spot → ("found", (conf, obs, pan,
-    tilt)) / ("none", None) / ("abort", None). Contract (plan 036): does NO
-    context management (the driver must already be entered) and NO base
-    rotation — the between-sweep rotation stays in find_object; a rotating
-    sweep would smuggle ungated turns past the gated-only guarantee.
-    `err` is a shared {"n": int} vision-error counter (find_object's
-    original consecutive-failure semantics, preserved across sweeps)."""
+    tilt)) / ("none", None) / ("abort_time"|"abort_capture"|"abort_vision",
+    None). Contract (plan 036): does NO context management (the driver must
+    already be entered) and NO base rotation — the between-sweep rotation
+    stays in find_object; a rotating sweep would smuggle ungated turns past
+    the gated-only guarantee. `err` is a shared {"n": int} vision-error
+    counter (find_object's original consecutive-failure semantics).
+    `deadline` (driver-clock absolute, plan 037) is checked BEFORE every
+    look so a slow sweep can never overrun its phase cap nor accept a
+    post-cap sighting — the cap is authoritative (code-review catch)."""
     best = None
     for tilt in sweep_tilts:
         for pan in sweep_pans:
-            if driver.elapsed() >= driver.max_seconds:
+            if driver.elapsed() >= driver.max_seconds or (
+                    deadline is not None and driver._clock() >= deadline):
                 log("time cap reached — stopping the search")
-                return "abort", None
+                return "abort_time", None
             driver.look(pan, tilt)
             try:
                 _, img = capture()
             except Exception as e:
                 log(f"capture failed ({e}); stopping")
-                return "abort", None
+                return "abort_capture", None
             obs = looker(None, img)
+            # the phase cap is authoritative even over a sighting whose look
+            # STARTED in-budget — a post-cap result is discarded (plan-037
+            # code-review demand; wall-clock semantics for find_object are
+            # deliberately unchanged: only the deadline param is strict)
+            if deadline is not None and driver._clock() >= deadline:
+                log("time cap reached — stopping the search")
+                return "abort_time", None
             if obs.get("error"):
                 err["n"] += 1
                 if err["n"] >= MAX_VISION_ERRORS:
                     log(f"vision failing ({err['n']}x) — giving up")
-                    return "abort", None
+                    return "abort_vision", None
                 continue
             err["n"] = 0
             conf = _num(obs.get("confidence"))
@@ -516,7 +542,7 @@ def find_object(driver, vision, target, *, capture, log=lambda m: None,
             state, best = _sweep_for(driver, looker, capture, err=err, log=log,
                                      sweep_pans=sweep_pans,
                                      sweep_tilts=sweep_tilts)
-            if state == "abort":
+            if state.startswith("abort"):
                 return None
 
             if best:
@@ -645,25 +671,84 @@ def turn_to_heading(driver, get_pose, target_deg, *, clearance,
     return abs(err) <= tol_deg
 
 
+def search_around(driver, looker, capture, clearance, *,
+                  max_rotations=5, phase_cap_s=SEARCH_PHASE_S,
+                  log=lambda m: None):
+    """Look approximately all the way around (plan 037): coarse gimbal
+    sweeps with GATED in-place rotations between them (unlike
+    find_object's legacy ungated rotation), until the target is sighted or
+    the phase cap / rotation budget runs out. Coverage is BEST-EFFORT
+    within the cap — rotations are open-loop and nominal (~60°), never a
+    guaranteed 360°. Returns (best | None, why). The driver must already
+    be entered (no context management here)."""
+    end = driver._clock() + phase_cap_s
+    timeout_why = ("couldn't spot it in the time I had — I looked around "
+                   "as far as time allowed")
+    err = {"n": 0}
+    for rot in range(max_rotations + 1):
+        if driver._clock() >= end:
+            return None, timeout_why
+        state, best = _sweep_for(driver, looker, capture, err=err, log=log,
+                                 sweep_pans=SEARCH_PANS,
+                                 sweep_tilts=SEARCH_TILTS,
+                                 deadline=end)
+        if state == "abort_time":
+            return None, timeout_why
+        if state.startswith("abort"):
+            return None, "search aborted (camera or vision failing)"
+        if best:
+            return best, "sighted"
+        if rot < max_rotations:
+            if driver._clock() >= end:
+                return None, timeout_why
+            log(f"not visible from viewpoint {rot + 1} — turning to look "
+                "around")
+            if not driver.turn_gated("left", ROTATE_MS, clearance):
+                return None, ("floor not clear for turning — couldn't look "
+                              "further around")
+    return None, ("looked around (approximately a full circle) without "
+                  "seeing it")
+
+
 def approach_object(driver, vision, target, *, capture, log=lambda m: None,
-                    look=None, clearance=None):
-    """Drive TO a visible object (plan 036). Sight it with a gimbal sweep
-    from the current spot (NO base rotation), turn the BODY until the
-    sighting is dead ahead (|pan| ≤ BODY_ALIGN_TOL — a pan=50° sighting must
-    never trigger a body-forward pulse, that vector is wrong), then creep
+                    look=None, clearance=None, search=False, detours=0):
+    """Drive TO a visible object (plan 036; search/detours plan 037).
+    Sight the target — a stationary sweep by default, `search=True` adds
+    gated look-around rotations first — turn the BODY until the sighting
+    is dead ahead (|pan| ≤ BODY_ALIGN_TOL — a pan=50° sighting must never
+    trigger a body-forward pulse, that vector is wrong), then creep
     forward, floor-gated per pulse, until the close criteria fire.
+    `detours > 0` allows bounded go-around attempts at a blocked path
+    (side probes are ADVISORY; the turn/forward gates stay authoritative,
+    and the blocked forward has already voided the turn survey so a detour
+    turn always re-surveys). HONEST LIMIT (glm review): the fresh survey's
+    center view is the same physical view that just blocked, so a STATIC
+    dead-ahead obstacle re-fails it and the detour stops with "path
+    blocked while turning" — detours genuinely help only when the hazard
+    is TRANSIENT (a cat that wandered off, a person passing) and the
+    re-check legitimately clears. Callers using search=True should size
+    max_seconds ≥ 2× SEARCH_PHASE_S or the search can eat the wall budget.
+    Defaults keep plan-036 behavior byte-stable.
     Returns (ok, obs, why). The driver context is entered HERE."""
     looker = look if look is not None else (lambda nm, im: look_for(vision, im, target))
     clearance = clearance or make_llm_clearance(vision, capture)
     obs = None
     with driver:
         try:
-            err = {"n": 0}
-            state, best = _sweep_for(driver, looker, capture, err=err, log=log)
-            if state == "abort" or best is None:
-                return False, None, "target not visible from here"
+            if search:
+                best, why = search_around(driver, looker, capture,
+                                          clearance, log=log)
+                if best is None:
+                    return False, None, why
+            else:
+                err = {"n": 0}
+                state, best = _sweep_for(driver, looker, capture, err=err,
+                                         log=log)
+                if state.startswith("abort") or best is None:
+                    return False, None, "target not visible from here"
             _, obs, pan, tilt = best
             lost = 0
+            detours_done = 0
             while True:
                 if driver.elapsed() >= driver.max_seconds:
                     return False, obs, "time budget reached"
@@ -706,7 +791,56 @@ def approach_object(driver, vision, target, *, capture, log=lambda m: None,
                     continue
                 # dead ahead + centered → ONE floor-gated forward pulse
                 if not driver.forward(clearance):
-                    return False, obs, "path blocked ahead"
+                    # blocked — forward() has voided the turn survey (the
+                    # hazard verdict invalidates cached clearances)
+                    if detours_done >= detours:
+                        return False, obs, (
+                            "path blocked ahead" if detours == 0
+                            else "path blocked — out of detour attempts")
+                    # side probes: camera-only, ADVISORY (the motion gates
+                    # below remain authoritative)
+                    clear_sides = []
+                    for probe_pan, side in ((-DETOUR_PROBE_PAN, "left"),
+                                            (DETOUR_PROBE_PAN, "right")):
+                        driver.look(probe_pan, driver.floor_tilt)
+                        if clearance():
+                            clear_sides.append(side)
+                    if not clear_sides:
+                        return False, obs, "boxed in — stopped"
+                    if len(clear_sides) == 2:   # tie-break toward the target
+                        side = "left" if cx < 0.5 else "right"
+                    else:
+                        side = clear_sides[0]
+                    # gated turn — fresh full survey guaranteed by the void
+                    if not driver.turn_gated(side, DETOUR_TURN_MS, clearance):
+                        return False, obs, "path blocked while turning"
+                    if not driver.forward(clearance):
+                        return False, obs, "path blocked on the detour"
+                    detours_done += 1
+                    # reacquire: camera sweep biased OPPOSITE the detour turn
+                    first = -1.0 if side == "right" else 1.0
+                    found = None
+                    for p in (first * 55.0, first * 25.0, 0.0, -first * 25.0):
+                        driver.look(p, tilt)
+                        try:
+                            _, img2 = capture()
+                        except Exception as e:
+                            return False, obs, f"camera failed: {e}"
+                        o3 = looker(None, img2)
+                        if o3.get("seen") and o3.get("bbox"):
+                            found = (o3, p)
+                            break
+                    if found:
+                        obs, pan = found
+                        lost = 0       # reacquired: losses don't compound
+                        continue
+                    # note: lost is always 0 here (the forward branch only
+                    # runs after a SEEN look, which resets it) — a distinct
+                    # "lost after detour" terminal was dead code (glm review
+                    # catch); the main loop's lost path decides from here
+                    lost += 1
+                    pan = 0.0
+                    continue
                 pan = 0.0     # forward() snapped the gimbal to (0, floor_tilt)
         except SafetyLimit as e:
             return False, obs, f"stopped by the safety envelope: {e}"

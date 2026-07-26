@@ -498,15 +498,21 @@ def build_tools(rover, arm):
              "parameters": {"type": "object", "properties": {
                  "target": {"type": "string"}}, "required": ["target"]}},
             {"name": "rover_go_to",
-             "description": "PHYSICALLY DRIVES the rover across the floor to an "
-                            "object it can currently see (tiny floor-checked "
-                            "forward pulses + gated turns), then optionally "
-                            "photographs a named detail of it (photo_of, e.g. "
-                            "'wheel'). Use ONLY when the user explicitly asks "
-                            "the rover to GO TO / DRIVE TO something — never "
-                            "for 'where is X' questions (use rover_where_is). "
-                            "Requires ROVER_GO_ENABLE=1; refuses safely "
-                            "otherwise. Takes minutes.",
+             "description": "PHYSICALLY DRIVES the rover across the floor to "
+                            "an object: first looks all around for it "
+                            "(turning in place, approximately a full circle, "
+                            "as time allows), then approaches with tiny "
+                            "floor-checked pulses; it will try to go around "
+                            "an obstacle once the way is re-checked clear "
+                            "(helps when something transient moves away — a "
+                            "fixed obstacle dead ahead stops it, and it says "
+                            "so); "
+                            "optionally photographs a named detail (photo_of, "
+                            "e.g. 'wheel'). Use ONLY when the user explicitly "
+                            "asks the rover to GO TO / DRIVE TO something — "
+                            "never for 'where is X' questions (use "
+                            "rover_where_is). Requires ROVER_GO_ENABLE=1; "
+                            "refuses safely otherwise. Takes minutes.",
              "parameters": {"type": "object", "properties": {
                  "target": {"type": "string"},
                  "photo_of": {"type": "string"}}, "required": ["target"]}},
@@ -544,6 +550,11 @@ SCANFOR_POLL_S = 2.0        # rover_scan_for poll cadence
 # plan 036: where the last rover_go_to started (pose + trail index) — what
 # rover_come_back returns to. One rover, one home.
 _NAV_HOME = {"pose": None, "trail_len": None}
+
+# plan 037: go-to v2 budget — search is separately capped (SEARCH_PHASE_S)
+# inside this wall budget so at least half always remains for the approach
+GO_MAX_STEPS = 80
+GO_MAX_SECONDS = 480.0
 
 
 def _go_gate(rover):
@@ -681,11 +692,13 @@ def run_tool(rover, arm, name, a):
 
             def capture():
                 return None, client.get_stream_frame()
-            driver = autodrive.SafeDriver(client)
+            driver = autodrive.SafeDriver(client, max_steps=GO_MAX_STEPS,
+                                          max_seconds=GO_MAX_SECONDS)
             try:
                 ok, obs, why = autodrive.approach_object(
                     driver, vm, target, capture=capture,
-                    log=lambda m: print("   " + m))
+                    log=lambda m: print("   " + m),
+                    search=True, detours=autodrive.DETOUR_MAX)
             except Exception as e:
                 return f"go-to aborted — rover stopped/safe: {e}"
             try:
