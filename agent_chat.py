@@ -1232,16 +1232,79 @@ class ChatSession:
         return "\n".join(out)
 
 
-def serve(session, chat_status, port=8090):
+CHAT_HIST_MAX = 200         # display-transcript bound (memory + /chat_history)
+CHAT_HIST_PRUNE = 1000      # file bound, applied at serve start
+
+
+def _hist_load(path, maxlen=CHAT_HIST_MAX):
+    """Last maxlen entries of the JSONL transcript; corrupt lines skipped."""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return out
+    for line in lines[-maxlen:]:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(e, dict) and e.get("who") in ("you", "bot")
+                and isinstance(e.get("text"), str)):
+            out.append({"who": e["who"], "text": e["text"],
+                        "ts": e.get("ts")})
+    return out
+
+
+def _hist_prune(path, keep=CHAT_HIST_PRUNE):
+    """Bound the transcript file to its last `keep` lines. temp+os.replace:
+    a crash mid-rewrite must never lose the whole history."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+        if len(lines) <= keep:
+            return
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            fh.writelines(lines[-keep:])
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def serve(session, chat_status, port=8090, hist_path=None):
     """Async job model on loopback (plan 030): POST /chat submits a turn and
     returns {"turn": N} immediately (409 while one runs); GET /chat_poll
-    fetches the result; GET /chat_status reports health. Binding the port is
-    the single-instance mutex — a second service dies on EADDRINUSE."""
+    fetches the result; GET /chat_status reports health; GET /chat_history
+    serves the persisted display transcript (plan 038). Binding the port is
+    the single-instance mutex — a second service dies on EADDRINUSE.
+    hist_path resolution (at CALL time, never import): param →
+    ROVER_CHAT_HIST env → ~/rover-chat-history.jsonl."""
+    import collections
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    if hist_path is None:
+        hist_path = os.environ.get("ROVER_CHAT_HIST") or os.path.expanduser(
+            "~/rover-chat-history.jsonl")
     state = {"turn": 0, "busy": False, "active": None, "results": {}}
     slock = threading.Lock()
+    history = collections.deque(_hist_load(hist_path), maxlen=CHAT_HIST_MAX)
+    _hist_prune(hist_path)
+
+    def record(who, text):
+        """Append to the display transcript. Blank entries never recorded;
+        the deque write is under slock, the disk append is OUTSIDE it (IO
+        must not stall /chat_status//chat_poll); a failed write only logs."""
+        if not text:
+            return
+        entry = {"who": who, "text": text, "ts": int(time.time())}
+        with slock:
+            history.append(entry)
+        try:
+            with open(hist_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            print(f"chat history write failed: {e}")
 
     def submit(text):
         with slock:
@@ -1251,12 +1314,14 @@ def serve(session, chat_status, port=8090):
             state["busy"] = True
             state["active"] = state["turn"]
             n = state["turn"]
+        record("you", text)
 
         def work():
             try:
                 reply = session.handle(text)
             except Exception as e:              # belt and braces: never wedge busy
                 reply = f"chat error: {e}"
+            record("bot", reply)
             with slock:
                 state["results"][n] = reply
                 state["busy"] = False
@@ -1285,6 +1350,10 @@ def serve(session, chat_status, port=8090):
                 with slock:
                     busy = state["busy"]
                 self._json(200, dict(chat_status, busy=busy))
+            elif u.path == "/chat_history":
+                with slock:                     # deque iteration vs append
+                    hist = list(history)        # CAN throw without the lock
+                self._json(200, {"history": hist})
             elif u.path == "/chat_poll":
                 try:
                     n = int((parse_qs(u.query).get("turn") or ["x"])[0])

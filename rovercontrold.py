@@ -2257,6 +2257,9 @@ def make_handler(app):
             elif p == "/chat_status":
                 if not self._chat_proxy("GET", "/chat_status"):
                     self._json(200, {"up": False})    # down is an answer
+            elif p == "/chat_history":
+                if not self._chat_proxy("GET", "/chat_history"):
+                    self._json(200, {"history": []})  # down: empty IS the answer
             elif p == "/chat_poll":
                 if not self._chat_proxy("GET", "/chat_poll?" + u.query):
                     self._err(503, "chat service not running")
