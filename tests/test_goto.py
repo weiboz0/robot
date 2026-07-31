@@ -740,6 +740,119 @@ class DetourTest(unittest.TestCase):
         self.assertIn("lost sight", why)
 
 
+class MotionTypedGateTest(unittest.TestCase):
+    """Plan 039: forward pulses judge the drive strip; turns keep
+    full-frame strictness; animals veto anywhere under both."""
+
+    def test_floor_prompt_pins(self):
+        p = ad.FLOOR_PROMPT
+        self.assertIn("ANYWHERE", p)                  # animal rule
+        self.assertIn("ANY animal", p)
+        self.assertIn("CENTER DRIVE STRIP", p)
+        self.assertIn("OUTSIDE the strip", p)         # ignore side clutter
+        self.assertIn("If unsure", p)
+        self.assertIn("overhang", p)                  # Opus's hazard class
+        self.assertIn("EDGE", p)
+        # the old whole-frame veto line must be gone
+        self.assertNotIn("NO object, person, foot, wall", p)
+
+    def test_turn_prompt_pins(self):
+        p = ad.TURN_PROMPT
+        self.assertIn("rotate IN PLACE", p)
+        self.assertIn("ANYWHERE", p)                  # animal rule
+        self.assertIn("30 cm", p)                     # baseline strictness
+        self.assertIn("ANY doubt", p)
+
+    class RecordingVision:
+        def __init__(self, verdict=None):
+            self.prompts = []
+            self.verdict = verdict or {"clear": True, "confidence": 0.9,
+                                       "hazard": ""}
+
+        def describe(self, img, prompt, **kw):
+            self.prompts.append(prompt)
+            return dict(self.verdict)
+
+    def test_forward_uses_floor_prompt_turn_uses_turn_prompt(self):
+        c = NavClient()
+        d = make_driver(c)
+        vm = self.RecordingVision()
+        cl = ad.make_llm_clearance(vm, lambda: (None, b"img"), driver=d)
+        with d:
+            self.assertTrue(d.forward(cl))
+            self.assertEqual(vm.prompts, [ad.FLOOR_PROMPT])
+            vm.prompts.clear()
+            self.assertTrue(d.turn_gated("left", 200, cl))
+        # survey (3) + side check (1): ALL turn-strict
+        self.assertEqual(vm.prompts, [ad.TURN_PROMPT] * 4)
+
+    def test_context_transitions(self):
+        c = NavClient()
+        d = make_driver(c)
+        cl = Clearance()
+        with d:
+            d.turn_gated("left", 200, cl)
+            self.assertEqual(d.motion_context, "turn")
+            d.forward(cl)
+            self.assertEqual(d.motion_context, "forward")
+
+    def test_verdict_logging_and_fail_paths(self):
+        lines = []
+        vm = self.RecordingVision({"clear": False, "confidence": 0.95,
+                                   "hazard": "pen on floor"})
+        ok = ad.floor_is_clear(vm, b"img", log=lines.append)
+        self.assertFalse(ok)
+        self.assertIn("clear=False", lines[0])
+        self.assertIn("pen on floor", lines[0])
+
+        class Boom:
+            def describe(self, *a, **k):
+                raise RuntimeError("gateway down")
+        lines.clear()
+        self.assertFalse(ad.floor_is_clear(Boom(), b"img",
+                                           log=lines.append))
+        self.assertIn("fail closed", lines[0])
+
+    def test_low_confidence_still_vetoes(self):
+        vm = self.RecordingVision({"clear": True, "confidence": 0.3,
+                                   "hazard": ""})
+        self.assertFalse(ad.floor_is_clear(vm, b"img"))
+
+    def test_prompt_override_param(self):
+        vm = self.RecordingVision()
+        ad.floor_is_clear(vm, b"img", prompt=ad.TURN_PROMPT)
+        self.assertEqual(vm.prompts, [ad.TURN_PROMPT])
+
+    def test_detour_probes_are_turn_strict(self):
+        # the probes judge a corridor the rover would TURN into
+        c = NavClient()
+        d = make_driver(c)
+        vm = self.RecordingVision()
+        seen_ctx = []
+
+        class CtxClearance:
+            def __call__(self2):
+                seen_ctx.append(d.motion_context)
+                c.log.append(("clear",))
+                return False                # block everything: probes run,
+                                            # then boxed-in stop
+        cl = CtxClearance()
+
+        def script(pan):
+            if pan == 0:
+                return {"seen": True, "bbox": [0.45, 0.4, 0.55, 0.5],
+                        "close": False, "confidence": 0.9}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        ok, obs, why = ad.approach_object(
+            d, None, "bin", capture=lambda: (None, b"img"),
+            look=lambda nm, img: script((d._aim or (0, 0))[0]),
+            clearance=cl, detours=3)
+        self.assertFalse(ok)
+        # first check is the forward gate; the two probes after the block
+        # are turn-context — exact list, so a vanished probe can't pass
+        self.assertEqual(seen_ctx, ["forward", "turn", "turn"])
+
+
 class WaypointPlanTest(unittest.TestCase):
     def test_index_slice_beats_crossover(self):
         # pre-home wandering passes THROUGH home; the plan must use only the

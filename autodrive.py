@@ -98,6 +98,7 @@ class SafeDriver:
         self._entered = False
         self._aim = None      # gimbal (pan, tilt) cache — look() skips redundant aims
         self._survey_at = None   # plan 036: last valid 3-view turn-zone survey
+        self.motion_context = "forward"  # plan 039: which gate prompt applies
 
     # ---- lifecycle (context manager) ----
     def __enter__(self):
@@ -129,6 +130,7 @@ class SafeDriver:
         self.steps = 0
         self._last_forward = -1e9
         self._survey_at = None   # a prior run's turn survey must never leak
+        self.motion_context = "forward"   # nor its gate context (plan 039)
         # Independent watchdog: estop if the whole run overruns, even if the main
         # loop is wedged (hard caps only fire while code executes).
         self._wd = self._timer_cls(self.max_seconds + WATCHDOG_MARGIN_S, self._watchdog_fire)
@@ -212,6 +214,7 @@ class SafeDriver:
         capture a new forward-pointing frame itself), respect a cooldown, then a
         tiny nudge. Returns False (no motion) if blocked."""
         self._tick()
+        self.motion_context = "forward"     # plan 039: drive-strip gate
         self.look(0.0, self.floor_tilt)     # camera now reflects travel direction
         if not clearance():                 # fresh near-floor safety check
             # evidence of a hazard invalidates every cached clearance —
@@ -262,6 +265,7 @@ class SafeDriver:
     def turn_survey(self, clearance):
         """3-view turn-zone survey (pan −40/0/+40 at floor tilt) — ALL clear
         or no turning. Valid TURN_SURVEY_TTL_S; any forward pulse voids it."""
+        self.motion_context = "turn"        # plan 039: full-frame gate
         for pan in (-TURN_VIEW_PAN, 0.0, TURN_VIEW_PAN):
             self.look(pan, self.floor_tilt)
             if not clearance():
@@ -278,6 +282,7 @@ class SafeDriver:
         if direction not in ("left", "right"):
             raise ValueError(f"bad turn direction {direction!r}")
         self._tick()
+        self.motion_context = "turn"        # plan 039: full-frame gate
         if not self._survey_ok() and not self.turn_survey(clearance):
             return False
         self.look(TURN_VIEW_PAN if direction == "right" else -TURN_VIEW_PAN,
@@ -338,14 +343,40 @@ def _sane_bbox(b):
         return None
     return v
 
+# Motion-typed floor gates (plan 039). Two prompts because the safe zone
+# differs by motion: forward travel needs the DRIVE STRIP clear (side
+# clutter a body-width away must not veto — live testing got "boxed in"
+# by a pen); an in-place turn sweeps the body circle, so turn checks keep
+# full-frame near-zone strictness. Animals/people veto from ANYWHERE in
+# view under BOTH — stricter than the old prompt's 30 cm scope (cat rule).
 FLOOR_PROMPT = (
-    "This camera is aimed forward and downward at the floor directly ahead of a "
-    "small rover that is about to creep forward ~10 cm. Reply ONLY with JSON: "
-    "{\"clear\": bool, \"confidence\": 0..1, \"hazard\": string}. clear=true ONLY "
-    "if the near floor straight ahead is flat, empty and safe — NO object, person, "
-    "foot, wall, table/desk/chair edge, stair, step, dark gap or drop-off within "
-    "~30 cm. If there is ANY doubt, or you cannot clearly see the floor, set "
-    "clear=false.")
+    "This camera looks forward and down from a small floor rover that is "
+    "about to creep forward ~10 cm. Reply ONLY with JSON: "
+    "{\"clear\": bool, \"confidence\": 0..1, \"hazard\": string}. "
+    "RULE 1 — animals and people: if a person or ANY animal (cat, dog, "
+    "pet) is visible ANYWHERE in the image, at ANY distance, set "
+    "clear=false — a cat may approach from the side; any animal in view "
+    "blocks. "
+    "RULE 2 — objects: judge ONLY the CENTER DRIVE STRIP — the middle "
+    "portion of the image, roughly one-third of the frame wide, from the "
+    "bottom edge to about 50 cm ahead; that is the strip the rover will "
+    "drive through. Set clear=false if any object, wall, stair, step, "
+    "dark gap, drop-off, or a table/desk/chair EDGE or overhang at rover "
+    "height is in or overhangs THIS strip. Inanimate objects clearly "
+    "OUTSIDE the strip (off to the left or right) must NOT block: you "
+    "may mention them in \"hazard\" but keep clear=true when the strip "
+    "itself is flat, empty floor. If unsure whether something touches "
+    "the strip, set clear=false.")
+
+TURN_PROMPT = (
+    "This camera looks out and down from a small floor rover that is "
+    "about to rotate IN PLACE — its body sweeps a circle where it "
+    "stands. Reply ONLY with JSON: {\"clear\": bool, \"confidence\": "
+    "0..1, \"hazard\": string}. Set clear=false if a person or ANY "
+    "animal is visible ANYWHERE in the image at ANY distance, OR if ANY "
+    "object, wall, furniture edge, stair, step, dark gap or drop-off is "
+    "within about 30 cm of the rover in this view. If there is ANY "
+    "doubt, or you cannot clearly see the floor, set clear=false.")
 
 
 def _num(v, default=0.0):
@@ -355,14 +386,27 @@ def _num(v, default=0.0):
         return default
 
 
-def floor_is_clear(vision, img, *, min_conf=0.6):
-    """Fail-closed near-floor safety verdict. Any error/ambiguity -> False."""
+def floor_is_clear(vision, img, *, min_conf=0.6, log=None, prompt=None):
+    """Fail-closed floor-safety verdict. Any error/ambiguity -> False.
+    `prompt` picks the motion-typed gate (FLOOR_PROMPT default); `log`
+    records every verdict so runs are self-diagnosing (plan 039 — the
+    live 'boxed in by a pen' session had to reconstruct verdicts from
+    outside)."""
     try:
-        v = vision.describe(img, FLOOR_PROMPT, json_out=True, max_tokens=200)
-    except Exception:
+        v = vision.describe(img, prompt or FLOOR_PROMPT, json_out=True,
+                            max_tokens=200)
+    except Exception as e:
+        if log:
+            log(f"floor: vision error ({e}) — fail closed")
         return False
     if not isinstance(v, dict):
+        if log:
+            log("floor: bad vision output — fail closed")
         return False
+    if log:
+        log(f"floor: clear={v.get('clear')} "
+            f"conf={_num(v.get('confidence')):.2f} "
+            f"hazard={str(v.get('hazard') or '')[:60]}")
     return v.get("clear") is True and _num(v.get("confidence")) >= min_conf
 
 
@@ -596,15 +640,24 @@ def _fresh_pose(get_pose):
     return p
 
 
-def make_llm_clearance(vision, capture):
-    """The standard floor gate: fresh frame at the current aim → fail-closed
-    floor_is_clear verdict."""
+def make_llm_clearance(vision, capture, log=None, driver=None):
+    """The standard floor gate: fresh frame at the current aim →
+    fail-closed floor_is_clear verdict. Motion-typed (plan 039): when
+    `driver` is given, the prompt follows `driver.motion_context` —
+    "turn" gets TURN_PROMPT's full-frame strictness (an in-place turn
+    sweeps the body circle), anything else the FLOOR_PROMPT drive-strip
+    rules."""
     def clearance():
         try:
             _, img = capture()
         except Exception:
+            if log:
+                log("floor: capture failed — fail closed")
             return False
-        return floor_is_clear(vision, img)
+        turn = driver is not None and getattr(driver, "motion_context",
+                                              "") == "turn"
+        return floor_is_clear(vision, img, log=log,
+                              prompt=TURN_PROMPT if turn else FLOOR_PROMPT)
     return clearance
 
 
@@ -731,7 +784,8 @@ def approach_object(driver, vision, target, *, capture, log=lambda m: None,
     Defaults keep plan-036 behavior byte-stable.
     Returns (ok, obs, why). The driver context is entered HERE."""
     looker = look if look is not None else (lambda nm, im: look_for(vision, im, target))
-    clearance = clearance or make_llm_clearance(vision, capture)
+    clearance = clearance or make_llm_clearance(vision, capture, log=log,
+                                                driver=driver)
     obs = None
     with driver:
         try:
@@ -798,7 +852,9 @@ def approach_object(driver, vision, target, *, capture, log=lambda m: None,
                             "path blocked ahead" if detours == 0
                             else "path blocked — out of detour attempts")
                     # side probes: camera-only, ADVISORY (the motion gates
-                    # below remain authoritative)
+                    # below remain authoritative). They judge a corridor
+                    # the rover would TURN into → turn-strict gate.
+                    driver.motion_context = "turn"
                     clear_sides = []
                     for probe_pan, side in ((-DETOUR_PROBE_PAN, "left"),
                                             (DETOUR_PROBE_PAN, "right")):
