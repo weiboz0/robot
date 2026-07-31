@@ -62,6 +62,9 @@ DETOUR_TURN_MS = 350      # nominal ~45°; OPEN-LOOP — the true angle is a
                           # guess on this uncalibrated rover; forward()
                           # re-gates whatever heading results
 DETOUR_PROBE_PAN = 40.0   # side floor views probed before picking a side
+CLEARANCE_ERROR_RETRIES = 2   # fresh-frame retries for ERROR-class gate
+                              # failures only (timeouts); real "not clear"
+                              # verdicts are never retried (plan 039)
 
 
 class SafetyLimit(RuntimeError):
@@ -222,6 +225,11 @@ class SafeDriver:
             # that this verdict just contradicted (plan-037 review catch)
             self._survey_at = None
             return False
+        # the gate itself can be slow (vision retries): never nudge past
+        # the time cap — the watchdog may already have e-stopped, and a
+        # post-estop nudge must not race the latch (Opus review)
+        if self._clock() - self._start >= self.max_seconds:
+            raise SafetyLimit("time cap reached during the floor gate")
         gap = self._clock() - self._last_forward
         if gap < self.forward_cooldown_s:
             self._sleep(self.forward_cooldown_s - gap)
@@ -290,6 +298,8 @@ class SafeDriver:
         if not clearance():
             self._survey_at = None
             return False
+        if self._clock() - self._start >= self.max_seconds:
+            raise SafetyLimit("time cap reached during the turn gate")
         self._nudge_and_settle(direction, min(600, max(0, int(ms))))
         return True
 
@@ -386,28 +396,35 @@ def _num(v, default=0.0):
         return default
 
 
-def floor_is_clear(vision, img, *, min_conf=0.6, log=None, prompt=None):
-    """Fail-closed floor-safety verdict. Any error/ambiguity -> False.
-    `prompt` picks the motion-typed gate (FLOOR_PROMPT default); `log`
-    records every verdict so runs are self-diagnosing (plan 039 — the
-    live 'boxed in by a pen' session had to reconstruct verdicts from
-    outside)."""
+def _floor_verdict(vision, img, *, min_conf=0.6, log=None, prompt=None):
+    """(ok, is_error): the error flag lets the clearance layer retry
+    TRANSIENT failures (gateway timeout) with a fresh frame — a genuine
+    clear=false VERDICT is never retried (plan 039 addendum: a timeout
+    consumed the block path and produced a false 'boxed in')."""
     try:
         v = vision.describe(img, prompt or FLOOR_PROMPT, json_out=True,
                             max_tokens=200)
     except Exception as e:
         if log:
             log(f"floor: vision error ({e}) — fail closed")
-        return False
+        return False, True
     if not isinstance(v, dict):
         if log:
             log("floor: bad vision output — fail closed")
-        return False
+        return False, True
     if log:
         log(f"floor: clear={v.get('clear')} "
             f"conf={_num(v.get('confidence')):.2f} "
             f"hazard={str(v.get('hazard') or '')[:60]}")
-    return v.get("clear") is True and _num(v.get("confidence")) >= min_conf
+    return (v.get("clear") is True
+            and _num(v.get("confidence")) >= min_conf), False
+
+
+def floor_is_clear(vision, img, *, min_conf=0.6, log=None, prompt=None):
+    """Fail-closed floor-safety verdict (bool-compatible wrapper)."""
+    ok, _ = _floor_verdict(vision, img, min_conf=min_conf, log=log,
+                           prompt=prompt)
+    return ok
 
 
 def look_for(vision, img, target):
@@ -648,16 +665,27 @@ def make_llm_clearance(vision, capture, log=None, driver=None):
     sweeps the body circle), anything else the FLOOR_PROMPT drive-strip
     rules."""
     def clearance():
-        try:
-            _, img = capture()
-        except Exception:
-            if log:
-                log("floor: capture failed — fail closed")
-            return False
         turn = driver is not None and getattr(driver, "motion_context",
                                               "") == "turn"
-        return floor_is_clear(vision, img, log=log,
-                              prompt=TURN_PROMPT if turn else FLOOR_PROMPT)
+        prompt = TURN_PROMPT if turn else FLOOR_PROMPT
+        # error-only retries: a transient gateway failure gets a FRESH
+        # frame and another try; a real clear=false verdict returns
+        # immediately (zero retries); persistent errors fail closed.
+        for attempt in range(1 + CLEARANCE_ERROR_RETRIES):
+            try:
+                _, img = capture()
+            except Exception:
+                if log:
+                    log("floor: capture failed — fail closed")
+                return False
+            ok, is_error = _floor_verdict(vision, img, log=log,
+                                          prompt=prompt)
+            if not is_error:
+                return ok
+            if log and attempt < CLEARANCE_ERROR_RETRIES:
+                log(f"floor: retrying after error "
+                    f"({attempt + 1}/{CLEARANCE_ERROR_RETRIES})")
+        return False
     return clearance
 
 

@@ -818,6 +818,89 @@ class MotionTypedGateTest(unittest.TestCase):
                                    "hazard": ""})
         self.assertFalse(ad.floor_is_clear(vm, b"img"))
 
+    def test_error_only_retries_transient_timeout_recovers(self):
+        # plan 039 addendum: a gateway timeout must not consume the block
+        # path — fresh frame + retry; a real verdict is never retried
+        calls = {"n": 0}
+
+        class FlakyVision:
+            def describe(self, img, prompt, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise TimeoutError("Request timed out.")
+                return {"clear": True, "confidence": 0.9, "hazard": ""}
+        captures = {"n": 0}
+
+        def capture():
+            captures["n"] += 1
+            return None, b"img"
+        lines = []
+        cl = ad.make_llm_clearance(FlakyVision(), capture,
+                                   log=lines.append)
+        self.assertTrue(cl())                       # recovered on retry
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(captures["n"], 2)          # FRESH frame each try
+        self.assertTrue(any("retrying after error" in l for l in lines))
+
+    def test_bad_shape_output_is_retryable_then_recovers(self):
+        calls = {"n": 0}
+
+        class BadThenGood:
+            def describe(self, img, prompt, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return "not a dict"             # malformed → retryable
+                return {"clear": True, "confidence": 0.9, "hazard": ""}
+        cl = ad.make_llm_clearance(BadThenGood(), lambda: (None, b"img"))
+        self.assertTrue(cl())
+        self.assertEqual(calls["n"], 2)
+
+    def test_persistent_error_fails_closed_after_retries(self):
+        calls = {"n": 0}
+
+        class DeadVision:
+            def describe(self, img, prompt, **kw):
+                calls["n"] += 1
+                raise TimeoutError("down")
+        cl = ad.make_llm_clearance(DeadVision(), lambda: (None, b"img"))
+        self.assertFalse(cl())
+        self.assertEqual(calls["n"], 1 + ad.CLEARANCE_ERROR_RETRIES)
+
+    def test_real_not_clear_verdict_never_retried(self):
+        calls = {"n": 0}
+
+        class NoVision:
+            def describe(self, img, prompt, **kw):
+                calls["n"] += 1
+                return {"clear": False, "confidence": 0.95,
+                        "hazard": "cat"}
+        cl = ad.make_llm_clearance(NoVision(), lambda: (None, b"img"))
+        self.assertFalse(cl())
+        self.assertEqual(calls["n"], 1)             # instant stop, no retry
+
+    def test_slow_gate_never_nudges_past_the_time_cap(self):
+        # Opus review: a slow clearance (vision retries) returning True
+        # AFTER the cap must raise, never nudge (the watchdog may already
+        # have e-stopped)
+        t = {"now": 0.0}
+        c = NavClient()
+        d = make_driver(c, clock=lambda: t["now"], max_seconds=100.0)
+
+        def slow_clear():
+            t["now"] += 200.0                # gate outlives the cap
+            return True
+        with d:
+            with self.assertRaises(ad.SafetyLimit):
+                d.forward(slow_clear)
+        self.assertEqual(nudges(c), [])
+        c2 = NavClient()
+        d2 = make_driver(c2, clock=lambda: t["now"], max_seconds=100.0)
+        t["now"] = 0.0
+        with d2:
+            with self.assertRaises(ad.SafetyLimit):
+                d2.turn_gated("left", 200, slow_clear)
+        self.assertEqual(nudges(c2), [])
+
     def test_prompt_override_param(self):
         vm = self.RecordingVision()
         ad.floor_is_clear(vm, b"img", prompt=ad.TURN_PROMPT)

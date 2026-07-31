@@ -130,6 +130,23 @@ safety:
   folded (goal wording, stage wording, edge/overhang pin, evidence
   frames confirmed existing on the Mac).
 
+## Addendum (post-merge live finding, same plan scope)
+
+First relaunch: target sighted (conf 0.90, pan 0), then the forward gate
+FAILED CLOSED on `vision error (Request timed out.)` — a transient
+gateway timeout, not a hazard — which consumed the block path, triggered
+the probes (correctly blocked: chair left, tripod right), and ended
+"boxed in" with zero genuine forward verdicts. Fix: **error-only
+retries** in `make_llm_clearance` — an ERROR-class failure (exception /
+malformed output) refetches a FRESH frame and retries up to
+`CLEARANCE_ERROR_RETRIES = 2` times (each logged); a genuine
+`clear=false` VERDICT retries ZERO times (instant stop, unchanged);
+persistent errors still fail closed. Internal split
+`_floor_verdict(...) -> (ok, is_error)` with `floor_is_clear` kept as
+the compatible bool wrapper. Tests: error→clear succeeds with two calls;
+persistent error → False after N+1 attempts, logged; real False → one
+call, no retry.
+
 ## Stages
 
 1. Motion-typed prompts + logging + tests (no crop code exists).
