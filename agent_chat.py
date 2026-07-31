@@ -760,13 +760,15 @@ def run_tool(rover, arm, name, a):
 
             def capture():
                 return None, client.get_stream_frame()
-            clearance = autodrive.make_llm_clearance(vm, capture)
             home = {"pose": dict(_NAV_HOME["pose"]),
                     "trail_len": _NAV_HOME.get("trail_len") or 0}
             wps, _ = autodrive.plan_return_waypoints(trail, home)
             driver = autodrive.SafeDriver(
                 client, max_steps=min(120, 24 + 10 * len(wps)),
                 max_seconds=300.0)
+            # driver first: the clearance is motion-typed off its context
+            clearance = autodrive.make_llm_clearance(
+                vm, capture, log=lambda m: print("   " + m), driver=driver)
             try:
                 ok, rem, why = autodrive.backtrack(
                     driver, client.get_pose, trail, home,
