@@ -147,6 +147,21 @@ the compatible bool wrapper. Tests: error→clear succeeds with two calls;
 persistent error → False after N+1 attempts, logged; real False → one
 call, no retry.
 
+## Addendum 2 (live finding, attempt 4)
+
+The sweep's early-accept (conf ≥ 0.85 at ANY pan) grabbed a peripheral
+sighting at pan −50 on its FIRST look and committed to a body turn toward
+real furniture (turn gate correctly refused: "furniture leg and cables
+very close") — when one more look would have found the target dead ahead,
+requiring no turn at all (attempt 2: pan 0, conf 0.90). Fix:
+`_sweep_for(prefer_center=False)` — when True (search_around/approach
+path only), early-accept fires ONLY for sightings within
+`BODY_ALIGN_TOL` of center, and final selection prefers the smallest
+|pan| (tiebreak: confidence) instead of raw confidence. `find_object`
+keeps `prefer_center=False` → byte-identical behavior. Tests: centered
+low-conf beats peripheral high-conf; no early-accept at −50; early-accept
+at 0; find_object suite untouched.
+
 ## Stages
 
 1. Motion-typed prompts + logging + tests (no crop code exists).

@@ -515,7 +515,7 @@ EARLY_ACCEPT_CONF = 0.85   # stop sweeping immediately on a very strong sighting
 
 def _sweep_for(driver, looker, capture, *, err, log=lambda m: None,
                sweep_pans=SWEEP_PANS, sweep_tilts=SWEEP_TILTS,
-               deadline=None):
+               deadline=None, prefer_center=False):
     """One gimbal sweep from the CURRENT spot → ("found", (conf, obs, pan,
     tilt)) / ("none", None) / ("abort_time"|"abort_capture"|"abort_vision",
     None). Contract (plan 036): does NO context management (the driver must
@@ -559,10 +559,25 @@ def _sweep_for(driver, looker, capture, *, err, log=lambda m: None,
                 log(f"  spotted at pan={pan} tilt={tilt} conf={conf:.2f} "
                     f"({str(obs.get('reason', ''))[:40]})")
                 cand = (conf, obs, pan, tilt)
-                if best is None or conf > best[0]:
-                    best = cand
-                if conf >= EARLY_ACCEPT_CONF:
-                    return "found", best
+                if prefer_center:
+                    # approach path (plan 039 addendum 2): a centered
+                    # sighting needs NO body turn — worth more than a
+                    # marginally-confident peripheral one (early-accept at
+                    # pan −50 committed the rover to a turn toward real
+                    # furniture when the target was also dead ahead)
+                    if best is None or ((abs(pan), -conf)
+                                        < (abs(best[2]), -best[0])):
+                        best = cand
+                    if conf >= EARLY_ACCEPT_CONF and abs(pan) <= BODY_ALIGN_TOL:
+                        # returns the MOST-CENTERED sighting seen so far,
+                        # which may differ from the cand that triggered the
+                        # early accept — centered is what alignment wants
+                        return "found", best
+                else:
+                    if best is None or conf > best[0]:
+                        best = cand
+                    if conf >= EARLY_ACCEPT_CONF:
+                        return "found", best
     return ("found", best) if best else ("none", None)
 
 
@@ -772,7 +787,7 @@ def search_around(driver, looker, capture, clearance, *,
         state, best = _sweep_for(driver, looker, capture, err=err, log=log,
                                  sweep_pans=SEARCH_PANS,
                                  sweep_tilts=SEARCH_TILTS,
-                                 deadline=end)
+                                 deadline=end, prefer_center=True)
         if state == "abort_time":
             return None, timeout_why
         if state.startswith("abort"):
@@ -825,7 +840,7 @@ def approach_object(driver, vision, target, *, capture, log=lambda m: None,
             else:
                 err = {"n": 0}
                 state, best = _sweep_for(driver, looker, capture, err=err,
-                                         log=log)
+                                         log=log, prefer_center=True)
                 if state.startswith("abort") or best is None:
                     return False, None, "target not visible from here"
             _, obs, pan, tilt = best
