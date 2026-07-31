@@ -936,6 +936,92 @@ class MotionTypedGateTest(unittest.TestCase):
         self.assertEqual(seen_ctx, ["forward", "turn", "turn"])
 
 
+class PreferCenterSightingTest(unittest.TestCase):
+    """Plan 039 addendum 2: the approach search prefers the most CENTERED
+    confident sighting — a peripheral early-accept committed the rover to
+    a body turn toward real furniture when the target was also dead
+    ahead."""
+
+    def _sweep(self, script, prefer_center):
+        c = NavClient()
+        d = make_driver(c)
+        with d:
+            err = {"n": 0}
+            return ad._sweep_for(
+                d, lambda nm, img: script((d._aim or (0, 0))[0]),
+                lambda: (None, b"img"), err=err,
+                prefer_center=prefer_center)
+
+    def test_centered_lower_conf_beats_peripheral_higher_conf(self):
+        def script(pan):
+            if pan == -50:
+                return {"seen": True, "bbox": [0.4, 0.4, 0.6, 0.6],
+                        "confidence": 0.85}       # early-accept threshold!
+            if pan == 0:
+                return {"seen": True, "bbox": [0.4, 0.4, 0.6, 0.6],
+                        "confidence": 0.7}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        state, best = self._sweep(script, prefer_center=True)
+        self.assertEqual(state, "found")
+        self.assertEqual(best[2], 0)              # CENTERED sighting wins
+        # legacy mode: raw confidence wins, early-accept at -50
+        state, best = self._sweep(script, prefer_center=False)
+        self.assertEqual(best[2], -50)
+
+    def test_early_accept_only_when_centered(self):
+        looks = {"n": 0}
+
+        def script(pan):
+            looks["n"] += 1
+            if pan == -50:
+                return {"seen": True, "bbox": [0.4, 0.4, 0.6, 0.6],
+                        "confidence": 0.95}       # very strong, peripheral
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        state, best = self._sweep(script, prefer_center=True)
+        # did NOT early-accept at -50: the whole sweep ran (3 search pans
+        # would be the coarse grid; the default grid here is 10 looks)
+        self.assertGreater(looks["n"], 1)
+        self.assertEqual(best[2], -50)            # still found, just later
+
+    def test_early_accept_returns_most_centered_not_trigger(self):
+        # glm review: with SEARCH pans (-50, 0, 50) both centered-ish
+        # sightings possible — the return must be the most-centered seen,
+        # even when a later stronger one triggers the early accept
+        c = NavClient()
+        d = make_driver(c)
+
+        def script(pan):
+            if pan == 0:
+                return {"seen": True, "bbox": [0.4, 0.4, 0.6, 0.6],
+                        "confidence": 0.6}        # weak but dead-center
+            if pan == 5:                          # hypothetical near-center
+                return {"seen": True, "bbox": [0.4, 0.4, 0.6, 0.6],
+                        "confidence": 0.95}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        with d:
+            err = {"n": 0}
+            state, best = ad._sweep_for(
+                d, lambda nm, img: script((d._aim or (0, 0))[0]),
+                lambda: (None, b"img"), err=err,
+                sweep_pans=(0, 5), sweep_tilts=(-18,),
+                prefer_center=True)
+        self.assertEqual(state, "found")
+        self.assertEqual(best[2], 0)              # most centered, not trigger
+
+    def test_centered_strong_sighting_early_accepts(self):
+        looks = {"n": 0}
+
+        def script(pan):
+            looks["n"] += 1
+            if pan == 0:
+                return {"seen": True, "bbox": [0.4, 0.4, 0.6, 0.6],
+                        "confidence": 0.95}
+            return {"seen": False, "bbox": None, "confidence": 0.0}
+        state, best = self._sweep(script, prefer_center=True)
+        self.assertEqual(best[2], 0)
+        self.assertLess(looks["n"], 10)           # stopped at the sighting
+
+
 class WaypointPlanTest(unittest.TestCase):
     def test_index_slice_beats_crossover(self):
         # pre-home wandering passes THROUGH home; the plan must use only the
